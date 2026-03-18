@@ -1,0 +1,11 @@
+node_modules/
+dist/
+release/
+recordings/
+*.mp4
+*.wav
+.DS_Store
+certs/
+*.p12
+*.p8
+.env

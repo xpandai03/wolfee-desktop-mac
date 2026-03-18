@@ -1,0 +1,35 @@
+appId: com.wolfee.desktop
+productName: Wolfee Desktop
+directories:
+  output: release
+  buildResources: assets
+files:
+  - dist/**/*
+  - assets/**/*
+  - src/renderer/**/*
+
+afterSign: scripts/notarize.js
+
+mac:
+  category: public.app-category.productivity
+  icon: assets/icon.icns
+  target:
+    - dmg
+    - zip
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: entitlements.plist
+  entitlementsInherit: entitlements.inherit.plist
+  identity: "XPAND TECHNOLOGY LLC (LT73Z72CKR)"
+  artifactName: "${productName}-${version}-${arch}.${ext}"
+  notarize: false
+  signIgnore:
+    - "\\.pak$"
+    - "\\.lproj/"
+
+dmg:
+  sign: false
+
+extraResources:
+  - from: node_modules/ffmpeg-static/ffmpeg
+    to: ffmpeg

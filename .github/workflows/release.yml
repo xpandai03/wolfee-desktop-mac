@@ -1,0 +1,121 @@
+name: Build, Sign & Notarize
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # ── Signing certificate ──
+      # Import the Developer ID Application certificate into a temporary keychain
+      # so electron-builder can sign the app.
+      - name: Import signing certificate
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+
+          # Create temporary keychain
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Decode and import certificate
+          echo "$CSC_LINK" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" \
+            -k "$KEYCHAIN_PATH" \
+            -P "$CSC_KEY_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+
+          # Allow codesign to access the keychain without prompt
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Add to search list
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+
+          # Clean up cert file
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+
+      # ── Apple API key ──
+      # Write the App Store Connect API key .p8 file from the secret
+      # so notarytool can authenticate.
+      - name: Write Apple API key
+        env:
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+        run: |
+          API_KEY_DIR="$HOME/private_keys"
+          mkdir -p "$API_KEY_DIR"
+          echo "$APPLE_API_KEY_CONTENT" > "$API_KEY_DIR/AuthKey_${{ secrets.APPLE_API_KEY_ID }}.p8"
+          echo "APPLE_API_KEY=$API_KEY_DIR/AuthKey_${{ secrets.APPLE_API_KEY_ID }}.p8" >> "$GITHUB_ENV"
+
+      # ── Build + Sign + Notarize + Upload ──
+      - name: Build, sign, notarize, and upload
+        env:
+          # Signing (electron-builder reads these automatically)
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          CSC_KEYCHAIN: ${{ env.KEYCHAIN_PATH }}
+          # Notarization (read by scripts/notarize.js afterSign hook)
+          APPLE_API_KEY: ${{ env.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          # R2 upload (read by scripts/release.js)
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_PUBLIC_URL: ${{ secrets.R2_PUBLIC_URL }}
+        run: node scripts/release.js
+
+      # ── Verify ──
+      - name: Verify build artifacts
+        run: |
+          echo "── Artifacts ──"
+          ls -lh release/*.zip release/*.dmg 2>/dev/null || true
+          echo ""
+          echo "── Codesign ──"
+          codesign --verify --deep --strict "release/mac-arm64/Wolfee Desktop.app" 2>&1
+          echo ""
+          echo "── Staple ──"
+          xcrun stapler validate "release/mac-arm64/Wolfee Desktop.app" 2>&1
+
+      # ── Upload artifacts to GitHub Release ──
+      - name: Upload to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/Wolfee Desktop-*-arm64.dmg
+            release/wolfee-desktop.zip
+          generate_release_notes: true
+
+      # ── Cleanup ──
+      - name: Cleanup keychain
+        if: always()
+        run: |
+          if [ -n "$KEYCHAIN_PATH" ] && security list-keychains | grep -q "$KEYCHAIN_PATH"; then
+            security delete-keychain "$KEYCHAIN_PATH"
+          fi

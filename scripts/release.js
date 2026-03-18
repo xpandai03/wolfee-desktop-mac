@@ -1,0 +1,431 @@
+#!/usr/bin/env node
+
+/**
+ * Wolfee Desktop — Release Pipeline
+ *
+ * One-command: build → sign → notarize → staple → zip → upload → verify.
+ *
+ * Required env vars:
+ *   R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET
+ *   APPLE_API_KEY, APPLE_API_KEY_ID, APPLE_API_ISSUER
+ *
+ * Optional:
+ *   R2_PUBLIC_URL / R2_PUBLIC_DOMAIN
+ *   RELEASE_NOTES
+ */
+
+const { execSync } = require("child_process");
+const fs = require("fs");
+const path = require("path");
+const https = require("https");
+const http = require("http");
+const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
+
+const APP_NAME = "Wolfee Desktop";
+const APP_PATH = `release/mac-arm64/${APP_NAME}.app`;
+const ZIP_NAME = "wolfee-desktop.zip";
+const ZIP_PATH = `release/${ZIP_NAME}`;
+const R2_KEY = `downloads/${ZIP_NAME}`;
+const MIN_ZIP_SIZE = 50 * 1024 * 1024;
+const NOTARIZE_TIMEOUT = 15 * 60; // 15 minutes max wait
+
+// ── Helpers ──
+
+function run(cmd, label) {
+  console.log(`\n→ ${label}`);
+  console.log(`  $ ${cmd}\n`);
+  try {
+    execSync(cmd, { stdio: "inherit", cwd: path.resolve(__dirname, "..") });
+  } catch (err) {
+    console.error(`\n✗ FAILED: ${label}`);
+    process.exit(1);
+  }
+}
+
+/** Run a command and return its stdout */
+function runCapture(cmd, label) {
+  console.log(`\n→ ${label}`);
+  console.log(`  $ ${cmd}\n`);
+  try {
+    return execSync(cmd, {
+      encoding: "utf-8",
+      cwd: path.resolve(__dirname, ".."),
+      timeout: NOTARIZE_TIMEOUT * 1000,
+    });
+  } catch (err) {
+    // notarytool and spctl write to stderr, execSync throws on non-zero exit
+    // but the output is still useful
+    const output = (err.stdout || "") + (err.stderr || "");
+    if (output) console.log(output);
+    console.error(`\n✗ FAILED: ${label}`);
+    process.exit(1);
+  }
+}
+
+function requireEnv(name) {
+  const val = process.env[name];
+  if (!val) {
+    console.error(`✗ Missing env var: ${name}`);
+    console.error(`  Set it before running: export ${name}=...`);
+    process.exit(1);
+  }
+  return val;
+}
+
+function httpHead(url) {
+  return new Promise((resolve, reject) => {
+    const client = url.startsWith("https") ? https : http;
+    const req = client.request(url, { method: "HEAD", timeout: 15000 }, (res) => {
+      resolve({
+        status: res.statusCode,
+        contentLength: parseInt(res.headers["content-length"] || "0", 10),
+        contentType: res.headers["content-type"] || "",
+      });
+    });
+    req.on("error", reject);
+    req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
+    req.end();
+  });
+}
+
+// ── Main ──
+
+async function main() {
+  const startTime = Date.now();
+  const pkg = require("../package.json");
+  const TOTAL_STEPS = 11;
+
+  console.log("══════════════════════════════════════════");
+  console.log("  Wolfee Desktop — Release Pipeline");
+  console.log("══════════════════════════════════════════");
+  console.log(`  version: ${pkg.version}`);
+  console.log(`  target:  macOS arm64`);
+  console.log(`  steps:   ${TOTAL_STEPS}`);
+  console.log("");
+
+  // ══════════════════════════════════════════
+  // Step 1: Validate ALL env vars
+  // ══════════════════════════════════════════
+  console.log(`[1/${TOTAL_STEPS}] Validating environment...`);
+
+  // R2
+  const accountId = requireEnv("R2_ACCOUNT_ID");
+  const accessKeyId = requireEnv("R2_ACCESS_KEY_ID");
+  const secretAccessKey = requireEnv("R2_SECRET_ACCESS_KEY");
+  const bucket = requireEnv("R2_BUCKET");
+
+  // Apple notarization (API key auth)
+  const appleApiKey = requireEnv("APPLE_API_KEY");
+  const appleApiKeyId = requireEnv("APPLE_API_KEY_ID");
+  const appleApiIssuer = requireEnv("APPLE_API_ISSUER");
+
+  let publicBase;
+  if (process.env.R2_PUBLIC_URL) {
+    publicBase = process.env.R2_PUBLIC_URL.replace(/\/$/, "");
+  } else if (process.env.R2_PUBLIC_DOMAIN) {
+    publicBase = `https://${process.env.R2_PUBLIC_DOMAIN}`;
+  } else {
+    publicBase = `https://${bucket}.${accountId}.r2.dev`;
+  }
+
+  console.log(`  R2 bucket:   ${bucket}`);
+  console.log(`  Public base: ${publicBase}`);
+  console.log(`  API Key ID:  ${appleApiKeyId}`);
+  console.log(`  API Issuer:  ${appleApiIssuer}`);
+  console.log("  OK\n");
+
+  // ══════════════════════════════════════════
+  // Step 2: Clean + Build
+  // ══════════════════════════════════════════
+  console.log(`[2/${TOTAL_STEPS}] Building...`);
+  run("rm -rf dist release", "Clean previous build");
+  run("npm run build", "Compile TypeScript");
+
+  // ══════════════════════════════════════════
+  // Step 3: Package + Sign
+  // ══════════════════════════════════════════
+  console.log(`[3/${TOTAL_STEPS}] Packaging + signing...`);
+  run("npx electron-builder --mac --arm64", "electron-builder");
+
+  const absApp = path.resolve(__dirname, "..", APP_PATH);
+  if (!fs.existsSync(absApp)) {
+    console.error(`✗ Build output not found: ${APP_PATH}`);
+    process.exit(1);
+  }
+
+  // ══════════════════════════════════════════
+  // Step 4: Verify code signature
+  // ══════════════════════════════════════════
+  console.log(`[4/${TOTAL_STEPS}] Verifying code signature...`);
+  run(`codesign --verify --deep --strict "${APP_PATH}"`, "codesign verify");
+  console.log("  Signature OK");
+
+  // ══════════════════════════════════════════
+  // Step 5: Notarize
+  // ══════════════════════════════════════════
+  console.log(`[5/${TOTAL_STEPS}] Notarizing with Apple...`);
+
+  // Check if afterSign hook already notarized the app
+  let alreadyNotarized = false;
+  try {
+    execSync(`xcrun stapler validate "${APP_PATH}" 2>&1`, {
+      encoding: "utf-8",
+      cwd: path.resolve(__dirname, ".."),
+    });
+    alreadyNotarized = true;
+    console.log("  Already notarized (afterSign hook handled it). Skipping.");
+  } catch {
+    // Not yet notarized — proceed
+  }
+
+  let submissionId = "none";
+
+  if (alreadyNotarized) {
+    submissionId = "afterSign";
+  } else {
+    console.log("  [Notarize] Using API key auth");
+    console.log("  This may take 2-10 minutes. Waiting...\n");
+
+    // notarytool can submit a .app directory directly (it zips internally)
+    // but submitting a zip is more reliable — create a temp zip for submission
+    const notarizeZip = path.resolve(__dirname, "..", "release", "notarize-submission.zip");
+    run(
+      `ditto -c -k --keepParent "${APP_PATH}" "release/notarize-submission.zip"`,
+      "Create submission zip"
+    );
+
+    const notarizeOutput = runCapture(
+      `xcrun notarytool submit "release/notarize-submission.zip" ` +
+      `--key "${appleApiKey}" ` +
+      `--key-id "${appleApiKeyId}" ` +
+      `--issuer "${appleApiIssuer}" ` +
+      `--wait 2>&1`,
+      "notarytool submit --wait"
+    );
+
+    console.log(notarizeOutput);
+
+    // Parse submission ID for logging
+    const idMatch = notarizeOutput.match(/id:\s*([0-9a-f-]+)/i);
+    const statusMatch = notarizeOutput.match(/status:\s*(\w+)/i);
+    submissionId = idMatch ? idMatch[1] : "unknown";
+    const notarizeStatus = statusMatch ? statusMatch[1] : "unknown";
+
+    console.log(`  Submission ID: ${submissionId}`);
+    console.log(`  Status: ${notarizeStatus}`);
+
+    if (notarizeStatus.toLowerCase() !== "accepted") {
+      console.error(`✗ Notarization failed with status: ${notarizeStatus}`);
+      console.error("  Fetching detailed log...\n");
+
+      // Try to get the log for debugging
+      try {
+        const logOutput = execSync(
+          `xcrun notarytool log "${submissionId}" ` +
+          `--key "${appleApiKey}" ` +
+          `--key-id "${appleApiKeyId}" ` +
+          `--issuer "${appleApiIssuer}" 2>&1`,
+          { encoding: "utf-8", cwd: path.resolve(__dirname, "..") }
+        );
+        console.log(logOutput);
+      } catch (logErr) {
+        console.error("  Could not fetch notarization log:", logErr.message);
+      }
+
+      process.exit(1);
+    }
+
+    console.log("  Notarization ACCEPTED");
+
+    // Clean up submission zip
+    if (fs.existsSync(notarizeZip)) fs.unlinkSync(notarizeZip);
+  }
+
+  // ══════════════════════════════════════════
+  // Step 6: Staple
+  // ══════════════════════════════════════════
+  console.log(`[6/${TOTAL_STEPS}] Stapling notarization ticket...`);
+  run(`xcrun stapler staple "${APP_PATH}"`, "stapler staple");
+  console.log("  Staple OK");
+
+  // ══════════════════════════════════════════
+  // Step 7: Verify notarization via spctl
+  // ══════════════════════════════════════════
+  console.log(`[7/${TOTAL_STEPS}] Verifying Gatekeeper acceptance...`);
+
+  try {
+    const spctlOutput = execSync(
+      `spctl --assess --type execute --verbose=2 "${APP_PATH}" 2>&1`,
+      { encoding: "utf-8", cwd: path.resolve(__dirname, "..") }
+    );
+    console.log(`  ${spctlOutput.trim()}`);
+
+    if (!spctlOutput.includes("accepted")) {
+      console.error("✗ spctl did not return 'accepted'. App may not open cleanly for users.");
+      process.exit(1);
+    }
+    console.log("  Gatekeeper: ACCEPTED");
+  } catch (err) {
+    const output = (err.stdout || "") + (err.stderr || "");
+    console.log(`  ${output.trim()}`);
+    if (output.includes("accepted")) {
+      console.log("  Gatekeeper: ACCEPTED");
+    } else {
+      console.error("✗ spctl verification failed. App will be blocked by Gatekeeper.");
+      process.exit(1);
+    }
+  }
+
+  // ══════════════════════════════════════════
+  // Step 8: Create distribution zip (with stapled ticket)
+  // ══════════════════════════════════════════
+  console.log(`[8/${TOTAL_STEPS}] Creating distribution zip...`);
+  const absZip = path.resolve(__dirname, "..", ZIP_PATH);
+  if (fs.existsSync(absZip)) fs.unlinkSync(absZip);
+
+  run(
+    `ditto -c -k --keepParent "${APP_PATH}" "${ZIP_PATH}"`,
+    "ditto zip (notarized + stapled)"
+  );
+
+  const zipStat = fs.statSync(absZip);
+  const sizeBytes = zipStat.size;
+  const sizeMB = (sizeBytes / 1024 / 1024).toFixed(1);
+  console.log(`  Zip size: ${sizeMB} MB`);
+
+  if (sizeBytes < MIN_ZIP_SIZE) {
+    console.error(`✗ Zip too small (${sizeMB} MB). Expected at least ${(MIN_ZIP_SIZE / 1024 / 1024).toFixed(0)} MB.`);
+    process.exit(1);
+  }
+
+  // ══════════════════════════════════════════
+  // Step 9: Upload zip to R2
+  // ══════════════════════════════════════════
+  console.log(`[9/${TOTAL_STEPS}] Uploading zip to Cloudflare R2...`);
+
+  const s3 = new S3Client({
+    region: "auto",
+    endpoint: `https://${accountId}.r2.cloudflarestorage.com`,
+    credentials: { accessKeyId, secretAccessKey },
+  });
+
+  const zipBuffer = fs.readFileSync(absZip);
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      console.log(`  Uploading ${R2_KEY} (${sizeMB} MB, attempt ${attempt})...`);
+      await s3.send(
+        new PutObjectCommand({
+          Bucket: bucket,
+          Key: R2_KEY,
+          Body: zipBuffer,
+          ContentType: "application/zip",
+          ContentDisposition: `attachment; filename="wolfee-desktop-${pkg.version}.zip"`,
+          CacheControl: "no-cache, no-store, must-revalidate",
+          Metadata: {
+            "wolfee-version": pkg.version,
+            "build-time": new Date().toISOString(),
+            "notarization-id": submissionId,
+          },
+        })
+      );
+      console.log("  Upload OK");
+      break;
+    } catch (err) {
+      console.error(`  Upload failed: ${err.message}`);
+      if (attempt === 2) {
+        console.error("✗ Upload failed after 2 attempts. Aborting.");
+        process.exit(1);
+      }
+      console.log("  Retrying in 3s...");
+      await new Promise((r) => setTimeout(r, 3000));
+    }
+  }
+
+  // ══════════════════════════════════════════
+  // Step 10: Upload latest.json manifest
+  // ══════════════════════════════════════════
+  console.log(`[10/${TOTAL_STEPS}] Uploading update manifest...`);
+
+  const downloadUrl = `${publicBase}/${R2_KEY}`;
+  const releaseNotes = process.env.RELEASE_NOTES || `Wolfee Desktop v${pkg.version}`;
+
+  const manifest = {
+    version: pkg.version,
+    url: downloadUrl,
+    notes: releaseNotes,
+    notarizationId: submissionId,
+    releasedAt: new Date().toISOString(),
+  };
+
+  const manifestKey = "releases/latest.json";
+
+  try {
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: bucket,
+        Key: manifestKey,
+        Body: JSON.stringify(manifest, null, 2),
+        ContentType: "application/json",
+        CacheControl: "max-age=300",
+      })
+    );
+    console.log(`  Uploaded ${manifestKey}`);
+  } catch (err) {
+    console.error(`  Manifest upload failed: ${err.message}`);
+    console.error("  WARNING: Zip uploaded but manifest failed.");
+  }
+
+  // ══════════════════════════════════════════
+  // Step 11: Verify public URL
+  // ══════════════════════════════════════════
+  console.log(`[11/${TOTAL_STEPS}] Verifying public download URL...`);
+  console.log(`  HEAD ${downloadUrl}`);
+
+  try {
+    const check = await httpHead(downloadUrl);
+    console.log(`  Status: ${check.status}`);
+    console.log(`  Content-Length: ${check.contentLength} bytes`);
+
+    if (check.status !== 200) {
+      console.error(`✗ URL returned ${check.status}. Check R2 public access.`);
+      process.exit(1);
+    }
+
+    if (check.contentLength > 0 && Math.abs(check.contentLength - sizeBytes) > 1024) {
+      console.error(`✗ Size mismatch: uploaded ${sizeBytes}, URL reports ${check.contentLength}`);
+      process.exit(1);
+    }
+    console.log("  Verification OK");
+  } catch (err) {
+    console.error(`  Verification failed: ${err.message}`);
+    console.error("  WARNING: Could not verify URL. Check manually: " + downloadUrl);
+  }
+
+  // ══════════════════════════════════════════
+  // Done
+  // ══════════════════════════════════════════
+  const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+  const manifestUrl = `${publicBase}/${manifestKey}`;
+
+  console.log("");
+  console.log("══════════════════════════════════════════");
+  console.log("  Release complete");
+  console.log("══════════════════════════════════════════");
+  console.log(`  Version:         ${pkg.version}`);
+  console.log(`  Zip:             ${ZIP_PATH} (${sizeMB} MB)`);
+  console.log(`  Signed:          YES`);
+  console.log(`  Notarized:       YES (${submissionId})`);
+  console.log(`  Stapled:         YES`);
+  console.log(`  Gatekeeper:      ACCEPTED`);
+  console.log(`  Time:            ${elapsed}s`);
+  console.log("");
+  console.log(`  Download URL:    ${downloadUrl}`);
+  console.log(`  Manifest URL:    ${manifestUrl}`);
+  console.log("══════════════════════════════════════════");
+}
+
+main().catch((err) => {
+  console.error("✗ Unexpected error:", err);
+  process.exit(1);
+});
