@@ -75,7 +75,7 @@ jobs:
       # Notarization uses explicit xcrun notarytool in release.js (not afterSign hook).
       # KEYCHAIN_PATH and APPLE_API_KEY are in GITHUB_ENV from prior steps.
       - name: Build, sign, notarize, and upload
-        timeout-minutes: 25
+        timeout-minutes: 40
         env:
           CI: "true"
           # Signing (electron-builder reads these automatically)

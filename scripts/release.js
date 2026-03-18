@@ -27,7 +27,8 @@ const ZIP_NAME = "wolfee-desktop.zip";
 const ZIP_PATH = `release/${ZIP_NAME}`;
 const R2_KEY = `downloads/${ZIP_NAME}`;
 const MIN_ZIP_SIZE = 50 * 1024 * 1024;
-const NOTARIZE_TIMEOUT = 20 * 60; // 20 minutes — Apple can be slow
+const NOTARIZE_TIMEOUT = 30 * 60; // 30 minutes max for notarization polling
+const NOTARIZE_POLL_INTERVAL = 10; // seconds between status checks
 
 // ── Helpers ──
 
@@ -170,11 +171,11 @@ async function main() {
   console.log("  Signature OK");
 
   // ══════════════════════════════════════════
-  // Step 5: Notarize (explicit xcrun notarytool — no library wrapper)
+  // Step 5: Notarize (async submit + poll — no blocking --wait)
   // ══════════════════════════════════════════
   console.log(`[5/${TOTAL_STEPS}] Notarizing with Apple...`);
-  console.log("  [NOTARIZE] Submitting to Apple...");
   console.log(`  [NOTARIZE] Timeout: ${NOTARIZE_TIMEOUT}s (${(NOTARIZE_TIMEOUT / 60).toFixed(0)} min)`);
+  console.log(`  [NOTARIZE] Poll interval: ${NOTARIZE_POLL_INTERVAL}s`);
   console.log(`  [NOTARIZE] App: ${APP_PATH}`);
   console.log("");
 
@@ -185,62 +186,134 @@ async function main() {
     "Create submission zip"
   );
 
-  const notarizeCmd =
-    `xcrun notarytool submit "release/notarize-submission.zip" ` +
-    `--key "${appleApiKey}" ` +
-    `--key-id "${appleApiKeyId}" ` +
-    `--issuer "${appleApiIssuer}" ` +
-    `--wait 2>&1`;
+  // ── Step 5a: Submit (non-blocking, no --wait) ──
+  console.log("  [NOTARIZE] Submitting to Apple...");
 
-  let notarizeOutput;
+  let submitOutput;
   try {
-    notarizeOutput = execSync(notarizeCmd, {
-      encoding: "utf-8",
-      cwd: path.resolve(__dirname, ".."),
-      timeout: NOTARIZE_TIMEOUT * 1000,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
+    submitOutput = execSync(
+      `xcrun notarytool submit "release/notarize-submission.zip" ` +
+      `--key "${appleApiKey}" ` +
+      `--key-id "${appleApiKeyId}" ` +
+      `--issuer "${appleApiIssuer}" ` +
+      `--output-format json 2>&1`,
+      {
+        encoding: "utf-8",
+        cwd: path.resolve(__dirname, ".."),
+        timeout: 120000, // 2 min for upload
+      }
+    );
   } catch (err) {
-    // execSync throws on non-zero exit OR timeout
-    notarizeOutput = (err.stdout || "") + (err.stderr || "");
-    if (err.killed) {
-      console.error(`\n✗ [NOTARIZE] TIMEOUT after ${NOTARIZE_TIMEOUT}s — Apple did not respond in time`);
-    } else {
-      console.error(`\n✗ [NOTARIZE] Command failed (exit code ${err.status})`);
-    }
-    if (notarizeOutput) console.log(notarizeOutput);
+    const output = (err.stdout || "") + (err.stderr || "");
+    console.error("✗ [NOTARIZE] Submit failed");
+    if (output) console.log(output);
     process.exit(1);
   }
 
-  console.log(notarizeOutput);
+  let submitJson;
+  try {
+    submitJson = JSON.parse(submitOutput);
+  } catch {
+    // notarytool may prefix non-JSON text before the JSON block
+    const jsonStart = submitOutput.indexOf("{");
+    if (jsonStart >= 0) {
+      submitJson = JSON.parse(submitOutput.slice(jsonStart));
+    } else {
+      console.error("✗ [NOTARIZE] Could not parse submission response:");
+      console.log(submitOutput);
+      process.exit(1);
+    }
+  }
 
-  // Parse submission ID and status
-  const idMatch = notarizeOutput.match(/id:\s*([0-9a-f-]+)/i);
-  const statusMatch = notarizeOutput.match(/status:\s*(\w+)/i);
-  const submissionId = idMatch ? idMatch[1] : "unknown";
-  const notarizeStatus = statusMatch ? statusMatch[1] : "unknown";
+  const submissionId = submitJson.id;
+  if (!submissionId) {
+    console.error("✗ [NOTARIZE] No submission ID in response:");
+    console.log(JSON.stringify(submitJson, null, 2));
+    process.exit(1);
+  }
 
-  console.log(`  [NOTARIZE] Submission ID: ${submissionId}`);
-  console.log(`  [NOTARIZE] Status: ${notarizeStatus}`);
+  console.log(`  [NOTARIZE] Submitted → ID: ${submissionId}`);
 
-  if (notarizeStatus.toLowerCase() !== "accepted") {
-    console.error(`✗ [NOTARIZE] FAILED with status: ${notarizeStatus}`);
-    console.error("  Fetching detailed log...\n");
+  // ── Step 5b: Poll for status ──
+  console.log("  [NOTARIZE] Polling...");
 
-    try {
-      const logOutput = execSync(
-        `xcrun notarytool log "${submissionId}" ` +
-        `--key "${appleApiKey}" ` +
-        `--key-id "${appleApiKeyId}" ` +
-        `--issuer "${appleApiIssuer}" 2>&1`,
-        { encoding: "utf-8", cwd: path.resolve(__dirname, ".."), timeout: 60000 }
-      );
-      console.log(logOutput);
-    } catch (logErr) {
-      console.error("  Could not fetch notarization log:", logErr.message);
+  const pollStart = Date.now();
+  let finalStatus = "unknown";
+
+  while (true) {
+    const elapsed = ((Date.now() - pollStart) / 1000).toFixed(0);
+
+    if (Date.now() - pollStart > NOTARIZE_TIMEOUT * 1000) {
+      console.error(`✗ [NOTARIZE] TIMEOUT after ${elapsed}s — Apple did not complete notarization`);
+      process.exit(1);
     }
 
-    process.exit(1);
+    // Wait before checking (Apple needs processing time)
+    await new Promise((r) => setTimeout(r, NOTARIZE_POLL_INTERVAL * 1000));
+
+    let infoOutput;
+    try {
+      infoOutput = execSync(
+        `xcrun notarytool info "${submissionId}" ` +
+        `--key "${appleApiKey}" ` +
+        `--key-id "${appleApiKeyId}" ` +
+        `--issuer "${appleApiIssuer}" ` +
+        `--output-format json 2>&1`,
+        {
+          encoding: "utf-8",
+          cwd: path.resolve(__dirname, ".."),
+          timeout: 30000,
+        }
+      );
+    } catch (err) {
+      const output = (err.stdout || "") + (err.stderr || "");
+      console.log(`  [NOTARIZE] Poll error at ${elapsed}s (will retry): ${(err.message || "").split("\n")[0]}`);
+      if (output) console.log(`    ${output.trim().split("\n")[0]}`);
+      continue;
+    }
+
+    let infoJson;
+    try {
+      infoJson = JSON.parse(infoOutput);
+    } catch {
+      const jsonStart = infoOutput.indexOf("{");
+      if (jsonStart >= 0) {
+        infoJson = JSON.parse(infoOutput.slice(jsonStart));
+      } else {
+        console.log(`  [NOTARIZE] Could not parse poll response at ${elapsed}s (will retry)`);
+        continue;
+      }
+    }
+
+    const status = (infoJson.status || "unknown").toLowerCase();
+    console.log(`  [NOTARIZE] Status: ${infoJson.status || "unknown"} (${elapsed}s elapsed)`);
+
+    if (status === "accepted") {
+      finalStatus = "accepted";
+      break;
+    }
+
+    if (status === "rejected" || status === "invalid") {
+      console.error(`✗ [NOTARIZE] FAILED with status: ${infoJson.status}`);
+      console.error("  Fetching detailed log...\n");
+
+      try {
+        const logOutput = execSync(
+          `xcrun notarytool log "${submissionId}" ` +
+          `--key "${appleApiKey}" ` +
+          `--key-id "${appleApiKeyId}" ` +
+          `--issuer "${appleApiIssuer}" 2>&1`,
+          { encoding: "utf-8", cwd: path.resolve(__dirname, ".."), timeout: 60000 }
+        );
+        console.log(logOutput);
+      } catch (logErr) {
+        console.error("  Could not fetch notarization log:", logErr.message);
+      }
+
+      process.exit(1);
+    }
+
+    // "In Progress" or any other status — keep polling
   }
 
   console.log("  [NOTARIZE] Completed — ACCEPTED");
