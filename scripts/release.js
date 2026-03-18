@@ -3,13 +3,13 @@
 /**
  * Wolfee Desktop — Release Pipeline
  *
- * One-command: build → sign → notarize → staple → zip → upload → verify.
+ * One-command: build → sign → notarize → staple → zip → upload.
  *
  * Required env vars:
- *   R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET
  *   APPLE_API_KEY, APPLE_API_KEY_ID, APPLE_API_ISSUER
  *
- * Optional:
+ * Optional (R2 upload — skipped if not set):
+ *   R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET
  *   R2_PUBLIC_URL / R2_PUBLIC_DOMAIN
  *   RELEASE_NOTES
  */
@@ -104,32 +104,41 @@ async function main() {
   console.log("");
 
   // ══════════════════════════════════════════
-  // Step 1: Validate ALL env vars
+  // Step 1: Validate env vars
   // ══════════════════════════════════════════
   console.log(`[1/${TOTAL_STEPS}] Validating environment...`);
 
-  // R2
-  const accountId = requireEnv("R2_ACCOUNT_ID");
-  const accessKeyId = requireEnv("R2_ACCESS_KEY_ID");
-  const secretAccessKey = requireEnv("R2_SECRET_ACCESS_KEY");
-  const bucket = requireEnv("R2_BUCKET");
-
-  // Apple notarization (API key auth)
+  // Apple notarization (required)
   const appleApiKey = requireEnv("APPLE_API_KEY");
   const appleApiKeyId = requireEnv("APPLE_API_KEY_ID");
   const appleApiIssuer = requireEnv("APPLE_API_ISSUER");
 
-  let publicBase;
-  if (process.env.R2_PUBLIC_URL) {
-    publicBase = process.env.R2_PUBLIC_URL.replace(/\/$/, "");
-  } else if (process.env.R2_PUBLIC_DOMAIN) {
-    publicBase = `https://${process.env.R2_PUBLIC_DOMAIN}`;
+  // R2 (optional — skipped if not configured)
+  const hasR2 = !!(process.env.R2_ACCOUNT_ID && process.env.R2_ACCESS_KEY_ID
+    && process.env.R2_SECRET_ACCESS_KEY && process.env.R2_BUCKET);
+
+  let accountId, accessKeyId, secretAccessKey, bucket, publicBase;
+
+  if (hasR2) {
+    accountId = process.env.R2_ACCOUNT_ID;
+    accessKeyId = process.env.R2_ACCESS_KEY_ID;
+    secretAccessKey = process.env.R2_SECRET_ACCESS_KEY;
+    bucket = process.env.R2_BUCKET;
+
+    if (process.env.R2_PUBLIC_URL) {
+      publicBase = process.env.R2_PUBLIC_URL.replace(/\/$/, "");
+    } else if (process.env.R2_PUBLIC_DOMAIN) {
+      publicBase = `https://${process.env.R2_PUBLIC_DOMAIN}`;
+    } else {
+      publicBase = `https://${bucket}.${accountId}.r2.dev`;
+    }
+
+    console.log(`  R2 bucket:   ${bucket}`);
+    console.log(`  Public base: ${publicBase}`);
   } else {
-    publicBase = `https://${bucket}.${accountId}.r2.dev`;
+    console.log("  [R2] Skipped — using GitHub Releases only");
   }
 
-  console.log(`  R2 bucket:   ${bucket}`);
-  console.log(`  Public base: ${publicBase}`);
   console.log(`  API Key ID:  ${appleApiKeyId}`);
   console.log(`  API Issuer:  ${appleApiIssuer}`);
   console.log("  OK\n");
@@ -323,114 +332,117 @@ async function main() {
   }
 
   // ══════════════════════════════════════════
-  // Step 9: Upload zip to R2
+  // Step 9–11: Upload to R2 (optional)
   // ══════════════════════════════════════════
-  console.log(`[9/${TOTAL_STEPS}] Uploading zip to Cloudflare R2...`);
+  let downloadUrl = "(GitHub Releases)";
+  let manifestUrl = "(GitHub Releases)";
 
-  const s3 = new S3Client({
-    region: "auto",
-    endpoint: `https://${accountId}.r2.cloudflarestorage.com`,
-    credentials: { accessKeyId, secretAccessKey },
-  });
+  if (hasR2) {
+    console.log(`[9/${TOTAL_STEPS}] Uploading zip to Cloudflare R2...`);
 
-  const zipBuffer = fs.readFileSync(absZip);
+    const s3 = new S3Client({
+      region: "auto",
+      endpoint: `https://${accountId}.r2.cloudflarestorage.com`,
+      credentials: { accessKeyId, secretAccessKey },
+    });
 
-  for (let attempt = 1; attempt <= 2; attempt++) {
+    const zipBuffer = fs.readFileSync(absZip);
+
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        console.log(`  Uploading ${R2_KEY} (${sizeMB} MB, attempt ${attempt})...`);
+        await s3.send(
+          new PutObjectCommand({
+            Bucket: bucket,
+            Key: R2_KEY,
+            Body: zipBuffer,
+            ContentType: "application/zip",
+            ContentDisposition: `attachment; filename="wolfee-desktop-${pkg.version}.zip"`,
+            CacheControl: "no-cache, no-store, must-revalidate",
+            Metadata: {
+              "wolfee-version": pkg.version,
+              "build-time": new Date().toISOString(),
+              "notarization-id": submissionId,
+            },
+          })
+        );
+        console.log("  Upload OK");
+        break;
+      } catch (err) {
+        console.error(`  Upload failed: ${err.message}`);
+        if (attempt === 2) {
+          console.error("✗ Upload failed after 2 attempts. Aborting.");
+          process.exit(1);
+        }
+        console.log("  Retrying in 3s...");
+        await new Promise((r) => setTimeout(r, 3000));
+      }
+    }
+
+    console.log(`[10/${TOTAL_STEPS}] Uploading update manifest...`);
+
+    downloadUrl = `${publicBase}/${R2_KEY}`;
+    const releaseNotes = process.env.RELEASE_NOTES || `Wolfee Desktop v${pkg.version}`;
+
+    const manifest = {
+      version: pkg.version,
+      url: downloadUrl,
+      notes: releaseNotes,
+      notarizationId: submissionId,
+      releasedAt: new Date().toISOString(),
+    };
+
+    const manifestKey = "releases/latest.json";
+    manifestUrl = `${publicBase}/${manifestKey}`;
+
     try {
-      console.log(`  Uploading ${R2_KEY} (${sizeMB} MB, attempt ${attempt})...`);
       await s3.send(
         new PutObjectCommand({
           Bucket: bucket,
-          Key: R2_KEY,
-          Body: zipBuffer,
-          ContentType: "application/zip",
-          ContentDisposition: `attachment; filename="wolfee-desktop-${pkg.version}.zip"`,
-          CacheControl: "no-cache, no-store, must-revalidate",
-          Metadata: {
-            "wolfee-version": pkg.version,
-            "build-time": new Date().toISOString(),
-            "notarization-id": submissionId,
-          },
+          Key: manifestKey,
+          Body: JSON.stringify(manifest, null, 2),
+          ContentType: "application/json",
+          CacheControl: "max-age=300",
         })
       );
-      console.log("  Upload OK");
-      break;
+      console.log(`  Uploaded ${manifestKey}`);
     } catch (err) {
-      console.error(`  Upload failed: ${err.message}`);
-      if (attempt === 2) {
-        console.error("✗ Upload failed after 2 attempts. Aborting.");
+      console.error(`  Manifest upload failed: ${err.message}`);
+      console.error("  WARNING: Zip uploaded but manifest failed.");
+    }
+
+    console.log(`[11/${TOTAL_STEPS}] Verifying public download URL...`);
+    console.log(`  HEAD ${downloadUrl}`);
+
+    try {
+      const check = await httpHead(downloadUrl);
+      console.log(`  Status: ${check.status}`);
+      console.log(`  Content-Length: ${check.contentLength} bytes`);
+
+      if (check.status !== 200) {
+        console.error(`✗ URL returned ${check.status}. Check R2 public access.`);
         process.exit(1);
       }
-      console.log("  Retrying in 3s...");
-      await new Promise((r) => setTimeout(r, 3000));
+
+      if (check.contentLength > 0 && Math.abs(check.contentLength - sizeBytes) > 1024) {
+        console.error(`✗ Size mismatch: uploaded ${sizeBytes}, URL reports ${check.contentLength}`);
+        process.exit(1);
+      }
+      console.log("  Verification OK");
+    } catch (err) {
+      console.error(`  Verification failed: ${err.message}`);
+      console.error("  WARNING: Could not verify URL. Check manually: " + downloadUrl);
     }
-  }
-
-  // ══════════════════════════════════════════
-  // Step 10: Upload latest.json manifest
-  // ══════════════════════════════════════════
-  console.log(`[10/${TOTAL_STEPS}] Uploading update manifest...`);
-
-  const downloadUrl = `${publicBase}/${R2_KEY}`;
-  const releaseNotes = process.env.RELEASE_NOTES || `Wolfee Desktop v${pkg.version}`;
-
-  const manifest = {
-    version: pkg.version,
-    url: downloadUrl,
-    notes: releaseNotes,
-    notarizationId: submissionId,
-    releasedAt: new Date().toISOString(),
-  };
-
-  const manifestKey = "releases/latest.json";
-
-  try {
-    await s3.send(
-      new PutObjectCommand({
-        Bucket: bucket,
-        Key: manifestKey,
-        Body: JSON.stringify(manifest, null, 2),
-        ContentType: "application/json",
-        CacheControl: "max-age=300",
-      })
-    );
-    console.log(`  Uploaded ${manifestKey}`);
-  } catch (err) {
-    console.error(`  Manifest upload failed: ${err.message}`);
-    console.error("  WARNING: Zip uploaded but manifest failed.");
-  }
-
-  // ══════════════════════════════════════════
-  // Step 11: Verify public URL
-  // ══════════════════════════════════════════
-  console.log(`[11/${TOTAL_STEPS}] Verifying public download URL...`);
-  console.log(`  HEAD ${downloadUrl}`);
-
-  try {
-    const check = await httpHead(downloadUrl);
-    console.log(`  Status: ${check.status}`);
-    console.log(`  Content-Length: ${check.contentLength} bytes`);
-
-    if (check.status !== 200) {
-      console.error(`✗ URL returned ${check.status}. Check R2 public access.`);
-      process.exit(1);
-    }
-
-    if (check.contentLength > 0 && Math.abs(check.contentLength - sizeBytes) > 1024) {
-      console.error(`✗ Size mismatch: uploaded ${sizeBytes}, URL reports ${check.contentLength}`);
-      process.exit(1);
-    }
-    console.log("  Verification OK");
-  } catch (err) {
-    console.error(`  Verification failed: ${err.message}`);
-    console.error("  WARNING: Could not verify URL. Check manually: " + downloadUrl);
+  } else {
+    console.log(`[9/${TOTAL_STEPS}] [R2] Skipped — not configured`);
+    console.log(`[10/${TOTAL_STEPS}] [R2] Skipped — not configured`);
+    console.log(`[11/${TOTAL_STEPS}] [R2] Skipped — using GitHub Releases only`);
   }
 
   // ══════════════════════════════════════════
   // Done
   // ══════════════════════════════════════════
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-  const manifestUrl = `${publicBase}/${manifestKey}`;
 
   console.log("");
   console.log("══════════════════════════════════════════");
@@ -442,10 +454,11 @@ async function main() {
   console.log(`  Notarized:       YES (${submissionId})`);
   console.log(`  Stapled:         YES`);
   console.log(`  Gatekeeper:      ACCEPTED`);
+  console.log(`  R2:              ${hasR2 ? "YES" : "SKIPPED"}`);
   console.log(`  Time:            ${elapsed}s`);
   console.log("");
-  console.log(`  Download URL:    ${downloadUrl}`);
-  console.log(`  Manifest URL:    ${manifestUrl}`);
+  console.log(`  Download:        ${downloadUrl}`);
+  console.log(`  Manifest:        ${manifestUrl}`);
   console.log("══════════════════════════════════════════");
 }
 
