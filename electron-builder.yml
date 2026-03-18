@@ -28,6 +28,8 @@ mac:
 dmg:
   sign: false
 
+publish: null
+
 extraResources:
   - from: node_modules/ffmpeg-static/ffmpeg
     to: ffmpeg

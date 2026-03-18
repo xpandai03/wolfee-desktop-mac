@@ -154,7 +154,7 @@ async function main() {
   // Step 3: Package + Sign
   // ══════════════════════════════════════════
   console.log(`[3/${TOTAL_STEPS}] Packaging + signing...`);
-  run("npx electron-builder --mac --arm64", "electron-builder");
+  run("npx electron-builder --mac --arm64 --publish never", "electron-builder");
 
   const absApp = path.resolve(__dirname, "..", APP_PATH);
   if (!fs.existsSync(absApp)) {
