@@ -13,9 +13,15 @@ exports.default = async function notarizing(context) {
   const hasAppleId = process.env.APPLE_ID && process.env.APPLE_ID_PASSWORD && process.env.APPLE_TEAM_ID;
 
   if (!hasApiKey && !hasAppleId) {
-    console.log("[Notarize] Skipping — no Apple credentials set");
-    console.log("[Notarize] Set APPLE_API_KEY/APPLE_API_KEY_ID/APPLE_API_ISSUER for API key auth");
-    console.log("[Notarize] Or set APPLE_ID/APPLE_ID_PASSWORD/APPLE_TEAM_ID for Apple ID auth");
+    // In CI, missing credentials is a hard error — we must notarize.
+    // Locally, skip silently so `npm run dist:unsigned` still works.
+    if (process.env.CI) {
+      throw new Error(
+        "[Notarize] FATAL: No Apple credentials set in CI. " +
+        "Set APPLE_API_KEY + APPLE_API_KEY_ID + APPLE_API_ISSUER secrets."
+      );
+    }
+    console.log("[Notarize] Skipping — no Apple credentials set (local build)");
     return;
   }
 

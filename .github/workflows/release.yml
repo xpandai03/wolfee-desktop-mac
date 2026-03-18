@@ -72,14 +72,16 @@ jobs:
           echo "APPLE_API_KEY=$API_KEY_DIR/AuthKey_${{ secrets.APPLE_API_KEY_ID }}.p8" >> "$GITHUB_ENV"
 
       # ── Build + Sign + Notarize + Upload ──
+      # Note: KEYCHAIN_PATH and APPLE_API_KEY are written to GITHUB_ENV
+      # in earlier steps, so they're available as env vars at run time
+      # (not via ${{ env.X }} which evaluates at parse time).
       - name: Build, sign, notarize, and upload
         env:
+          CI: "true"
           # Signing (electron-builder reads these automatically)
           CSC_LINK: ${{ secrets.CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
-          CSC_KEYCHAIN: ${{ env.KEYCHAIN_PATH }}
           # Notarization (read by scripts/notarize.js afterSign hook)
-          APPLE_API_KEY: ${{ env.APPLE_API_KEY }}
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           # R2 upload (read by scripts/release.js)
@@ -88,7 +90,11 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
           R2_PUBLIC_URL: ${{ secrets.R2_PUBLIC_URL }}
-        run: node scripts/release.js
+        run: |
+          # KEYCHAIN_PATH and APPLE_API_KEY were set via GITHUB_ENV in prior steps.
+          # Export them under the names electron-builder and notarize.js expect.
+          export CSC_KEYCHAIN="$KEYCHAIN_PATH"
+          node scripts/release.js
 
       # ── Verify ──
       - name: Verify build artifacts
@@ -96,11 +102,17 @@ jobs:
           echo "── Artifacts ──"
           ls -lh release/*.zip release/*.dmg 2>/dev/null || true
           echo ""
-          echo "── Codesign ──"
+          echo "── Codesign (.app) ──"
           codesign --verify --deep --strict "release/mac-arm64/Wolfee Desktop.app" 2>&1
           echo ""
-          echo "── Staple ──"
+          echo "── Staple (.app) ──"
           xcrun stapler validate "release/mac-arm64/Wolfee Desktop.app" 2>&1
+          echo ""
+          echo "── Staple (.dmg) ──"
+          xcrun stapler validate release/*.dmg 2>&1
+          echo ""
+          echo "── Gatekeeper ──"
+          spctl --assess --type execute --verbose=2 "release/mac-arm64/Wolfee Desktop.app" 2>&1 || true
 
       # ── Upload artifacts to GitHub Release ──
       - name: Upload to GitHub Release

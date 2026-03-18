@@ -277,6 +277,30 @@ async function main() {
   }
 
   // ══════════════════════════════════════════
+  // Step 7b: Re-create DMG with stapled app + staple the DMG itself
+  // ══════════════════════════════════════════
+  console.log(`[7b/${TOTAL_STEPS}] Re-creating DMG with stapled app...`);
+
+  // Remove the stale DMG that electron-builder created before notarization
+  const dmgGlob = fs.readdirSync(path.resolve(__dirname, "..", "release"))
+    .filter((f) => f.endsWith(".dmg"));
+  for (const dmg of dmgGlob) {
+    fs.unlinkSync(path.resolve(__dirname, "..", "release", dmg));
+  }
+
+  // Create fresh DMG from the notarized+stapled .app
+  const dmgName = `Wolfee Desktop-${pkg.version}-arm64.dmg`;
+  const DMG_PATH = `release/${dmgName}`;
+  run(
+    `hdiutil create -volname "Wolfee Desktop" -srcfolder "${APP_PATH}" -ov -format UDZO "${DMG_PATH}"`,
+    "hdiutil create DMG"
+  );
+
+  // Staple the DMG itself (so offline Gatekeeper checks pass on the DMG too)
+  run(`xcrun stapler staple "${DMG_PATH}"`, "stapler staple DMG");
+  console.log("  DMG stapled OK");
+
+  // ══════════════════════════════════════════
   // Step 8: Create distribution zip (with stapled ticket)
   // ══════════════════════════════════════════
   console.log(`[8/${TOTAL_STEPS}] Creating distribution zip...`);
