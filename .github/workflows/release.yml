@@ -72,16 +72,16 @@ jobs:
           echo "APPLE_API_KEY=$API_KEY_DIR/AuthKey_${{ secrets.APPLE_API_KEY_ID }}.p8" >> "$GITHUB_ENV"
 
       # ── Build + Sign + Notarize + Upload ──
-      # Note: KEYCHAIN_PATH and APPLE_API_KEY are written to GITHUB_ENV
-      # in earlier steps, so they're available as env vars at run time
-      # (not via ${{ env.X }} which evaluates at parse time).
+      # Notarization uses explicit xcrun notarytool in release.js (not afterSign hook).
+      # KEYCHAIN_PATH and APPLE_API_KEY are in GITHUB_ENV from prior steps.
       - name: Build, sign, notarize, and upload
+        timeout-minutes: 25
         env:
           CI: "true"
           # Signing (electron-builder reads these automatically)
           CSC_LINK: ${{ secrets.CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
-          # Notarization (read by scripts/notarize.js afterSign hook)
+          # Notarization (read by release.js — explicit xcrun notarytool)
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           # R2 upload (optional — pipeline works without these)
@@ -91,8 +91,6 @@ jobs:
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
           R2_PUBLIC_URL: ${{ secrets.R2_PUBLIC_URL }}
         run: |
-          # KEYCHAIN_PATH and APPLE_API_KEY were set via GITHUB_ENV in prior steps.
-          # Export them under the names electron-builder and notarize.js expect.
           export CSC_KEYCHAIN="$KEYCHAIN_PATH"
           node scripts/release.js
 

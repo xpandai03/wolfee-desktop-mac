@@ -27,7 +27,7 @@ const ZIP_NAME = "wolfee-desktop.zip";
 const ZIP_PATH = `release/${ZIP_NAME}`;
 const R2_KEY = `downloads/${ZIP_NAME}`;
 const MIN_ZIP_SIZE = 50 * 1024 * 1024;
-const NOTARIZE_TIMEOUT = 15 * 60; // 15 minutes max wait
+const NOTARIZE_TIMEOUT = 20 * 60; // 20 minutes — Apple can be slow
 
 // ── Helpers ──
 
@@ -170,92 +170,91 @@ async function main() {
   console.log("  Signature OK");
 
   // ══════════════════════════════════════════
-  // Step 5: Notarize
+  // Step 5: Notarize (explicit xcrun notarytool — no library wrapper)
   // ══════════════════════════════════════════
   console.log(`[5/${TOTAL_STEPS}] Notarizing with Apple...`);
+  console.log("  [NOTARIZE] Submitting to Apple...");
+  console.log(`  [NOTARIZE] Timeout: ${NOTARIZE_TIMEOUT}s (${(NOTARIZE_TIMEOUT / 60).toFixed(0)} min)`);
+  console.log(`  [NOTARIZE] App: ${APP_PATH}`);
+  console.log("");
 
-  // Check if afterSign hook already notarized the app
-  let alreadyNotarized = false;
+  // Create submission zip — more reliable than submitting .app directly
+  const notarizeZip = path.resolve(__dirname, "..", "release", "notarize-submission.zip");
+  run(
+    `ditto -c -k --keepParent "${APP_PATH}" "release/notarize-submission.zip"`,
+    "Create submission zip"
+  );
+
+  const notarizeCmd =
+    `xcrun notarytool submit "release/notarize-submission.zip" ` +
+    `--key "${appleApiKey}" ` +
+    `--key-id "${appleApiKeyId}" ` +
+    `--issuer "${appleApiIssuer}" ` +
+    `--wait 2>&1`;
+
+  let notarizeOutput;
   try {
-    execSync(`xcrun stapler validate "${APP_PATH}" 2>&1`, {
+    notarizeOutput = execSync(notarizeCmd, {
       encoding: "utf-8",
       cwd: path.resolve(__dirname, ".."),
+      timeout: NOTARIZE_TIMEOUT * 1000,
+      stdio: ["pipe", "pipe", "pipe"],
     });
-    alreadyNotarized = true;
-    console.log("  Already notarized (afterSign hook handled it). Skipping.");
-  } catch {
-    // Not yet notarized — proceed
+  } catch (err) {
+    // execSync throws on non-zero exit OR timeout
+    notarizeOutput = (err.stdout || "") + (err.stderr || "");
+    if (err.killed) {
+      console.error(`\n✗ [NOTARIZE] TIMEOUT after ${NOTARIZE_TIMEOUT}s — Apple did not respond in time`);
+    } else {
+      console.error(`\n✗ [NOTARIZE] Command failed (exit code ${err.status})`);
+    }
+    if (notarizeOutput) console.log(notarizeOutput);
+    process.exit(1);
   }
 
-  let submissionId = "none";
+  console.log(notarizeOutput);
 
-  if (alreadyNotarized) {
-    submissionId = "afterSign";
-  } else {
-    console.log("  [Notarize] Using API key auth");
-    console.log("  This may take 2-10 minutes. Waiting...\n");
+  // Parse submission ID and status
+  const idMatch = notarizeOutput.match(/id:\s*([0-9a-f-]+)/i);
+  const statusMatch = notarizeOutput.match(/status:\s*(\w+)/i);
+  const submissionId = idMatch ? idMatch[1] : "unknown";
+  const notarizeStatus = statusMatch ? statusMatch[1] : "unknown";
 
-    // notarytool can submit a .app directory directly (it zips internally)
-    // but submitting a zip is more reliable — create a temp zip for submission
-    const notarizeZip = path.resolve(__dirname, "..", "release", "notarize-submission.zip");
-    run(
-      `ditto -c -k --keepParent "${APP_PATH}" "release/notarize-submission.zip"`,
-      "Create submission zip"
-    );
+  console.log(`  [NOTARIZE] Submission ID: ${submissionId}`);
+  console.log(`  [NOTARIZE] Status: ${notarizeStatus}`);
 
-    const notarizeOutput = runCapture(
-      `xcrun notarytool submit "release/notarize-submission.zip" ` +
-      `--key "${appleApiKey}" ` +
-      `--key-id "${appleApiKeyId}" ` +
-      `--issuer "${appleApiIssuer}" ` +
-      `--wait 2>&1`,
-      "notarytool submit --wait"
-    );
+  if (notarizeStatus.toLowerCase() !== "accepted") {
+    console.error(`✗ [NOTARIZE] FAILED with status: ${notarizeStatus}`);
+    console.error("  Fetching detailed log...\n");
 
-    console.log(notarizeOutput);
-
-    // Parse submission ID for logging
-    const idMatch = notarizeOutput.match(/id:\s*([0-9a-f-]+)/i);
-    const statusMatch = notarizeOutput.match(/status:\s*(\w+)/i);
-    submissionId = idMatch ? idMatch[1] : "unknown";
-    const notarizeStatus = statusMatch ? statusMatch[1] : "unknown";
-
-    console.log(`  Submission ID: ${submissionId}`);
-    console.log(`  Status: ${notarizeStatus}`);
-
-    if (notarizeStatus.toLowerCase() !== "accepted") {
-      console.error(`✗ Notarization failed with status: ${notarizeStatus}`);
-      console.error("  Fetching detailed log...\n");
-
-      // Try to get the log for debugging
-      try {
-        const logOutput = execSync(
-          `xcrun notarytool log "${submissionId}" ` +
-          `--key "${appleApiKey}" ` +
-          `--key-id "${appleApiKeyId}" ` +
-          `--issuer "${appleApiIssuer}" 2>&1`,
-          { encoding: "utf-8", cwd: path.resolve(__dirname, "..") }
-        );
-        console.log(logOutput);
-      } catch (logErr) {
-        console.error("  Could not fetch notarization log:", logErr.message);
-      }
-
-      process.exit(1);
+    try {
+      const logOutput = execSync(
+        `xcrun notarytool log "${submissionId}" ` +
+        `--key "${appleApiKey}" ` +
+        `--key-id "${appleApiKeyId}" ` +
+        `--issuer "${appleApiIssuer}" 2>&1`,
+        { encoding: "utf-8", cwd: path.resolve(__dirname, ".."), timeout: 60000 }
+      );
+      console.log(logOutput);
+    } catch (logErr) {
+      console.error("  Could not fetch notarization log:", logErr.message);
     }
 
-    console.log("  Notarization ACCEPTED");
-
-    // Clean up submission zip
-    if (fs.existsSync(notarizeZip)) fs.unlinkSync(notarizeZip);
+    process.exit(1);
   }
 
+  console.log("  [NOTARIZE] Completed — ACCEPTED");
+
+  // Clean up submission zip
+  if (fs.existsSync(notarizeZip)) fs.unlinkSync(notarizeZip);
+
   // ══════════════════════════════════════════
-  // Step 6: Staple
+  // Step 6: Staple + Validate
   // ══════════════════════════════════════════
   console.log(`[6/${TOTAL_STEPS}] Stapling notarization ticket...`);
-  run(`xcrun stapler staple "${APP_PATH}"`, "stapler staple");
-  console.log("  Staple OK");
+  run(`xcrun stapler staple "${APP_PATH}"`, "stapler staple .app");
+  run(`xcrun stapler validate "${APP_PATH}"`, "stapler validate .app");
+  console.log("  Staple OK — validated");
 
   // ══════════════════════════════════════════
   // Step 7: Verify notarization via spctl
