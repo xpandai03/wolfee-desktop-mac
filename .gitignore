@@ -9,3 +9,12 @@ certs/
 *.p12
 *.p8
 .env
+
+# Tauri build artifacts
+src-tauri/target/
+
+# Test artifacts
+stripped.app/
+stripped.dmg
+test.app/
+test.zip

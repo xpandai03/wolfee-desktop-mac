@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 
 /**
- * Wolfee Desktop — Release Pipeline
+ * Wolfee Desktop — Tauri Release Pipeline
  *
- * One-command: build → sign → notarize → staple → zip → upload.
+ * One-command: build → sign → notarize → staple → upload.
  *
  * Required env vars:
  *   APPLE_API_KEY, APPLE_API_KEY_ID, APPLE_API_ISSUER
@@ -21,14 +21,21 @@ const https = require("https");
 const http = require("http");
 const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
 
-const APP_NAME = "Wolfee Desktop";
-const APP_PATH = `release/mac-arm64/${APP_NAME}.app`;
-const ZIP_NAME = "wolfee-desktop.zip";
-const ZIP_PATH = `release/${ZIP_NAME}`;
-const R2_KEY = `downloads/${ZIP_NAME}`;
-const MIN_ZIP_SIZE = 50 * 1024 * 1024;
-const NOTARIZE_TIMEOUT = 30 * 60; // 30 minutes max for notarization polling
-const NOTARIZE_POLL_INTERVAL = 10; // seconds between status checks
+const TAURI_CONF = require("../src-tauri/tauri.conf.json");
+const VERSION = TAURI_CONF.version;
+const APP_NAME = TAURI_CONF.productName;
+
+// Tauri 2 bundle output paths
+const BUNDLE_DIR = "src-tauri/target/release/bundle";
+const APP_PATH = `${BUNDLE_DIR}/macos/${APP_NAME}.app`;
+const DMG_DIR = `${BUNDLE_DIR}/dmg`;
+
+const SIGNING_IDENTITY = "Developer ID Application: XPAND TECHNOLOGY LLC (LT73Z72CKR)";
+const DMG_NAME = `wolfee-desktop.dmg`;
+const R2_KEY = `downloads/${DMG_NAME}`;
+const MIN_DMG_SIZE = 10 * 1024 * 1024; // 10 MB min for Tauri app
+const NOTARIZE_TIMEOUT = 30 * 60;
+const NOTARIZE_POLL_INTERVAL = 10;
 
 // ── Helpers ──
 
@@ -43,7 +50,6 @@ function run(cmd, label) {
   }
 }
 
-/** Run a command and return its stdout */
 function runCapture(cmd, label) {
   console.log(`\n→ ${label}`);
   console.log(`  $ ${cmd}\n`);
@@ -54,8 +60,6 @@ function runCapture(cmd, label) {
       timeout: NOTARIZE_TIMEOUT * 1000,
     });
   } catch (err) {
-    // notarytool and spctl write to stderr, execSync throws on non-zero exit
-    // but the output is still useful
     const output = (err.stdout || "") + (err.stderr || "");
     if (output) console.log(output);
     console.error(`\n✗ FAILED: ${label}`);
@@ -93,15 +97,14 @@ function httpHead(url) {
 
 async function main() {
   const startTime = Date.now();
-  const pkg = require("../package.json");
-  const TOTAL_STEPS = 11;
+  const TOTAL_STEPS = 9;
 
   console.log("══════════════════════════════════════════");
-  console.log("  Wolfee Desktop — Release Pipeline");
+  console.log("  Wolfee Desktop — Tauri Release Pipeline");
   console.log("══════════════════════════════════════════");
-  console.log(`  version: ${pkg.version}`);
+  console.log(`  version: ${VERSION}`);
   console.log(`  target:  macOS arm64`);
-  console.log(`  steps:   ${TOTAL_STEPS}`);
+  console.log(`  engine:  Tauri 2`);
   console.log("");
 
   // ══════════════════════════════════════════
@@ -109,12 +112,10 @@ async function main() {
   // ══════════════════════════════════════════
   console.log(`[1/${TOTAL_STEPS}] Validating environment...`);
 
-  // Apple notarization (required)
   const appleApiKey = requireEnv("APPLE_API_KEY");
   const appleApiKeyId = requireEnv("APPLE_API_KEY_ID");
   const appleApiIssuer = requireEnv("APPLE_API_ISSUER");
 
-  // R2 (optional — skipped if not configured)
   const hasR2 = !!(process.env.R2_ACCOUNT_ID && process.env.R2_ACCESS_KEY_ID
     && process.env.R2_SECRET_ACCESS_KEY && process.env.R2_BUCKET);
 
@@ -137,7 +138,7 @@ async function main() {
     console.log(`  R2 bucket:   ${bucket}`);
     console.log(`  Public base: ${publicBase}`);
   } else {
-    console.log("  [R2] Skipped — using GitHub Releases only");
+    console.log("  [R2] Skipped — not configured");
   }
 
   console.log(`  API Key ID:  ${appleApiKeyId}`);
@@ -145,54 +146,80 @@ async function main() {
   console.log("  OK\n");
 
   // ══════════════════════════════════════════
-  // Step 2: Clean + Build
+  // Step 2: Build with Tauri (compile + bundle + sign)
   // ══════════════════════════════════════════
-  console.log(`[2/${TOTAL_STEPS}] Building...`);
-  run("rm -rf dist release", "Clean previous build");
-  run("npm run build", "Compile TypeScript");
+  console.log(`[2/${TOTAL_STEPS}] Building with Tauri...`);
+  console.log("  Tauri handles: compile → bundle .app → code sign → create DMG\n");
+  run("cargo tauri build", "cargo tauri build");
 
-  // ══════════════════════════════════════════
-  // Step 3: Package + Sign
-  // ══════════════════════════════════════════
-  console.log(`[3/${TOTAL_STEPS}] Packaging + signing...`);
-  run("npx electron-builder --mac --arm64 --publish never", "electron-builder");
-
+  // Verify .app exists
   const absApp = path.resolve(__dirname, "..", APP_PATH);
   if (!fs.existsSync(absApp)) {
     console.error(`✗ Build output not found: ${APP_PATH}`);
     process.exit(1);
   }
+  console.log(`  ✓ App bundle: ${APP_PATH}`);
 
   // ══════════════════════════════════════════
-  // Step 4: Verify code signature
+  // Step 3: Verify code signature
   // ══════════════════════════════════════════
-  console.log(`[4/${TOTAL_STEPS}] Verifying code signature...`);
-  run(`codesign --verify --deep --strict "${APP_PATH}"`, "codesign verify");
-  console.log("  Signature OK");
+  console.log(`[3/${TOTAL_STEPS}] Verifying code signature...`);
+
+  try {
+    execSync(
+      `codesign --verify --deep --strict "${APP_PATH}" 2>&1`,
+      { encoding: "utf-8", cwd: path.resolve(__dirname, "..") }
+    );
+    console.log("  ✓ Signature valid");
+  } catch (err) {
+    const output = (err.stdout || "") + (err.stderr || "");
+    console.error("✗ Signature verification failed:");
+    console.error(output);
+    process.exit(1);
+  }
 
   // ══════════════════════════════════════════
-  // Step 5: Notarize (async submit + poll — no blocking --wait)
+  // Step 4: Find DMG (Tauri creates it)
   // ══════════════════════════════════════════
-  console.log(`[5/${TOTAL_STEPS}] Notarizing with Apple...`);
-  console.log(`  [NOTARIZE] Timeout: ${NOTARIZE_TIMEOUT}s (${(NOTARIZE_TIMEOUT / 60).toFixed(0)} min)`);
-  console.log(`  [NOTARIZE] Poll interval: ${NOTARIZE_POLL_INTERVAL}s`);
-  console.log(`  [NOTARIZE] App: ${APP_PATH}`);
-  console.log("");
+  console.log(`[4/${TOTAL_STEPS}] Locating DMG...`);
 
-  // Create submission zip — more reliable than submitting .app directly
-  const notarizeZip = path.resolve(__dirname, "..", "release", "notarize-submission.zip");
-  run(
-    `ditto -c -k --keepParent "${APP_PATH}" "release/notarize-submission.zip"`,
-    "Create submission zip"
-  );
+  const absDmgDir = path.resolve(__dirname, "..", DMG_DIR);
+  let dmgFile;
 
-  // ── Step 5a: Submit (non-blocking, no --wait) ──
-  console.log("  [NOTARIZE] Submitting to Apple...");
+  if (fs.existsSync(absDmgDir)) {
+    const dmgs = fs.readdirSync(absDmgDir).filter((f) => f.endsWith(".dmg"));
+    if (dmgs.length > 0) {
+      dmgFile = path.join(DMG_DIR, dmgs[0]);
+      console.log(`  ✓ Tauri DMG: ${dmgFile}`);
+    }
+  }
+
+  // If Tauri didn't create a DMG, create one manually
+  if (!dmgFile) {
+    console.log("  Tauri DMG not found — creating manually...");
+    dmgFile = `${BUNDLE_DIR}/dmg/${APP_NAME}-${VERSION}.dmg`;
+    const dmgDir = path.resolve(__dirname, "..", `${BUNDLE_DIR}/dmg`);
+    if (!fs.existsSync(dmgDir)) fs.mkdirSync(dmgDir, { recursive: true });
+    run(
+      `hdiutil create -volname "${APP_NAME}" -srcfolder "${APP_PATH}" -ov -format UDZO "${dmgFile}"`,
+      "hdiutil create DMG"
+    );
+  }
+
+  const absDmg = path.resolve(__dirname, "..", dmgFile);
+  const dmgSizeMB = (fs.statSync(absDmg).size / 1024 / 1024).toFixed(1);
+  console.log(`  DMG: ${dmgFile} (${dmgSizeMB} MB)`);
+
+  // ══════════════════════════════════════════
+  // Step 5: Notarize DMG
+  // ══════════════════════════════════════════
+  console.log(`[5/${TOTAL_STEPS}] Notarizing DMG with Apple...`);
+  console.log(`  Timeout: ${NOTARIZE_TIMEOUT}s | Poll: ${NOTARIZE_POLL_INTERVAL}s\n`);
 
   let submitOutput;
   try {
     submitOutput = execSync(
-      `xcrun notarytool submit "release/notarize-submission.zip" ` +
+      `xcrun notarytool submit "${dmgFile}" ` +
       `--key "${appleApiKey}" ` +
       `--key-id "${appleApiKeyId}" ` +
       `--issuer "${appleApiIssuer}" ` +
@@ -200,7 +227,7 @@ async function main() {
       {
         encoding: "utf-8",
         cwd: path.resolve(__dirname, ".."),
-        timeout: 120000, // 2 min for upload
+        timeout: 300000,
       }
     );
   } catch (err) {
@@ -214,7 +241,6 @@ async function main() {
   try {
     submitJson = JSON.parse(submitOutput);
   } catch {
-    // notarytool may prefix non-JSON text before the JSON block
     const jsonStart = submitOutput.indexOf("{");
     if (jsonStart >= 0) {
       submitJson = JSON.parse(submitOutput.slice(jsonStart));
@@ -232,23 +258,19 @@ async function main() {
     process.exit(1);
   }
 
-  console.log(`  [NOTARIZE] Submitted → ID: ${submissionId}`);
-
-  // ── Step 5b: Poll for status ──
-  console.log("  [NOTARIZE] Polling...");
+  console.log(`  Submitted → ID: ${submissionId}`);
+  console.log("  Polling...");
 
   const pollStart = Date.now();
-  let finalStatus = "unknown";
 
   while (true) {
     const elapsed = ((Date.now() - pollStart) / 1000).toFixed(0);
 
     if (Date.now() - pollStart > NOTARIZE_TIMEOUT * 1000) {
-      console.error(`✗ [NOTARIZE] TIMEOUT after ${elapsed}s — Apple did not complete notarization`);
+      console.error(`✗ [NOTARIZE] TIMEOUT after ${elapsed}s`);
       process.exit(1);
     }
 
-    // Wait before checking (Apple needs processing time)
     await new Promise((r) => setTimeout(r, NOTARIZE_POLL_INTERVAL * 1000));
 
     let infoOutput;
@@ -266,9 +288,7 @@ async function main() {
         }
       );
     } catch (err) {
-      const output = (err.stdout || "") + (err.stderr || "");
-      console.log(`  [NOTARIZE] Poll error at ${elapsed}s (will retry): ${(err.message || "").split("\n")[0]}`);
-      if (output) console.log(`    ${output.trim().split("\n")[0]}`);
+      console.log(`  Poll error at ${elapsed}s (will retry)`);
       continue;
     }
 
@@ -280,23 +300,17 @@ async function main() {
       if (jsonStart >= 0) {
         infoJson = JSON.parse(infoOutput.slice(jsonStart));
       } else {
-        console.log(`  [NOTARIZE] Could not parse poll response at ${elapsed}s (will retry)`);
         continue;
       }
     }
 
     const status = (infoJson.status || "unknown").toLowerCase();
-    console.log(`  [NOTARIZE] Status: ${infoJson.status || "unknown"} (${elapsed}s elapsed)`);
+    console.log(`  Status: ${infoJson.status || "unknown"} (${elapsed}s)`);
 
-    if (status === "accepted") {
-      finalStatus = "accepted";
-      break;
-    }
+    if (status === "accepted") break;
 
     if (status === "rejected" || status === "invalid") {
-      console.error(`✗ [NOTARIZE] FAILED with status: ${infoJson.status}`);
-      console.error("  Fetching detailed log...\n");
-
+      console.error(`✗ [NOTARIZE] FAILED: ${infoJson.status}`);
       try {
         const logOutput = execSync(
           `xcrun notarytool log "${submissionId}" ` +
@@ -306,111 +320,54 @@ async function main() {
           { encoding: "utf-8", cwd: path.resolve(__dirname, ".."), timeout: 60000 }
         );
         console.log(logOutput);
-      } catch (logErr) {
-        console.error("  Could not fetch notarization log:", logErr.message);
-      }
-
+      } catch {}
       process.exit(1);
     }
-
-    // "In Progress" or any other status — keep polling
   }
 
-  console.log("  [NOTARIZE] Completed — ACCEPTED");
-
-  // Clean up submission zip
-  if (fs.existsSync(notarizeZip)) fs.unlinkSync(notarizeZip);
+  console.log("  ✓ Notarized");
 
   // ══════════════════════════════════════════
   // Step 6: Staple + Validate
   // ══════════════════════════════════════════
   console.log(`[6/${TOTAL_STEPS}] Stapling notarization ticket...`);
-  run(`xcrun stapler staple "${APP_PATH}"`, "stapler staple .app");
-  run(`xcrun stapler validate "${APP_PATH}"`, "stapler validate .app");
-  console.log("  Staple OK — validated");
 
-  // ══════════════════════════════════════════
-  // Step 7: Verify notarization via spctl
-  // ══════════════════════════════════════════
-  console.log(`[7/${TOTAL_STEPS}] Verifying Gatekeeper acceptance...`);
+  run(`xcrun stapler staple "${APP_PATH}"`, "staple .app");
+  run(`xcrun stapler staple "${dmgFile}"`, "staple DMG");
+  run(`xcrun stapler validate "${dmgFile}"`, "validate DMG");
 
+  // Verify with spctl
+  console.log("  Verifying with spctl...");
   try {
-    const spctlOutput = execSync(
-      `spctl --assess --type execute --verbose=2 "${APP_PATH}" 2>&1`,
+    const spctlOut = execSync(
+      `spctl -a -vvv -t install "${dmgFile}" 2>&1`,
       { encoding: "utf-8", cwd: path.resolve(__dirname, "..") }
     );
-    console.log(`  ${spctlOutput.trim()}`);
-
-    if (!spctlOutput.includes("accepted")) {
-      console.error("✗ spctl did not return 'accepted'. App may not open cleanly for users.");
+    console.log(`  ${spctlOut.trim()}`);
+    if (!spctlOut.includes("Notarized Developer ID")) {
+      console.error("✗ DMG is NOT notarized according to spctl");
       process.exit(1);
     }
-    console.log("  Gatekeeper: ACCEPTED");
+    console.log("  ✓ spctl: Notarized Developer ID");
   } catch (err) {
     const output = (err.stdout || "") + (err.stderr || "");
-    console.log(`  ${output.trim()}`);
-    if (output.includes("accepted")) {
-      console.log("  Gatekeeper: ACCEPTED");
+    if (output && output.includes("Notarized Developer ID")) {
+      console.log("  ✓ spctl: Notarized Developer ID");
     } else {
-      console.error("✗ spctl verification failed. App will be blocked by Gatekeeper.");
+      console.error("✗ spctl verification failed:");
+      if (output) console.error(output);
       process.exit(1);
     }
   }
 
   // ══════════════════════════════════════════
-  // Step 7b: Re-create DMG with stapled app + staple the DMG itself
+  // Step 7–9: Upload to R2 (optional)
   // ══════════════════════════════════════════
-  console.log(`[7b/${TOTAL_STEPS}] Re-creating DMG with stapled app...`);
-
-  // Remove the stale DMG that electron-builder created before notarization
-  const dmgGlob = fs.readdirSync(path.resolve(__dirname, "..", "release"))
-    .filter((f) => f.endsWith(".dmg"));
-  for (const dmg of dmgGlob) {
-    fs.unlinkSync(path.resolve(__dirname, "..", "release", dmg));
-  }
-
-  // Create fresh DMG from the notarized+stapled .app
-  const dmgName = `Wolfee Desktop-${pkg.version}-arm64.dmg`;
-  const DMG_PATH = `release/${dmgName}`;
-  run(
-    `hdiutil create -volname "Wolfee Desktop" -srcfolder "${APP_PATH}" -ov -format UDZO "${DMG_PATH}"`,
-    "hdiutil create DMG"
-  );
-
-  // Staple the DMG itself (so offline Gatekeeper checks pass on the DMG too)
-  run(`xcrun stapler staple "${DMG_PATH}"`, "stapler staple DMG");
-  console.log("  DMG stapled OK");
-
-  // ══════════════════════════════════════════
-  // Step 8: Create distribution zip (with stapled ticket)
-  // ══════════════════════════════════════════
-  console.log(`[8/${TOTAL_STEPS}] Creating distribution zip...`);
-  const absZip = path.resolve(__dirname, "..", ZIP_PATH);
-  if (fs.existsSync(absZip)) fs.unlinkSync(absZip);
-
-  run(
-    `ditto -c -k --keepParent "${APP_PATH}" "${ZIP_PATH}"`,
-    "ditto zip (notarized + stapled)"
-  );
-
-  const zipStat = fs.statSync(absZip);
-  const sizeBytes = zipStat.size;
-  const sizeMB = (sizeBytes / 1024 / 1024).toFixed(1);
-  console.log(`  Zip size: ${sizeMB} MB`);
-
-  if (sizeBytes < MIN_ZIP_SIZE) {
-    console.error(`✗ Zip too small (${sizeMB} MB). Expected at least ${(MIN_ZIP_SIZE / 1024 / 1024).toFixed(0)} MB.`);
-    process.exit(1);
-  }
-
-  // ══════════════════════════════════════════
-  // Step 9–11: Upload to R2 (optional)
-  // ══════════════════════════════════════════
-  let downloadUrl = "(GitHub Releases)";
-  let manifestUrl = "(GitHub Releases)";
+  let downloadUrl = "(local only)";
+  let manifestUrl = "(local only)";
 
   if (hasR2) {
-    console.log(`[9/${TOTAL_STEPS}] Uploading zip to Cloudflare R2...`);
+    console.log(`[7/${TOTAL_STEPS}] Uploading DMG to Cloudflare R2...`);
 
     const s3 = new S3Client({
       region: "auto",
@@ -418,7 +375,14 @@ async function main() {
       credentials: { accessKeyId, secretAccessKey },
     });
 
-    const zipBuffer = fs.readFileSync(absZip);
+    const dmgBuffer = fs.readFileSync(absDmg);
+    const sizeBytes = dmgBuffer.length;
+    const sizeMB = (sizeBytes / 1024 / 1024).toFixed(1);
+
+    if (sizeBytes < MIN_DMG_SIZE) {
+      console.error(`✗ DMG too small (${sizeMB} MB). Expected at least ${(MIN_DMG_SIZE / 1024 / 1024).toFixed(0)} MB.`);
+      process.exit(1);
+    }
 
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
@@ -427,37 +391,36 @@ async function main() {
           new PutObjectCommand({
             Bucket: bucket,
             Key: R2_KEY,
-            Body: zipBuffer,
-            ContentType: "application/zip",
-            ContentDisposition: `attachment; filename="wolfee-desktop-${pkg.version}.zip"`,
+            Body: dmgBuffer,
+            ContentType: "application/x-apple-diskimage",
+            ContentDisposition: `attachment; filename="wolfee-desktop-${VERSION}.dmg"`,
             CacheControl: "no-cache, no-store, must-revalidate",
             Metadata: {
-              "wolfee-version": pkg.version,
+              "wolfee-version": VERSION,
               "build-time": new Date().toISOString(),
               "notarization-id": submissionId,
             },
           })
         );
-        console.log("  Upload OK");
+        console.log("  ✓ Upload OK");
         break;
       } catch (err) {
         console.error(`  Upload failed: ${err.message}`);
         if (attempt === 2) {
-          console.error("✗ Upload failed after 2 attempts. Aborting.");
+          console.error("✗ Upload failed after 2 attempts.");
           process.exit(1);
         }
-        console.log("  Retrying in 3s...");
         await new Promise((r) => setTimeout(r, 3000));
       }
     }
 
-    console.log(`[10/${TOTAL_STEPS}] Uploading update manifest...`);
+    console.log(`[8/${TOTAL_STEPS}] Uploading update manifest...`);
 
     downloadUrl = `${publicBase}/${R2_KEY}`;
-    const releaseNotes = process.env.RELEASE_NOTES || `Wolfee Desktop v${pkg.version}`;
+    const releaseNotes = process.env.RELEASE_NOTES || `Wolfee Desktop v${VERSION}`;
 
     const manifest = {
-      version: pkg.version,
+      version: VERSION,
       url: downloadUrl,
       notes: releaseNotes,
       notarizationId: submissionId,
@@ -477,38 +440,30 @@ async function main() {
           CacheControl: "max-age=300",
         })
       );
-      console.log(`  Uploaded ${manifestKey}`);
+      console.log(`  ✓ Uploaded ${manifestKey}`);
     } catch (err) {
       console.error(`  Manifest upload failed: ${err.message}`);
-      console.error("  WARNING: Zip uploaded but manifest failed.");
     }
 
-    console.log(`[11/${TOTAL_STEPS}] Verifying public download URL...`);
+    console.log(`[9/${TOTAL_STEPS}] Verifying public download URL...`);
     console.log(`  HEAD ${downloadUrl}`);
 
     try {
       const check = await httpHead(downloadUrl);
       console.log(`  Status: ${check.status}`);
-      console.log(`  Content-Length: ${check.contentLength} bytes`);
-
       if (check.status !== 200) {
         console.error(`✗ URL returned ${check.status}. Check R2 public access.`);
         process.exit(1);
       }
-
-      if (check.contentLength > 0 && Math.abs(check.contentLength - sizeBytes) > 1024) {
-        console.error(`✗ Size mismatch: uploaded ${sizeBytes}, URL reports ${check.contentLength}`);
-        process.exit(1);
-      }
-      console.log("  Verification OK");
+      console.log("  ✓ Verification OK");
     } catch (err) {
       console.error(`  Verification failed: ${err.message}`);
-      console.error("  WARNING: Could not verify URL. Check manually: " + downloadUrl);
+      console.error("  WARNING: Check manually: " + downloadUrl);
     }
   } else {
-    console.log(`[9/${TOTAL_STEPS}] [R2] Skipped — not configured`);
-    console.log(`[10/${TOTAL_STEPS}] [R2] Skipped — not configured`);
-    console.log(`[11/${TOTAL_STEPS}] [R2] Skipped — using GitHub Releases only`);
+    console.log(`[7/${TOTAL_STEPS}] [R2] Skipped`);
+    console.log(`[8/${TOTAL_STEPS}] [R2] Skipped`);
+    console.log(`[9/${TOTAL_STEPS}] [R2] Skipped`);
   }
 
   // ══════════════════════════════════════════
@@ -520,12 +475,13 @@ async function main() {
   console.log("══════════════════════════════════════════");
   console.log("  Release complete");
   console.log("══════════════════════════════════════════");
-  console.log(`  Version:         ${pkg.version}`);
-  console.log(`  Zip:             ${ZIP_PATH} (${sizeMB} MB)`);
+  console.log(`  Version:         ${VERSION}`);
+  console.log(`  Engine:          Tauri 2`);
+  console.log(`  DMG:             ${dmgFile} (${dmgSizeMB} MB)`);
   console.log(`  Signed:          YES`);
   console.log(`  Notarized:       YES (${submissionId})`);
-  console.log(`  Stapled:         YES`);
-  console.log(`  Gatekeeper:      ACCEPTED`);
+  console.log(`  Stapled:         YES (DMG + .app)`);
+  console.log(`  spctl:           Notarized Developer ID`);
   console.log(`  R2:              ${hasR2 ? "YES" : "SKIPPED"}`);
   console.log(`  Time:            ${elapsed}s`);
   console.log("");

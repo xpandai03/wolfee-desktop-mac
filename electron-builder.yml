@@ -21,9 +21,6 @@ mac:
   identity: "XPAND TECHNOLOGY LLC (LT73Z72CKR)"
   artifactName: "${productName}-${version}-${arch}.${ext}"
   notarize: false
-  signIgnore:
-    - "\\.pak$"
-    - "\\.lproj/"
 
 dmg:
   sign: false
