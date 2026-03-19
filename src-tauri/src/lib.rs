@@ -276,8 +276,15 @@ pub fn run() {
                     "link-account" => {
                         let device_id = state.device_id.lock().unwrap().clone();
                         let backend_url = backend_url_clone.clone();
-                        let url = format!("{}/settings/devices?link={}", backend_url, device_id);
-                        log::info!("[AUTH] Link clicked — opening: {}", url);
+                        let device_name = hostname::get()
+                            .map(|h| h.to_string_lossy().to_string())
+                            .unwrap_or_else(|_| "Desktop".to_string());
+                        let encoded_name = urlencoding::encode(&device_name);
+                        let url = format!(
+                            "{}/desktop/link?deviceId={}&deviceName={}",
+                            backend_url, device_id, encoded_name
+                        );
+                        log::info!("[LINK] Opening pairing URL: {}", url);
                         open_url(&url);
 
                         // Now poll the backend until the web app confirms the link
