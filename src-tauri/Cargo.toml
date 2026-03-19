@@ -1,6 +1,6 @@
 [package]
 name = "wolfee-desktop"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Wolfee Desktop Recorder"
 
@@ -20,6 +20,7 @@ chrono = { version = "0.4", features = ["serde"] }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+chrono = "0.4"
 
 [features]
 default = ["custom-protocol"]

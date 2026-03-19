@@ -46,16 +46,38 @@ pub fn run() {
         .format_timestamp_millis()
         .init();
 
+    const VERSION: &str = env!("CARGO_PKG_VERSION");
+    const BUILD_TS: &str = env!("BUILD_TIMESTAMP");
+
     let auth_config = AuthConfig::load();
+    let exe_path = std::env::current_exe().unwrap_or_default();
+
     log::info!("══════════════════════════════════════════");
     log::info!("  WOLFEE DESKTOP (Tauri) BOOT");
     log::info!("══════════════════════════════════════════");
-    log::info!("  version:     0.2.0");
+    log::info!("  version:     {} (built {})", VERSION, BUILD_TS);
+    log::info!("  binary:      {}", exe_path.display());
     log::info!("  backend:     {}", auth_config.backend_url);
     log::info!("  deviceId:    {}", auth_config.device_id);
     log::info!("  authed:      {}", auth_config.is_authenticated());
     log::info!("  config:      {}", AuthConfig::config_path().display());
     log::info!("══════════════════════════════════════════");
+
+    // Warn if duplicate installs exist
+    let check_paths = [
+        "/Applications/Wolfee Desktop.app",
+        &format!("{}/Applications/Wolfee Desktop.app", dirs::home_dir().unwrap_or_default().display()),
+    ];
+    let existing: Vec<&str> = check_paths.iter().filter(|p| std::path::Path::new(p).exists()).copied().collect();
+    if existing.len() > 1 {
+        log::warn!("══════════════════════════════════════════");
+        log::warn!("  WARNING: Multiple Wolfee installs found!");
+        for p in &existing {
+            log::warn!("    → {}", p);
+        }
+        log::warn!("  Remove duplicates to avoid running stale versions.");
+        log::warn!("══════════════════════════════════════════");
+    }
 
     let app_state = AppState {
         recording_state: Mutex::new(RecordingState::Idle),
