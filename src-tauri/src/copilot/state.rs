@@ -93,3 +93,18 @@ impl Default for TranscriptBufferMutex {
         Self(Mutex::new(TranscriptBuffer::with_default_window()))
     }
 }
+
+/// Tauri-managed state wrapper around the active audio capture handle.
+/// `None` when no Copilot session is running. Set to `Some(capture)`
+/// inside `start-copilot-session`; taken back out and stopped inside
+/// `end-copilot-session`. Tokio Mutex (not std) because we hold the
+/// guard across `await` points (CopilotAudioCapture::stop is async).
+pub struct CopilotAudioCaptureMutex(
+    pub tokio::sync::Mutex<Option<crate::copilot::audio::CopilotAudioCapture>>,
+);
+
+impl Default for CopilotAudioCaptureMutex {
+    fn default() -> Self {
+        Self(tokio::sync::Mutex::new(None))
+    }
+}

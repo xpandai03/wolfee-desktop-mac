@@ -6,7 +6,9 @@ mod tray;
 mod uploader;
 
 use auth::AuthConfig;
-use copilot::state::{CopilotState, CopilotStateMutex};
+use copilot::audio::CopilotAudioCapture;
+use copilot::session::api::{EndReason, SessionApi};
+use copilot::state::{CopilotAudioCaptureMutex, CopilotState, CopilotStateMutex};
 use recorder::Recorder;
 use state::{AppState, LinkingStatus, RecordingState, UploadStatus};
 use std::sync::{Arc, Mutex};
@@ -41,6 +43,73 @@ where
             rt.block_on(f());
         })
         .unwrap_or_else(|e| panic!("Failed to spawn thread {}: {}", name, e));
+}
+
+/// Phase 5 frame counter — Phase 3 will replace this with the Deepgram
+/// WebSocket sender. Lives on its own dedicated thread (the channel
+/// receiver isn't `Send` across the Tauri runtime in some configs;
+/// the dedicated-thread-with-current_thread-runtime pattern from
+/// spawn_async is the well-trodden path here).
+///
+/// Logs every 5 s: frame count, total bytes, and a quick non-zero
+/// check on each channel so the PO can verify both mic + system audio
+/// are flowing during runtime verification.
+fn spawn_frame_logger(
+    mut rx: tokio::sync::mpsc::Receiver<copilot::audio::AudioFrame>,
+) {
+    spawn_async("copilot-frame-logger", move || async move {
+        let mut count: u64 = 0;
+        let mut total_bytes: u64 = 0;
+        let mut last_log = std::time::Instant::now();
+        let mut last_l_nonzero = false;
+        let mut last_r_nonzero = false;
+
+        log::info!("[Copilot/audio] frame logger started");
+
+        while let Some(frame) = rx.recv().await {
+            count += 1;
+            total_bytes += (frame.pcm_s16le_stereo.len() * 2) as u64;
+
+            // Quick channel-population check: scan the latest frame
+            // for non-zero L (mic) and R (system) samples. Aggregated
+            // across the 5s window so transient silence on either side
+            // doesn't flap the readout.
+            let mut l_nonzero = false;
+            let mut r_nonzero = false;
+            for (i, &s) in frame.pcm_s16le_stereo.iter().enumerate() {
+                if s != 0 {
+                    if i % 2 == 0 {
+                        l_nonzero = true;
+                    } else {
+                        r_nonzero = true;
+                    }
+                    if l_nonzero && r_nonzero {
+                        break;
+                    }
+                }
+            }
+            last_l_nonzero |= l_nonzero;
+            last_r_nonzero |= r_nonzero;
+
+            if last_log.elapsed().as_secs() >= 5 {
+                log::info!(
+                    "[Copilot/audio] frames in last 5s: {} ({} KB), \
+                     mic_nonzero={}, system_nonzero={}",
+                    count,
+                    total_bytes / 1024,
+                    last_l_nonzero,
+                    last_r_nonzero
+                );
+                count = 0;
+                total_bytes = 0;
+                last_l_nonzero = false;
+                last_r_nonzero = false;
+                last_log = std::time::Instant::now();
+            }
+        }
+
+        log::info!("[Copilot/audio] frame channel closed — logger exiting");
+    });
 }
 
 pub fn run() {
@@ -106,6 +175,7 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::new().build())
         .manage(app_state)
         .manage(CopilotStateMutex::default())
+        .manage(CopilotAudioCaptureMutex::default())
         .on_window_event(|window, event| {
             // Keep Rust state in sync when the overlay window hides via Esc / blur.
             if window.label() == copilot::window::OVERLAY_LABEL {
@@ -482,6 +552,273 @@ pub fn run() {
                         log::info!(
                             "[Copilot] Set Up Copilot clicked — Settings UI lands in Sub-prompt 6"
                         );
+                    }
+
+                    // ─────────────────────────────────────────
+                    // COPILOT (Sub-prompt 2 Phase 5 — Listening lifecycle)
+                    // ─────────────────────────────────────────
+                    "start-copilot-session" => {
+                        log::info!("[Copilot] Tray: Start Copilot Session clicked");
+
+                        // Idempotent: ignore if not Idle/ShowingOverlay.
+                        let copilot_mutex = handle_ref.state::<CopilotStateMutex>();
+                        {
+                            let cur = copilot_mutex.0.lock().unwrap();
+                            if !matches!(*cur, CopilotState::Idle | CopilotState::ShowingOverlay) {
+                                log::info!(
+                                    "[Copilot] Ignoring start-session — current state: {}",
+                                    *cur
+                                );
+                                return;
+                            }
+                        }
+
+                        // Auth check — lib.rs has the device_token in AppState; backend_url
+                        // captured at builder time.
+                        let device_token = match state.auth_token.lock().unwrap().clone() {
+                            Some(t) => t,
+                            None => {
+                                log::warn!(
+                                    "[Copilot] Cannot start session — not paired. \
+                                     Click 'Link with Wolfee...' first."
+                                );
+                                return;
+                            }
+                        };
+
+                        // Soft warning per Decision N6: recorder coexistence is allowed.
+                        if state.current_state() == RecordingState::Recording {
+                            log::warn!(
+                                "[Copilot] Notes recorder is also running — Copilot will \
+                                 listen alongside. Stop recorder if you want to free resources."
+                            );
+                        }
+
+                        // Client-generated session UUID per Decision N6.
+                        let session_id = uuid::Uuid::new_v4().to_string();
+                        let backend_url = backend_url_clone.clone();
+
+                        // Transition to Starting + refresh tray.
+                        *copilot_mutex.0.lock().unwrap() =
+                            CopilotState::StartingSession { session_id: session_id.clone() };
+                        tray::update_tray_menu(
+                            &tray_clone,
+                            handle_ref,
+                            state.current_state(),
+                            true,
+                        );
+
+                        let tray = tray_clone.clone();
+                        let handle = handle_ref.clone();
+
+                        spawn_async("copilot-start", move || async move {
+                            let api = SessionApi::new(backend_url.clone(), device_token.clone());
+
+                            // 1. Mint session id backend-side.
+                            match api.create_session(&session_id).await {
+                                Ok(resp) => {
+                                    log::info!(
+                                        "[Copilot] backend session created — id={}, startedAt={}",
+                                        resp.session_id,
+                                        resp.started_at
+                                    );
+                                }
+                                Err(e) => {
+                                    log::error!(
+                                        "[Copilot] create_session failed: {} — aborting start",
+                                        e
+                                    );
+                                    let copilot_mutex = handle.state::<CopilotStateMutex>();
+                                    *copilot_mutex.0.lock().unwrap() = CopilotState::Idle;
+                                    let app_state: tauri::State<'_, AppState> = handle.state();
+                                    tray::update_tray_menu(
+                                        &tray,
+                                        &handle,
+                                        app_state.current_state(),
+                                        app_state.auth_token.lock().unwrap().is_some(),
+                                    );
+                                    return;
+                                }
+                            }
+
+                            // 2. Start audio capture (mic + system + mux pump).
+                            let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<
+                                copilot::audio::AudioFrame,
+                            >(64);
+
+                            let capture = match CopilotAudioCapture::start(
+                                session_id.clone(),
+                                frame_tx,
+                            )
+                            .await
+                            {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    log::error!(
+                                        "[Copilot] audio capture start failed: {} — \
+                                         ending backend session and reverting state",
+                                        e
+                                    );
+                                    let _ = api
+                                        .end_session(&session_id, EndReason::Error)
+                                        .await;
+                                    let copilot_mutex = handle.state::<CopilotStateMutex>();
+                                    *copilot_mutex.0.lock().unwrap() = CopilotState::Idle;
+                                    let app_state: tauri::State<'_, AppState> = handle.state();
+                                    tray::update_tray_menu(
+                                        &tray,
+                                        &handle,
+                                        app_state.current_state(),
+                                        app_state.auth_token.lock().unwrap().is_some(),
+                                    );
+                                    return;
+                                }
+                            };
+
+                            // 3. Stash capture handle in managed state.
+                            //    Bind the State outside the await so its borrow
+                            //    of `handle` lives across the suspend point.
+                            let cap_mutex = handle.state::<CopilotAudioCaptureMutex>();
+                            *cap_mutex.0.lock().await = Some(capture);
+                            drop(cap_mutex);
+
+                            // 4. Spawn frame logger (Phase 3 will replace with Deepgram WS).
+                            //    Logs every 5 seconds: count + sample-of-last-frame stats so
+                            //    the PO can verify both channels populated during runtime.
+                            spawn_frame_logger(frame_rx);
+
+                            // 5. Transition to Listening + refresh tray.
+                            {
+                                let copilot_mutex = handle.state::<CopilotStateMutex>();
+                                *copilot_mutex.0.lock().unwrap() = CopilotState::Listening {
+                                    session_id: session_id.clone(),
+                                    started_at: std::time::Instant::now(),
+                                };
+                            }
+                            let app_state: tauri::State<'_, AppState> = handle.state();
+                            tray::update_tray_menu(
+                                &tray,
+                                &handle,
+                                app_state.current_state(),
+                                app_state.auth_token.lock().unwrap().is_some(),
+                            );
+                            log::info!(
+                                "[Copilot] session live — id={}, listening for audio",
+                                session_id
+                            );
+                        });
+                    }
+
+                    "end-copilot-session" => {
+                        log::info!("[Copilot] Tray: End Copilot Session clicked");
+
+                        // Capture the active session_id while we still have the lock.
+                        let session_id_opt = {
+                            let copilot_mutex = handle_ref.state::<CopilotStateMutex>();
+                            let cur = copilot_mutex.0.lock().unwrap().clone();
+                            match cur {
+                                CopilotState::Listening { session_id, .. }
+                                | CopilotState::Reconnecting { session_id, .. }
+                                | CopilotState::StartingSession { session_id }
+                                | CopilotState::EndingSession { session_id, .. } => {
+                                    Some(session_id)
+                                }
+                                _ => None,
+                            }
+                        };
+
+                        let session_id = match session_id_opt {
+                            Some(id) => id,
+                            None => {
+                                log::info!(
+                                    "[Copilot] Ignoring end-session — no active session"
+                                );
+                                return;
+                            }
+                        };
+
+                        // Transition to Ending + refresh tray.
+                        {
+                            let copilot_mutex = handle_ref.state::<CopilotStateMutex>();
+                            *copilot_mutex.0.lock().unwrap() = CopilotState::EndingSession {
+                                session_id: session_id.clone(),
+                                reason: copilot::state::SessionEndReason::UserRequested,
+                            };
+                        }
+                        tray::update_tray_menu(
+                            &tray_clone,
+                            handle_ref,
+                            state.current_state(),
+                            state.auth_token.lock().unwrap().is_some(),
+                        );
+
+                        let tray = tray_clone.clone();
+                        let handle = handle_ref.clone();
+                        let device_token = state.auth_token.lock().unwrap().clone();
+                        let backend_url = backend_url_clone.clone();
+
+                        spawn_async("copilot-end", move || async move {
+                            // 1. Stop audio capture (drops mic + sys + pump).
+                            //    Bind State outside the await so its borrow of
+                            //    `handle` lives across the suspend point.
+                            let cap_mutex = handle.state::<CopilotAudioCaptureMutex>();
+                            let capture_opt = cap_mutex.0.lock().await.take();
+                            drop(cap_mutex);
+                            if let Some(capture) = capture_opt {
+                                if let Err(e) = capture.stop().await {
+                                    log::warn!(
+                                        "[Copilot] capture.stop() error (non-fatal): {}",
+                                        e
+                                    );
+                                } else {
+                                    log::info!("[Copilot] audio capture stopped cleanly");
+                                }
+                            } else {
+                                log::warn!(
+                                    "[Copilot] No capture handle in managed state — \
+                                     possibly already torn down"
+                                );
+                            }
+
+                            // 2. Notify backend (non-fatal — local end already happened).
+                            if let Some(token) = device_token {
+                                let api = SessionApi::new(backend_url, token);
+                                match api
+                                    .end_session(&session_id, EndReason::UserRequested)
+                                    .await
+                                {
+                                    Ok(resp) => {
+                                        log::info!(
+                                            "[Copilot] backend end OK — duration={}s, \
+                                             alreadyEnded={}",
+                                            resp.duration_seconds,
+                                            resp.already_ended
+                                        );
+                                    }
+                                    Err(e) => {
+                                        log::warn!(
+                                            "[Copilot] backend end failed: {} — \
+                                             session ended locally regardless",
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+
+                            // 3. Return state to Idle + refresh tray.
+                            {
+                                let copilot_mutex = handle.state::<CopilotStateMutex>();
+                                *copilot_mutex.0.lock().unwrap() = CopilotState::Idle;
+                            }
+                            let app_state: tauri::State<'_, AppState> = handle.state();
+                            tray::update_tray_menu(
+                                &tray,
+                                &handle,
+                                app_state.current_state(),
+                                app_state.auth_token.lock().unwrap().is_some(),
+                            );
+                            log::info!("[Copilot] session ended — back to Idle");
+                        });
                     }
 
                     _ => {
