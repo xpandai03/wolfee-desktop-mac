@@ -1,12 +1,19 @@
 use tauri::{
     image::Image,
-    AppHandle, Runtime,
     menu::{Menu, MenuItem},
     tray::{TrayIcon, TrayIconBuilder},
-    Emitter,
+    AppHandle, Emitter, Manager, Runtime,
 };
 
+use crate::copilot::state::{CopilotState, CopilotStateMutex};
 use crate::state::RecordingState;
+
+fn current_copilot_state<R: Runtime>(app: &AppHandle<R>) -> CopilotState {
+    if let Some(state) = app.try_state::<CopilotStateMutex>() {
+        return *state.0.lock().unwrap();
+    }
+    CopilotState::Idle
+}
 
 // Wolfee tray icon (template-style, 44x44 @2x)
 const TRAY_ICON_BYTES: &[u8] = include_bytes!("../icons/trayTemplate.png");
@@ -21,7 +28,7 @@ pub fn create_tray<R: Runtime>(app: &AppHandle<R>) -> Result<TrayIcon<R>, tauri:
         .tooltip("Wolfee Desktop")
         .icon(icon)
         .icon_as_template(true)
-        .menu(&build_menu(app, RecordingState::Idle, false)?)
+        .menu(&build_menu(app, RecordingState::Idle, current_copilot_state(app), false)?)
         .on_menu_event(move |app, event| {
             handle_menu_event(app, event.id().as_ref());
         })
@@ -36,7 +43,8 @@ pub fn update_tray_menu<R: Runtime>(
     state: RecordingState,
     is_authenticated: bool,
 ) {
-    if let Ok(menu) = build_menu(app, state, is_authenticated) {
+    let copilot_state = current_copilot_state(app);
+    if let Ok(menu) = build_menu(app, state, copilot_state, is_authenticated) {
         let _ = tray.set_menu(Some(menu));
     }
 
@@ -63,14 +71,68 @@ pub fn update_tray_menu<R: Runtime>(
     let _ = tray.set_title(title);
 }
 
+fn copilot_status_label(state: CopilotState) -> &'static str {
+    match state {
+        CopilotState::Idle => "🟢 Copilot: Idle",
+        CopilotState::ShowingOverlay => "🟡 Copilot: Active",
+        CopilotState::Paused => "🔴 Copilot: Paused",
+    }
+}
+
 fn build_menu<R: Runtime>(
     app: &AppHandle<R>,
     state: RecordingState,
+    copilot_state: CopilotState,
     is_authenticated: bool,
 ) -> Result<Menu<R>, tauri::Error> {
     let menu = Menu::new(app)?;
 
-    // Always show auth status at top
+    // ─────────────────────────────────────────────
+    // COPILOT SECTION (new — Sub-prompt 1)
+    // Per design doc §2.2 + Decision N7: Copilot is the headline.
+    // ─────────────────────────────────────────────
+    let copilot_status = MenuItem::with_id(
+        app,
+        "copilot_status",
+        copilot_status_label(copilot_state),
+        false,
+        None::<&str>,
+    )?;
+    menu.append(&copilot_status)?;
+
+    let open_overlay = MenuItem::with_id(
+        app,
+        "copilot_open_overlay",
+        "Open Copilot Overlay  ⌘⌥W",
+        true,
+        None::<&str>,
+    )?;
+    menu.append(&open_overlay)?;
+
+    let pause_label = if copilot_state == CopilotState::Paused {
+        "Resume Copilot"
+    } else {
+        "Pause Copilot"
+    };
+    let pause_copilot = MenuItem::with_id(app, "copilot_pause", pause_label, true, None::<&str>)?;
+    menu.append(&pause_copilot)?;
+
+    let copilot_sep = MenuItem::with_id(app, "copilot_sep", "—", false, None::<&str>)?;
+    menu.append(&copilot_sep)?;
+
+    let setup_copilot =
+        MenuItem::with_id(app, "copilot_setup", "Set Up Copilot…", true, None::<&str>)?;
+    menu.append(&setup_copilot)?;
+
+    let section_sep = MenuItem::with_id(app, "section_sep", "———", false, None::<&str>)?;
+    menu.append(&section_sep)?;
+
+    // ─────────────────────────────────────────────
+    // NOTES SECTION (existing — DO NOT modify)
+    // Decision N6 (recorder coexistence) deferred to Sub-prompt 6.
+    // ─────────────────────────────────────────────
+
+    // Always show auth status at top of Notes section if not authed
     if !is_authenticated {
         let link = MenuItem::with_id(app, "link", "Link with Wolfee...", true, None::<&str>)?;
         menu.append(&link)?;
@@ -127,6 +189,21 @@ fn build_menu<R: Runtime>(
 
 fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, id: &str) {
     match id {
+        // ─── Copilot menu items ───
+        "copilot_open_overlay" => {
+            log::info!("[Tray] Open Copilot Overlay clicked");
+            let _ = app.emit("wolfee-action", "open-copilot-overlay");
+        }
+        "copilot_pause" => {
+            log::info!("[Tray] Pause/Resume Copilot clicked");
+            let _ = app.emit("wolfee-action", "toggle-copilot-pause");
+        }
+        "copilot_setup" => {
+            log::info!("[Tray] Set Up Copilot clicked");
+            let _ = app.emit("wolfee-action", "open-copilot-settings");
+        }
+
+        // ─── Existing recorder / nav items (unchanged) ───
         "start" => {
             log::info!("[Tray] Start Recording clicked");
             let _ = app.emit("wolfee-action", "start-recording");

@@ -1,14 +1,16 @@
 mod auth;
+mod copilot;
 mod recorder;
 mod state;
 mod tray;
 mod uploader;
 
 use auth::AuthConfig;
+use copilot::state::{CopilotState, CopilotStateMutex};
 use recorder::Recorder;
 use state::{AppState, RecordingState};
 use std::sync::{Arc, Mutex};
-use tauri::{Listener, Manager};
+use tauri::{Listener, Manager, WindowEvent};
 
 fn open_url(url: &str) {
     log::info!("[App] Opening URL: {}", url);
@@ -95,7 +97,25 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_store::Builder::new().build())
         .manage(app_state)
+        .manage(CopilotStateMutex::default())
+        .on_window_event(|window, event| {
+            // Keep Rust state in sync when the overlay window hides via Esc / blur.
+            if window.label() == copilot::window::OVERLAY_LABEL {
+                if let WindowEvent::Focused(false) = event {
+                    let app = window.app_handle();
+                    // Hide the overlay on focus loss — matches the frontend's blur listener;
+                    // either path is fine (idempotent).
+                    let _ = copilot::window::hide_overlay(app);
+                    copilot::hotkey::on_overlay_hidden(app);
+                }
+            }
+        })
         .setup(move |app| {
             let handle = app.handle().clone();
 
@@ -103,6 +123,12 @@ pub fn run() {
             let tray = tray::create_tray(&handle)?;
             let is_authed = auth_config.is_authenticated();
             tray::update_tray_menu(&tray, &handle, RecordingState::Idle, is_authed);
+
+            // Initialize Copilot foundation (overlay window + hotkey).
+            // No audio / no LLM yet — Sub-prompts 2 / 3.
+            if let Err(e) = copilot::init(&handle) {
+                log::error!("[Copilot] Failed to initialize: {}", e);
+            }
 
             let tray = Arc::new(tray);
 
@@ -336,6 +362,49 @@ pub fn run() {
                         let url = last_meeting_url_clone.lock().unwrap().clone()
                             .unwrap_or_else(|| backend_url_clone.clone());
                         open_url(&url);
+                    }
+
+                    // ─────────────────────────────────────────
+                    // COPILOT (Sub-prompt 1 — Foundation)
+                    // ─────────────────────────────────────────
+                    "open-copilot-overlay" => {
+                        log::info!("[Copilot] Tray: open overlay");
+                        if let Err(e) = copilot::window::show_overlay(handle_ref) {
+                            log::error!("[Copilot] show_overlay failed: {}", e);
+                        } else {
+                            let copilot_mutex = handle_ref.state::<CopilotStateMutex>();
+                            *copilot_mutex.0.lock().unwrap() = CopilotState::ShowingOverlay;
+                            tray::update_tray_menu(
+                                &tray_clone,
+                                handle_ref,
+                                state.current_state(),
+                                state.auth_token.lock().unwrap().is_some(),
+                            );
+                        }
+                    }
+
+                    "toggle-copilot-pause" => {
+                        let copilot_mutex = handle_ref.state::<CopilotStateMutex>();
+                        let mut s = copilot_mutex.0.lock().unwrap();
+                        *s = match *s {
+                            CopilotState::Paused => CopilotState::Idle,
+                            _ => CopilotState::Paused,
+                        };
+                        log::info!("[Copilot] State -> {}", *s);
+                        drop(s);
+                        tray::update_tray_menu(
+                            &tray_clone,
+                            handle_ref,
+                            state.current_state(),
+                            state.auth_token.lock().unwrap().is_some(),
+                        );
+                    }
+
+                    "open-copilot-settings" => {
+                        // Sub-prompt 1 placeholder. Full Settings window in Sub-prompt 6.
+                        log::info!(
+                            "[Copilot] Set Up Copilot clicked — Settings UI lands in Sub-prompt 6"
+                        );
                     }
 
                     _ => {
