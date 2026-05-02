@@ -46,10 +46,17 @@ where
 }
 
 /// Phase 5 frame counter — Phase 3 will replace this with the Deepgram
-/// WebSocket sender. Lives on its own dedicated thread (the channel
-/// receiver isn't `Send` across the Tauri runtime in some configs;
-/// the dedicated-thread-with-current_thread-runtime pattern from
-/// spawn_async is the well-trodden path here).
+/// WebSocket sender.
+///
+/// Hosted on Tauri's global async runtime so it shares a long-lived
+/// runtime with the mux pump (which is `tokio::spawn`'d inside
+/// `CopilotAudioCapture::start`). Earlier we used `spawn_async` here
+/// and for the session handlers — that built a one-shot
+/// `current_thread` runtime that died when the spawning closure
+/// returned, cancelling the mux pump 3 ms after the session went live
+/// and silently breaking the audio gate (see verification report
+/// 2026-05-02). Using `tauri::async_runtime::spawn` keeps everything
+/// on the same persistent runtime.
 ///
 /// Logs every 5 s: frame count, total bytes, and a quick non-zero
 /// check on each channel so the PO can verify both mic + system audio
@@ -57,7 +64,7 @@ where
 fn spawn_frame_logger(
     mut rx: tokio::sync::mpsc::Receiver<copilot::audio::AudioFrame>,
 ) {
-    spawn_async("copilot-frame-logger", move || async move {
+    tauri::async_runtime::spawn(async move {
         let mut count: u64 = 0;
         let mut total_bytes: u64 = 0;
         let mut last_log = std::time::Instant::now();
@@ -611,7 +618,15 @@ pub fn run() {
                         let tray = tray_clone.clone();
                         let handle = handle_ref.clone();
 
-                        spawn_async("copilot-start", move || async move {
+                        // Hosted on Tauri's global async runtime so the mux
+                        // pump that CopilotAudioCapture::start tokio::spawn's
+                        // inherits a long-lived runtime. spawn_async builds a
+                        // one-shot current_thread runtime that dies on closure
+                        // return, which silently cancelled the pump 3 ms after
+                        // the session went live in the 2026-05-02 verification
+                        // run. tauri::async_runtime::spawn shares Tauri's
+                        // global runtime that lives for the app lifetime.
+                        tauri::async_runtime::spawn(async move {
                             let api = SessionApi::new(backend_url.clone(), device_token.clone());
 
                             // 1. Mint session id backend-side.
@@ -757,7 +772,12 @@ pub fn run() {
                         let device_token = state.auth_token.lock().unwrap().clone();
                         let backend_url = backend_url_clone.clone();
 
-                        spawn_async("copilot-end", move || async move {
+                        // Same Tauri-global-runtime hosting as copilot-start
+                        // (see comment there). End-session also awaits
+                        // capture.stop() which drops the mux pump task —
+                        // running on the same long-lived runtime keeps
+                        // everything tidy and symmetrical with start.
+                        tauri::async_runtime::spawn(async move {
                             // 1. Stop audio capture (drops mic + sys + pump).
                             //    Bind State outside the await so its borrow of
                             //    `handle` lives across the suspend point.
