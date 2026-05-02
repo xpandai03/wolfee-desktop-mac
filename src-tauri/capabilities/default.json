@@ -4,11 +4,21 @@
   "windows": ["*"],
   "permissions": [
     "core:default",
+    "core:window:default",
+    "core:window:allow-hide",
+    "core:window:allow-show",
+    "core:window:allow-set-focus",
+    "core:webview:default",
     "shell:default",
     "shell:allow-open",
     "shell:allow-execute",
     "shell:allow-spawn",
     "shell:allow-kill",
-    "opener:default"
+    "opener:default",
+    "global-shortcut:default",
+    "notification:default",
+    "clipboard-manager:default",
+    "deep-link:default",
+    "store:default"
   ]
 }
