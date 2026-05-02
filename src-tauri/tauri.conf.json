@@ -4,8 +4,10 @@
   "identifier": "io.wolfee.desktop",
   "version": "0.2.1",
   "build": {
-    "frontendDist": "../ui",
-    "devUrl": "http://localhost:1420"
+    "frontendDist": "../overlay/dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "pnpm --dir overlay dev",
+    "beforeBuildCommand": "pnpm --dir overlay build"
   },
   "app": {
     "withGlobalTauri": true,
@@ -28,7 +30,7 @@
       "signingIdentity": "Developer ID Application: XPAND TECHNOLOGY LLC (LT73Z72CKR)",
       "entitlements": "../entitlements.plist",
       "exceptionDomain": null,
-      "minimumSystemVersion": "12.0"
+      "minimumSystemVersion": "13.0"
     },
     "windows": {
       "certificateThumbprint": null,
