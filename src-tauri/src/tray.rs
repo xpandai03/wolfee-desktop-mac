@@ -6,13 +6,27 @@ use tauri::{
 };
 
 use crate::copilot::state::{CopilotState, CopilotStateMutex};
-use crate::state::RecordingState;
+use crate::state::{AppState, LinkingStatus, RecordingState, UploadStatus};
 
 fn current_copilot_state<R: Runtime>(app: &AppHandle<R>) -> CopilotState {
     if let Some(state) = app.try_state::<CopilotStateMutex>() {
         return *state.0.lock().unwrap();
     }
     CopilotState::Idle
+}
+
+fn current_linking_status<R: Runtime>(app: &AppHandle<R>) -> LinkingStatus {
+    if let Some(state) = app.try_state::<AppState>() {
+        return *state.linking_status.lock().unwrap();
+    }
+    LinkingStatus::Idle
+}
+
+fn current_upload_status<R: Runtime>(app: &AppHandle<R>) -> UploadStatus {
+    if let Some(state) = app.try_state::<AppState>() {
+        return *state.upload_status.lock().unwrap();
+    }
+    UploadStatus::Idle
 }
 
 // Wolfee tray icon (template-style, 44x44 @2x)
@@ -128,12 +142,110 @@ fn build_menu<R: Runtime>(
     menu.append(&section_sep)?;
 
     // ─────────────────────────────────────────────
-    // NOTES SECTION (existing — DO NOT modify)
-    // Decision N6 (recorder coexistence) deferred to Sub-prompt 6.
+    // NOTES SECTION
+    // Decision N6 (recorder coexistence) deferred to Sub-prompt 6 — recorder
+    // entries appear unchanged below.
     // ─────────────────────────────────────────────
 
-    // Always show auth status at top of Notes section if not authed
-    if !is_authenticated {
+    // Linking + upload status rows. Surface these BEFORE the auth row so the
+    // user sees what the desktop is doing right now (fixing the Sub-prompt 1
+    // bug-test silent-failure UX). All rows below are non-disruptive — they
+    // only appear when there's actually something to surface.
+    let linking_status = current_linking_status(app);
+    let upload_status = current_upload_status(app);
+
+    let mut needs_status_sep = false;
+
+    match linking_status {
+        LinkingStatus::Idle => {}
+        LinkingStatus::InProgress => {
+            let row = MenuItem::with_id(app, "linking_row", "🔄 Linking…", false, None::<&str>)?;
+            menu.append(&row)?;
+            needs_status_sep = true;
+        }
+        LinkingStatus::JustLinked => {
+            let row = MenuItem::with_id(app, "linking_row", "✅ Linked!", false, None::<&str>)?;
+            menu.append(&row)?;
+            needs_status_sep = true;
+        }
+        LinkingStatus::Failed => {
+            let row = MenuItem::with_id(
+                app,
+                "linking_failed_retry",
+                "❌ Link failed — click to retry",
+                true,
+                None::<&str>,
+            )?;
+            menu.append(&row)?;
+            let dismiss = MenuItem::with_id(
+                app,
+                "linking_failed_dismiss",
+                "  Dismiss",
+                true,
+                None::<&str>,
+            )?;
+            menu.append(&dismiss)?;
+            needs_status_sep = true;
+        }
+    }
+
+    match upload_status {
+        UploadStatus::Idle | UploadStatus::InProgress => {
+            // InProgress is reflected via the existing RecordingState::Uploading
+            // status row below; no need for a duplicate.
+        }
+        UploadStatus::JustUploaded => {
+            let row = MenuItem::with_id(
+                app,
+                "upload_just_uploaded",
+                "✅ Uploaded — open in Wolfee",
+                true,
+                None::<&str>,
+            )?;
+            menu.append(&row)?;
+            needs_status_sep = true;
+        }
+        UploadStatus::SkippedNoAuth => {
+            let row = MenuItem::with_id(
+                app,
+                "upload_skipped_link",
+                "⚠️ Recording saved — link to upload",
+                true,
+                None::<&str>,
+            )?;
+            menu.append(&row)?;
+            let dismiss = MenuItem::with_id(
+                app,
+                "upload_skipped_dismiss",
+                "  Dismiss",
+                true,
+                None::<&str>,
+            )?;
+            menu.append(&dismiss)?;
+            needs_status_sep = true;
+        }
+        UploadStatus::Failed => {
+            let row = MenuItem::with_id(
+                app,
+                "upload_failed_dismiss",
+                "❌ Upload failed — click to dismiss",
+                true,
+                None::<&str>,
+            )?;
+            menu.append(&row)?;
+            needs_status_sep = true;
+        }
+    }
+
+    if needs_status_sep {
+        let status_sep = MenuItem::with_id(app, "status_sep", "—", false, None::<&str>)?;
+        menu.append(&status_sep)?;
+    }
+
+    // Auth row — hide while linking is InProgress (the status row above tells
+    // the user what's happening; a clickable "Link with Wolfee…" would just
+    // double-open the browser).
+    if !is_authenticated && linking_status != LinkingStatus::InProgress {
         let link = MenuItem::with_id(app, "link", "Link with Wolfee...", true, None::<&str>)?;
         menu.append(&link)?;
         let sep = MenuItem::with_id(app, "sep0", "—", false, None::<&str>)?;
@@ -201,6 +313,35 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, id: &str) {
         "copilot_setup" => {
             log::info!("[Tray] Set Up Copilot clicked");
             let _ = app.emit("wolfee-action", "open-copilot-settings");
+        }
+
+        // ─── Linking / upload status row clicks ───
+        "linking_failed_retry" => {
+            log::info!("[Tray] Link-failed retry clicked");
+            let _ = app.emit("wolfee-action", "clear-linking-status");
+            let _ = app.emit("wolfee-action", "link-account");
+        }
+        "linking_failed_dismiss" => {
+            log::info!("[Tray] Link-failed dismiss clicked");
+            let _ = app.emit("wolfee-action", "clear-linking-status");
+        }
+        "upload_just_uploaded" => {
+            log::info!("[Tray] Just-uploaded row clicked → open meeting");
+            let _ = app.emit("wolfee-action", "clear-upload-status");
+            let _ = app.emit("wolfee-action", "open-meeting");
+        }
+        "upload_skipped_link" => {
+            log::info!("[Tray] Saved-locally row clicked → run link flow");
+            let _ = app.emit("wolfee-action", "clear-upload-status");
+            let _ = app.emit("wolfee-action", "link-account");
+        }
+        "upload_skipped_dismiss" => {
+            log::info!("[Tray] Saved-locally dismiss clicked");
+            let _ = app.emit("wolfee-action", "clear-upload-status");
+        }
+        "upload_failed_dismiss" => {
+            log::info!("[Tray] Upload-failed dismiss clicked");
+            let _ = app.emit("wolfee-action", "clear-upload-status");
         }
 
         // ─── Existing recorder / nav items (unchanged) ───

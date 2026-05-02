@@ -11,6 +11,30 @@ pub enum RecordingState {
     Complete,
 }
 
+/// User-visible status of the device-pairing flow.
+///
+/// Surfaces in the tray so the user sees what `auth::poll_link_status` is
+/// actually doing — fixing the silent-failure UX gap (yesterday's diagnosis
+/// §5.2 / T2). `JustLinked` is shown briefly after success then cleared
+/// back to `Idle`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkingStatus {
+    Idle,
+    InProgress,
+    JustLinked,
+    Failed,
+}
+
+/// User-visible status of the post-recording upload flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadStatus {
+    Idle,
+    InProgress,
+    JustUploaded,
+    SkippedNoAuth,
+    Failed,
+}
+
 impl std::fmt::Display for RecordingState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -45,6 +69,11 @@ pub struct AppState {
     pub device_id: Mutex<String>,
     pub current_recording_path: Mutex<Option<String>>,
     pub recording_start_time: Mutex<Option<std::time::Instant>>,
+    /// Linking flow status — drives the tray "🔄 Linking…" / "❌ Link failed" rows.
+    pub linking_status: Mutex<LinkingStatus>,
+    /// Upload flow status — drives the tray "🔄 Uploading…" / "✅ Uploaded" /
+    /// "⚠️ Saved locally — link to upload" / "❌ Upload failed" rows.
+    pub upload_status: Mutex<UploadStatus>,
 }
 
 impl AppState {
@@ -69,5 +98,13 @@ impl AppState {
 
     pub fn current_state(&self) -> RecordingState {
         *self.recording_state.lock().unwrap()
+    }
+
+    pub fn set_linking_status(&self, s: LinkingStatus) {
+        *self.linking_status.lock().unwrap() = s;
+    }
+
+    pub fn set_upload_status(&self, s: UploadStatus) {
+        *self.upload_status.lock().unwrap() = s;
     }
 }

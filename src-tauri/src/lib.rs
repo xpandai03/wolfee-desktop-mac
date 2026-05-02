@@ -8,7 +8,7 @@ mod uploader;
 use auth::AuthConfig;
 use copilot::state::{CopilotState, CopilotStateMutex};
 use recorder::Recorder;
-use state::{AppState, RecordingState};
+use state::{AppState, LinkingStatus, RecordingState, UploadStatus};
 use std::sync::{Arc, Mutex};
 use tauri::{Listener, Manager, WindowEvent};
 
@@ -88,6 +88,8 @@ pub fn run() {
         device_id: Mutex::new(auth_config.device_id.clone()),
         current_recording_path: Mutex::new(None),
         recording_start_time: Mutex::new(None),
+        linking_status: Mutex::new(LinkingStatus::Idle),
+        upload_status: Mutex::new(UploadStatus::Idle),
     };
 
     let backend_url = auth_config.backend_url.clone();
@@ -237,6 +239,11 @@ pub fn run() {
                                             duration: result.duration,
                                         };
 
+                                        {
+                                            let state: tauri::State<'_, AppState> = handle.state();
+                                            state.set_upload_status(UploadStatus::InProgress);
+                                        }
+                                        tray::update_tray_menu(&tray, &handle, RecordingState::Uploading, true);
                                         log::info!("[UPLOAD] Begin — POST {}/api/meetings/import/desktop", backend_url);
                                         match uploader::upload_recording(
                                             &result.file_path,
@@ -255,27 +262,31 @@ pub fn run() {
                                                 {
                                                     let state: tauri::State<'_, AppState> = handle.state();
                                                     let _ = state.transition_to(RecordingState::Complete);
+                                                    state.set_upload_status(UploadStatus::JustUploaded);
                                                 }
                                                 tray::update_tray_menu(&tray, &handle, RecordingState::Complete, true);
 
-                                                // Auto-return to idle after 5s
+                                                // Auto-return to idle after 10s, also clearing the upload status row.
                                                 let tray2 = tray.clone();
                                                 let handle2 = handle.clone();
                                                 std::thread::spawn(move || {
-                                                    std::thread::sleep(std::time::Duration::from_secs(5));
+                                                    std::thread::sleep(std::time::Duration::from_secs(10));
                                                     let state: tauri::State<'_, AppState> = handle2.state();
                                                     if state.current_state() == RecordingState::Complete {
                                                         let _ = state.transition_to(RecordingState::Idle);
+                                                        state.set_upload_status(UploadStatus::Idle);
                                                         tray::update_tray_menu(&tray2, &handle2, RecordingState::Idle, true);
                                                     }
                                                 });
                                             }
                                             Err(e) => {
-                                                log::error!("[UPLOAD] Error: {}", e);
-                                                log::error!("[UPLOAD] File kept at: {}", result.file_path.display());
+                                                log::warn!("[UPLOAD] Error: {}", e);
+                                                log::warn!("[UPLOAD] File kept at: {}", result.file_path.display());
                                                 let state: tauri::State<'_, AppState> = handle.state();
                                                 let _ = state.transition_to(RecordingState::Idle);
+                                                state.set_upload_status(UploadStatus::Failed);
                                                 tray::update_tray_menu(&tray, &handle, RecordingState::Idle, true);
+                                                // Failed upload is sticky — user dismisses via the tray.
                                             }
                                         }
                                     } else {
@@ -283,7 +294,9 @@ pub fn run() {
                                         log::warn!("[AUTH] File saved at: {}", result.file_path.display());
                                         let state: tauri::State<'_, AppState> = handle.state();
                                         let _ = state.transition_to(RecordingState::Idle);
+                                        state.set_upload_status(UploadStatus::SkippedNoAuth);
                                         tray::update_tray_menu(&tray, &handle, RecordingState::Idle, false);
+                                        // Sticky — user clicks "Link with Wolfee…" to clear via the link flow.
                                     }
                                 }
                                 Err(e) => {
@@ -313,6 +326,19 @@ pub fn run() {
                         log::info!("[LINK] Opening pairing URL: {}", url);
                         open_url(&url);
 
+                        // UX: surface "🔄 Linking…" in the tray so the user knows polling is live.
+                        // Also clears any prior SkippedNoAuth upload-status row.
+                        state.set_linking_status(LinkingStatus::InProgress);
+                        if *state.upload_status.lock().unwrap() == UploadStatus::SkippedNoAuth {
+                            state.set_upload_status(UploadStatus::Idle);
+                        }
+                        tray::update_tray_menu(
+                            &tray_clone,
+                            handle_ref,
+                            state.current_state(),
+                            state.auth_token.lock().unwrap().is_some(),
+                        );
+
                         // Now poll the backend until the web app confirms the link
                         let tray = tray_clone.clone();
                         let handle = handle_ref.clone();
@@ -338,17 +364,68 @@ pub fn run() {
                                     let state: tauri::State<'_, AppState> = handle.state();
                                     *state.auth_token.lock().unwrap() = Some(token);
                                     *state.user_id.lock().unwrap() = user_id;
+                                    state.set_linking_status(LinkingStatus::JustLinked);
 
                                     // Refresh tray to remove "Link with Wolfee..." and show ready state
                                     tray::update_tray_menu(&tray, &handle, RecordingState::Idle, true);
                                     log::info!("[AUTH] Tray updated — ready to record + upload");
+
+                                    // Auto-clear the "✅ Linked!" status row after 5s.
+                                    let tray2 = tray.clone();
+                                    let handle2 = handle.clone();
+                                    std::thread::spawn(move || {
+                                        std::thread::sleep(std::time::Duration::from_secs(5));
+                                        let state: tauri::State<'_, AppState> = handle2.state();
+                                        if *state.linking_status.lock().unwrap() == LinkingStatus::JustLinked {
+                                            state.set_linking_status(LinkingStatus::Idle);
+                                            tray::update_tray_menu(
+                                                &tray2,
+                                                &handle2,
+                                                state.current_state(),
+                                                true,
+                                            );
+                                        }
+                                    });
                                 }
                                 Err(e) => {
-                                    log::error!("[AUTH] Link failed: {}", e);
-                                    log::error!("[AUTH] User can retry by clicking 'Link with Wolfee...' again");
+                                    log::warn!("[AUTH] Link failed: {}", e);
+                                    log::warn!("[AUTH] Surface in tray as failed — click to retry");
+                                    let state: tauri::State<'_, AppState> = handle.state();
+                                    state.set_linking_status(LinkingStatus::Failed);
+                                    tray::update_tray_menu(
+                                        &tray,
+                                        &handle,
+                                        state.current_state(),
+                                        state.auth_token.lock().unwrap().is_some(),
+                                    );
+                                    // Sticky — user clicks the failed row to retry, which re-emits link-account.
                                 }
                             }
                         });
+                    }
+
+                    // ─────────────────────────────────────────
+                    // CLEAR transient status rows (tray dismiss)
+                    // ─────────────────────────────────────────
+                    "clear-linking-status" => {
+                        let s: tauri::State<'_, AppState> = handle_ref.state();
+                        s.set_linking_status(LinkingStatus::Idle);
+                        tray::update_tray_menu(
+                            &tray_clone,
+                            handle_ref,
+                            s.current_state(),
+                            s.auth_token.lock().unwrap().is_some(),
+                        );
+                    }
+                    "clear-upload-status" => {
+                        let s: tauri::State<'_, AppState> = handle_ref.state();
+                        s.set_upload_status(UploadStatus::Idle);
+                        tray::update_tray_menu(
+                            &tray_clone,
+                            handle_ref,
+                            s.current_state(),
+                            s.auth_token.lock().unwrap().is_some(),
+                        );
                     }
 
                     // ─────────────────────────────────────────
