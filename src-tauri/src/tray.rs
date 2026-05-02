@@ -131,6 +131,60 @@ fn build_menu<R: Runtime>(
     )?;
     menu.append(&open_overlay)?;
 
+    // ── Session controls (Sub-prompt 2 Phase 5) ───────────────────
+    // Show Start when nothing is in flight (Idle / ShowingOverlay /
+    // Paused) and End when a session is live or transitioning.
+    let session_sep_top = MenuItem::with_id(app, "copilot_session_sep_top", "—", false, None::<&str>)?;
+    menu.append(&session_sep_top)?;
+
+    let in_session = matches!(
+        copilot_state,
+        CopilotState::StartingSession { .. }
+            | CopilotState::Listening { .. }
+            | CopilotState::Reconnecting { .. }
+            | CopilotState::EndingSession { .. }
+    );
+
+    if !in_session {
+        let label = if is_authenticated {
+            "Start Copilot Session"
+        } else {
+            "Start Copilot Session (link first)"
+        };
+        let start_session = MenuItem::with_id(
+            app,
+            "copilot_start_session",
+            label,
+            is_authenticated, // disabled when not authed
+            None::<&str>,
+        )?;
+        menu.append(&start_session)?;
+    } else {
+        // Disable End during transient Starting/Ending so a stale
+        // double-click during transitions can't kick off cascading
+        // teardowns.
+        let enabled = matches!(
+            copilot_state,
+            CopilotState::Listening { .. } | CopilotState::Reconnecting { .. }
+        );
+        let label = if enabled {
+            "End Copilot Session"
+        } else {
+            "End Copilot Session (please wait…)"
+        };
+        let end_session = MenuItem::with_id(
+            app,
+            "copilot_end_session",
+            label,
+            enabled,
+            None::<&str>,
+        )?;
+        menu.append(&end_session)?;
+    }
+
+    let session_sep_bottom = MenuItem::with_id(app, "copilot_session_sep_bottom", "—", false, None::<&str>)?;
+    menu.append(&session_sep_bottom)?;
+
     let pause_label = if copilot_state == CopilotState::Paused {
         "Resume Copilot"
     } else {
@@ -145,6 +199,25 @@ fn build_menu<R: Runtime>(
     let setup_copilot =
         MenuItem::with_id(app, "copilot_setup", "Set Up Copilot…", true, None::<&str>)?;
     menu.append(&setup_copilot)?;
+
+    // Recorder + Copilot coexistence warning (Decision N6 — soft, allowed).
+    // Surface only when both are simultaneously active so the user knows
+    // they're double-running on shared mic resources.
+    let recorder_active = matches!(state, RecordingState::Recording);
+    let copilot_active_session = matches!(
+        copilot_state,
+        CopilotState::Listening { .. } | CopilotState::Reconnecting { .. }
+    );
+    if recorder_active && copilot_active_session {
+        let warn = MenuItem::with_id(
+            app,
+            "copilot_coexist_warn",
+            "⚠️ Recorder + Copilot both running",
+            false,
+            None::<&str>,
+        )?;
+        menu.append(&warn)?;
+    }
 
     let section_sep = MenuItem::with_id(app, "section_sep", "———", false, None::<&str>)?;
     menu.append(&section_sep)?;
@@ -321,6 +394,14 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, id: &str) {
         "copilot_setup" => {
             log::info!("[Tray] Set Up Copilot clicked");
             let _ = app.emit("wolfee-action", "open-copilot-settings");
+        }
+        "copilot_start_session" => {
+            log::info!("[Tray] Start Copilot Session clicked");
+            let _ = app.emit("wolfee-action", "start-copilot-session");
+        }
+        "copilot_end_session" => {
+            log::info!("[Tray] End Copilot Session clicked");
+            let _ = app.emit("wolfee-action", "end-copilot-session");
         }
 
         // ─── Linking / upload status row clicks ───
