@@ -13,6 +13,11 @@ certs/
 # Tauri build artifacts
 src-tauri/target/
 
+# Copilot overlay frontend build artifacts
+overlay/dist/
+overlay/node_modules/
+overlay/tsconfig.tsbuildinfo
+
 # Test artifacts
 stripped.app/
 stripped.dmg
