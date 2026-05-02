@@ -4,6 +4,7 @@
 //! Audio capture, LLM calls, CRM, and active-call detection arrive in
 //! Sub-prompts 2 / 3 / 5 / 6 respectively.
 
+pub mod audio;
 pub mod hotkey;
 pub mod state;
 pub mod transcribe;

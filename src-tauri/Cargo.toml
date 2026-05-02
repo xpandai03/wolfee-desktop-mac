@@ -25,6 +25,24 @@ chrono = { version = "0.4", features = ["serde"] }
 hostname = "0.4"
 urlencoding = "2"
 
+# Sub-prompt 2 (Listening) — macOS audio capture + Deepgram WS
+[target.'cfg(target_os = "macos")'.dependencies]
+screencapturekit = { version = "1.5", features = ["macos_13_0"] }
+core-graphics = "0.25"
+
+[dependencies.cpal]
+version = "0.17"
+
+[dependencies.tokio-tungstenite]
+version = "0.24"
+features = ["rustls-tls-webpki-roots"]
+
+[dependencies.rubato]
+version = "0.16"
+
+[dependencies.bytes]
+version = "1"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 chrono = "0.4"
