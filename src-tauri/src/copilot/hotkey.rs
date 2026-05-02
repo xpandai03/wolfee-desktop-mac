@@ -29,7 +29,9 @@ fn toggle_overlay<R: Runtime>(app: &AppHandle<R>) {
     let state_mutex = app.state::<CopilotStateMutex>();
     let mut state = state_mutex.0.lock().unwrap();
 
-    match *state {
+    // Match by reference so non-Copy variants (StartingSession et al
+    // from Sub-prompt 2) don't trigger a move out of the MutexGuard.
+    match &*state {
         CopilotState::Idle | CopilotState::Paused => {
             log::info!("[Copilot] Hotkey: showing overlay (was {})", *state);
             if let Err(e) = window::show_overlay(app) {
@@ -45,6 +47,12 @@ fn toggle_overlay<R: Runtime>(app: &AppHandle<R>) {
                 return;
             }
             *state = CopilotState::Idle;
+        }
+        // During an active listening session (or its setup/teardown)
+        // the hotkey is a no-op for V1. Sub-prompt 4 (Overlay polish)
+        // can repurpose it for "show suggestions" UX.
+        other => {
+            log::debug!("[Copilot] Hotkey ignored — current state: {}", other);
         }
     }
 }

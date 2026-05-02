@@ -6,6 +6,7 @@
 
 pub mod hotkey;
 pub mod state;
+pub mod transcribe;
 pub mod window;
 
 use tauri::{AppHandle, Runtime};

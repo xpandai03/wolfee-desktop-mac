@@ -10,7 +10,7 @@ use crate::state::{AppState, LinkingStatus, RecordingState, UploadStatus};
 
 fn current_copilot_state<R: Runtime>(app: &AppHandle<R>) -> CopilotState {
     if let Some(state) = app.try_state::<CopilotStateMutex>() {
-        return *state.0.lock().unwrap();
+        return state.0.lock().unwrap().clone();
     }
     CopilotState::Idle
 }
@@ -85,11 +85,19 @@ pub fn update_tray_menu<R: Runtime>(
     let _ = tray.set_title(title);
 }
 
-fn copilot_status_label(state: CopilotState) -> &'static str {
+fn copilot_status_label(state: &CopilotState) -> &'static str {
     match state {
         CopilotState::Idle => "🟢 Copilot: Idle",
         CopilotState::ShowingOverlay => "🟡 Copilot: Active",
         CopilotState::Paused => "🔴 Copilot: Paused",
+        // Sub-prompt 2 listening lifecycle. Wired here so the tray
+        // reflects session state even before Sub-prompt 5 lands the
+        // tray-action handlers; the matching menu items themselves
+        // come in Sub-prompt 5.
+        CopilotState::StartingSession { .. } => "🔄 Copilot: Starting…",
+        CopilotState::Listening { .. } => "🟢 Copilot: Listening",
+        CopilotState::Reconnecting { .. } => "⚠️ Copilot: Reconnecting…",
+        CopilotState::EndingSession { .. } => "🔄 Copilot: Ending…",
     }
 }
 
@@ -108,7 +116,7 @@ fn build_menu<R: Runtime>(
     let copilot_status = MenuItem::with_id(
         app,
         "copilot_status",
-        copilot_status_label(copilot_state),
+        copilot_status_label(&copilot_state),
         false,
         None::<&str>,
     )?;
