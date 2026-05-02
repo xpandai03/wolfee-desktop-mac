@@ -9,7 +9,7 @@ body,
   height: 100%;
   margin: 0;
   padding: 0;
-  background: transparent;
+  background: #09090b; /* zinc-950 — solid dark; transparency lands with macos-private-api in SP4 */
   color-scheme: dark;
   -webkit-font-smoothing: antialiased;
   font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Inter, sans-serif;

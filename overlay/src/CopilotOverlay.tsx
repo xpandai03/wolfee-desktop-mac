@@ -26,9 +26,9 @@ export default function CopilotOverlay() {
   }, []);
 
   return (
-    <div className="w-full h-full flex items-start justify-center p-3">
+    <div className="w-full h-full flex items-start justify-center p-3 bg-zinc-950">
       <div
-        className="w-full px-6 py-5 rounded-2xl border border-copilot-accent/40 shadow-2xl shadow-copilot-glow bg-zinc-950/85 backdrop-blur-md text-white"
+        className="w-full px-6 py-5 rounded-2xl border border-copilot-accent/40 shadow-2xl shadow-copilot-glow bg-zinc-900 text-white"
         role="dialog"
         aria-label="Wolfee Copilot suggestion overlay"
       >
