@@ -235,6 +235,19 @@ async fn run_one_cycle<R: Runtime>(
         },
     );
 
+    // Sub-prompt 4 N3 — pending event for the overlay's Reasoning
+    // indicator. Defensive: copilot-moment-detected and -pending
+    // both fire here; the overlay reducer dedupes (whichever lands
+    // first wins; the other is a no-op).
+    let _ = app.emit(
+        "copilot-suggestion-pending",
+        serde_json::json!({
+            "trigger_source": "moment",
+            "trigger": &resp.trigger,
+            "trigger_phrase": &resp.trigger_phrase,
+        }),
+    );
+
     // 9. Spawn suggest_client (Tauri-runtime, never blocks this worker).
     suggest_client::spawn_for_moment(
         app.clone(),

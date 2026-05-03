@@ -599,6 +599,14 @@ pub fn run() {
                                 device_token,
                             ),
                         );
+                        // Sub-prompt 4 N3 — fire-and-forget pending event so
+                        // the overlay can show the Reasoning indicator
+                        // instantly, before the LLM round-trip begins.
+                        // Eliminates 200-800ms dead air on hotkey path.
+                        let _ = handle_ref.emit(
+                            "copilot-suggestion-pending",
+                            serde_json::json!({"trigger_source": "hotkey"}),
+                        );
                         copilot::intelligence::suggest_client::spawn_for_hotkey(
                             handle_ref.clone(),
                             session_id,
