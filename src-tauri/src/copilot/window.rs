@@ -47,9 +47,55 @@ pub fn create_overlay_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()
         log::info!("[Copilot] Overlay content protection enabled");
     }
 
+    // Sub-prompt 4 fix 2026-05-03 — bump NSWindow level above
+    // fullscreen apps. visible_on_all_workspaces=true (set on the
+    // builder above) handles Spaces, but Tauri's `always_on_top`
+    // only sets NSFloatingWindowLevel (3) which is below the level
+    // fullscreen apps render at. We elevate to
+    // NSScreenSaverWindowLevel (1000) — the level macOS uses for
+    // the volume HUD and other system-wide overlays that float
+    // above fullscreen content.
+    #[cfg(target_os = "macos")]
+    elevate_window_level(&overlay);
+
     position_top_center(&overlay);
 
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn elevate_window_level<R: Runtime>(window: &tauri::WebviewWindow<R>) {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+
+    // NSScreenSaverWindowLevel = CGShieldingWindowLevel - 1 = 1000.
+    // Tauri's `WindowLevel` enum tops out at AlwaysOnTop which maps
+    // to NSFloatingWindowLevel (3) — too low for fullscreen apps.
+    const NS_SCREEN_SAVER_WINDOW_LEVEL: i64 = 1000;
+
+    let ns_window_ptr = match window.ns_window() {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!(
+                "[Copilot] elevate_window_level: ns_window() failed: {} — overlay may not show over fullscreen apps",
+                e
+            );
+            return;
+        }
+    };
+
+    // SAFETY: ns_window() returns a non-null pointer to a valid
+    // NSWindow instance owned by the macOS runtime. setLevel: is a
+    // standard NSWindow method that takes an NSInteger and returns
+    // void. We're not retaining or releasing — just calling.
+    unsafe {
+        let ns_window = ns_window_ptr as *mut AnyObject;
+        let _: () = msg_send![ns_window, setLevel: NS_SCREEN_SAVER_WINDOW_LEVEL];
+    }
+    log::info!(
+        "[Copilot] Overlay window level elevated to NSScreenSaverWindowLevel ({})",
+        NS_SCREEN_SAVER_WINDOW_LEVEL
+    );
 }
 
 fn position_top_center<R: Runtime>(window: &tauri::WebviewWindow<R>) {
