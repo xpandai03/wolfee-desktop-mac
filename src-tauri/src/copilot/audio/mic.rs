@@ -154,14 +154,53 @@ fn build_and_run_stream(
     // channel (capacity 256 = ~12 s of 50 ms frames) is plenty of slack.
     let sender_cb = sender.clone();
     let stream = match format {
-        SampleFormat::F32 => device.build_input_stream(
-            &stream_config,
-            move |data: &[f32], _info: &cpal::InputCallbackInfo| {
-                push_frame(&sender_cb, data, channels, sample_rate);
-            },
-            mic_error_cb,
-            None,
-        ),
+        SampleFormat::F32 => {
+            // Layer A diagnostic — Phase 3 mic-channel debugging.
+            // Logs every 5 s the maximum absolute amplitude of the raw
+            // f32 buffer as it arrives from the OS, plus the first
+            // sample of the last buffer in the window. If max_abs == 0
+            // for a full window while the user is speaking, the bug is
+            // upstream of our code (TCC / device / cpal config), not
+            // in our pipeline.
+            let mut diag_calls: u64 = 0;
+            let mut diag_samples: u64 = 0;
+            let mut diag_max_abs: f32 = 0.0;
+            let mut diag_last_first = 0.0f32;
+            let mut diag_last_log = Instant::now();
+            device.build_input_stream(
+                &stream_config,
+                move |data: &[f32], _info: &cpal::InputCallbackInfo| {
+                    diag_calls += 1;
+                    diag_samples += data.len() as u64;
+                    for &s in data.iter() {
+                        let a = s.abs();
+                        if a > diag_max_abs {
+                            diag_max_abs = a;
+                        }
+                    }
+                    if let Some(&first) = data.first() {
+                        diag_last_first = first;
+                    }
+                    if diag_last_log.elapsed().as_secs() >= 5 {
+                        log::info!(
+                            "[Copilot/mic] LAYER-A cpal cb (5s): calls={}, samples={}, \
+                             max_abs={:.6}, last_first={:.6}",
+                            diag_calls,
+                            diag_samples,
+                            diag_max_abs,
+                            diag_last_first
+                        );
+                        diag_calls = 0;
+                        diag_samples = 0;
+                        diag_max_abs = 0.0;
+                        diag_last_log = Instant::now();
+                    }
+                    push_frame(&sender_cb, data, channels, sample_rate);
+                },
+                mic_error_cb,
+                None,
+            )
+        }
         SampleFormat::I16 => device.build_input_stream(
             &stream_config,
             move |data: &[i16], _info: &cpal::InputCallbackInfo| {

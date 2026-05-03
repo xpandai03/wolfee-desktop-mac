@@ -233,6 +233,20 @@ pub async fn run_pump(
 
     log::info!("[Copilot/mux] pump started, awaiting first mic frame to size resampler");
 
+    // Layer B + C diagnostics — Phase 3 mic-channel debugging.
+    // B: max abs of mono mic samples received from the mic mpsc each 5s
+    //    (compare with Layer A to see if mic.rs's send pipeline drops
+    //    or zeros samples between cpal callback and mux receiver).
+    // C: max abs of mic samples that ended up in popped stereo frames
+    //    each 5s (compare with B to find resampler / mux output bugs).
+    let mut diag_b_recvs: u64 = 0;
+    let mut diag_b_samples: u64 = 0;
+    let mut diag_b_max_abs: f32 = 0.0;
+    let mut diag_c_frames: u64 = 0;
+    let mut diag_c_l_max_abs_i16: i16 = 0;
+    let mut diag_c_r_max_abs_i16: i16 = 0;
+    let mut diag_last_log = Instant::now();
+
     loop {
         // Cheap state check at the top of each iteration. Use try_lock
         // so we don't block the pump waiting on a state-mutator.
@@ -274,6 +288,15 @@ pub async fn run_pump(
                         }
                     }
                 }
+                // Layer B diagnostic — sample stats BEFORE handing to mux.
+                diag_b_recvs += 1;
+                diag_b_samples += frame.samples.len() as u64;
+                for &s in &frame.samples {
+                    let a = s.abs();
+                    if a > diag_b_max_abs {
+                        diag_b_max_abs = a;
+                    }
+                }
                 if let Some(m) = mux.as_mut() {
                     m.push_mic_samples(&frame.samples);
                 } else {
@@ -299,6 +322,22 @@ pub async fn run_pump(
 
         if let Some(m) = mux.as_mut() {
             while let Some(frame) = m.try_pop_frame() {
+                // Layer C diagnostic — peak abs of L (mic) and R (sys)
+                // as they leave the mux. Compare with Layer B: if B is
+                // nonzero but C is zero on L, the mic resampler /
+                // interleave is dropping samples; if B and C both
+                // nonzero, the mic side is fine end-to-end.
+                diag_c_frames += 1;
+                for (i, &s) in frame.pcm_s16le_stereo.iter().enumerate() {
+                    let a = s.saturating_abs();
+                    if i % 2 == 0 {
+                        if a > diag_c_l_max_abs_i16 {
+                            diag_c_l_max_abs_i16 = a;
+                        }
+                    } else if a > diag_c_r_max_abs_i16 {
+                        diag_c_r_max_abs_i16 = a;
+                    }
+                }
                 if out.try_send(frame).is_err() {
                     // Downstream backed up — let it catch up before
                     // pumping more frames. The Deepgram WS client (Phase
@@ -307,6 +346,28 @@ pub async fn run_pump(
                     break;
                 }
             }
+        }
+
+        if diag_last_log.elapsed().as_secs() >= 5 {
+            log::info!(
+                "[Copilot/mux] LAYER-B mic_rx (5s): recvs={}, samples={}, max_abs={:.6}",
+                diag_b_recvs,
+                diag_b_samples,
+                diag_b_max_abs
+            );
+            log::info!(
+                "[Copilot/mux] LAYER-C try_pop (5s): frames={}, L_max_i16={}, R_max_i16={}",
+                diag_c_frames,
+                diag_c_l_max_abs_i16,
+                diag_c_r_max_abs_i16
+            );
+            diag_b_recvs = 0;
+            diag_b_samples = 0;
+            diag_b_max_abs = 0.0;
+            diag_c_frames = 0;
+            diag_c_l_max_abs_i16 = 0;
+            diag_c_r_max_abs_i16 = 0;
+            diag_last_log = Instant::now();
         }
 
         // Suppress unused-variable warning on pending_mic; replayed

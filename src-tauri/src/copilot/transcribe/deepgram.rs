@@ -358,6 +358,19 @@ async fn run_ws_session<R: Runtime>(
     let mut jwt_check = tokio::time::interval(JWT_CHECK_INTERVAL);
     jwt_check.tick().await; // skip the immediate first tick
 
+    // 5-second rolling diagnostic on the bytes leaving for Deepgram.
+    // Mirrors the Phase 5 spawn_frame_logger (now removed) but at the
+    // WS-send boundary instead of the mux output, so we can confirm
+    // that what Deepgram receives actually has L=mic populated. If
+    // mic_nonzero is true here but no `final (user, ...)` lines come
+    // back, the mux's L/R interleave is wrong; if mic_nonzero is
+    // false, the mic stream itself is bad.
+    let mut diag_count: u64 = 0;
+    let mut diag_bytes: u64 = 0;
+    let mut diag_mic_nonzero = false;
+    let mut diag_sys_nonzero = false;
+    let mut diag_last_log = Instant::now();
+
     loop {
         tokio::select! {
             biased;
@@ -365,6 +378,34 @@ async fn run_ws_session<R: Runtime>(
             frame = audio_rx.recv() => {
                 match frame {
                     Some(f) => {
+                        // Diagnostic: scan even-indexed samples (L = mic =
+                        // user) and odd-indexed (R = system audio =
+                        // speakers). Break early once both channels seen.
+                        for (i, &s) in f.pcm_s16le_stereo.iter().enumerate() {
+                            if s != 0 {
+                                if i % 2 == 0 { diag_mic_nonzero = true; }
+                                else { diag_sys_nonzero = true; }
+                                if diag_mic_nonzero && diag_sys_nonzero { break; }
+                            }
+                        }
+                        diag_count += 1;
+                        diag_bytes += (f.pcm_s16le_stereo.len() * 2) as u64;
+                        if diag_last_log.elapsed().as_secs() >= 5 {
+                            log::info!(
+                                "[Copilot/dg] ws-send frames in last 5s: {} ({} KB), \
+                                 mic_nonzero={}, system_nonzero={}",
+                                diag_count,
+                                diag_bytes / 1024,
+                                diag_mic_nonzero,
+                                diag_sys_nonzero
+                            );
+                            diag_count = 0;
+                            diag_bytes = 0;
+                            diag_mic_nonzero = false;
+                            diag_sys_nonzero = false;
+                            diag_last_log = Instant::now();
+                        }
+
                         let bytes = encode_frame(&f);
                         // Buffer for replay BEFORE sending so a send-time
                         // disconnect doesn't lose the in-flight frame.
