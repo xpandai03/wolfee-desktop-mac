@@ -19,6 +19,46 @@ interface TranscriptChunkPayload {
   ended_at_ms: number;
 }
 
+// ── Sub-prompt 3 (Intelligence) Tauri event payloads ──────────────
+interface CopilotSummaryUpdatedPayload {
+  session_id: string;
+  summary: string;
+  generated_at_ms: number;
+  generation_count: number;
+}
+
+interface CopilotMomentDetectedPayload {
+  session_id: string;
+  trigger: string;
+  trigger_phrase: string | null;
+  urgency: number;
+  rationale: string;
+}
+
+interface CopilotSuggestionPayload {
+  session_id: string;
+  suggestion_id: string;
+  moment_type: string;
+  primary: string;
+  secondary: string | null;
+  confidence: number;
+  reasoning: string;
+  ttl_seconds: number;
+}
+
+interface CopilotSuggestionStreamingPayload {
+  session_id: string;
+  suggestion_id: string;
+  kind: "start" | "delta" | "complete";
+  text: string | null;
+  moment_type: string | null;
+}
+
+interface CopilotSuggestionFailedPayload {
+  session_id: string;
+  reason: string;
+}
+
 export default function CopilotOverlay() {
   const [permissionNeeded, setPermissionNeeded] =
     useState<PermissionNeededPayload | null>(null);
@@ -58,6 +98,12 @@ export default function CopilotOverlay() {
 
     let permUnlisten: UnlistenFn | undefined;
     let transcriptUnlisten: UnlistenFn | undefined;
+    // Sub-prompt 3 — Intelligence event listeners (stub: log only).
+    let summaryUnlisten: UnlistenFn | undefined;
+    let momentUnlisten: UnlistenFn | undefined;
+    let suggestionUnlisten: UnlistenFn | undefined;
+    let suggestionStreamingUnlisten: UnlistenFn | undefined;
+    let suggestionFailedUnlisten: UnlistenFn | undefined;
 
     void (async () => {
       permUnlisten = await listen<PermissionNeededPayload>(
@@ -81,6 +127,69 @@ export default function CopilotOverlay() {
           );
         },
       );
+
+      // Sub-prompt 3 (Intelligence) — six new events. Sub-prompt 4
+      // will render summary panel + suggestion cards from these.
+      // For now we just console.log so the verification flow can
+      // confirm events flow over the IPC bridge.
+      summaryUnlisten = await listen<CopilotSummaryUpdatedPayload>(
+        "copilot-summary-updated",
+        (event) => {
+          const p = event.payload;
+          console.log(
+            `[Copilot] summary-updated count=${p.generation_count} ` +
+              `(${p.summary.length} chars)`,
+          );
+        },
+      );
+
+      momentUnlisten = await listen<CopilotMomentDetectedPayload>(
+        "copilot-moment-detected",
+        (event) => {
+          const p = event.payload;
+          console.log(
+            `[Copilot] moment-detected trigger=${p.trigger} urgency=${p.urgency}: ` +
+              `${p.rationale}`,
+          );
+        },
+      );
+
+      suggestionUnlisten = await listen<CopilotSuggestionPayload>(
+        "copilot-suggestion",
+        (event) => {
+          const p = event.payload;
+          console.log(
+            `[Copilot] suggestion id=${p.suggestion_id} ` +
+              `confidence=${p.confidence.toFixed(2)}: ${p.primary}`,
+          );
+        },
+      );
+
+      suggestionStreamingUnlisten = await listen<CopilotSuggestionStreamingPayload>(
+        "copilot-suggestion-streaming",
+        (event) => {
+          const p = event.payload;
+          if (p.kind === "delta" && p.text) {
+            // Per-token deltas — too noisy for production console.log,
+            // but useful during verification. Sub-prompt 4 will
+            // render these inline.
+            console.log(`[Copilot] suggestion-delta: ${p.text}`);
+          } else if (p.kind === "start") {
+            console.log(
+              `[Copilot] suggestion-start id=${p.suggestion_id} ` +
+                `moment=${p.moment_type ?? "(unknown)"}`,
+            );
+          }
+        },
+      );
+
+      suggestionFailedUnlisten = await listen<CopilotSuggestionFailedPayload>(
+        "copilot-suggestion-failed",
+        (event) => {
+          const p = event.payload;
+          console.warn(`[Copilot] suggestion-failed: ${p.reason}`);
+        },
+      );
     })();
 
     return () => {
@@ -88,6 +197,11 @@ export default function CopilotOverlay() {
       void focusUnlistenPromise.then((fn) => fn());
       permUnlisten?.();
       transcriptUnlisten?.();
+      summaryUnlisten?.();
+      momentUnlisten?.();
+      suggestionUnlisten?.();
+      suggestionStreamingUnlisten?.();
+      suggestionFailedUnlisten?.();
     };
   }, []);
 
