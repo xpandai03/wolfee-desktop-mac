@@ -6,7 +6,7 @@ mod tray;
 mod uploader;
 
 use auth::AuthConfig;
-use copilot::audio::CopilotAudioCapture;
+use copilot::audio::{AudioError, CopilotAudioCapture, PermissionKind};
 use copilot::session::api::{EndReason, SessionApi};
 use copilot::state::{
     CopilotAudioCaptureMutex, CopilotState, CopilotStateMutex, TranscriptBufferMutex,
@@ -15,7 +15,7 @@ use copilot::transcribe::deepgram::DeepgramClient;
 use recorder::Recorder;
 use state::{AppState, LinkingStatus, RecordingState, UploadStatus};
 use std::sync::{Arc, Mutex};
-use tauri::{Listener, Manager, WindowEvent};
+use tauri::{Emitter, Listener, Manager, WindowEvent};
 
 fn open_url(url: &str) {
     log::info!("[App] Opening URL: {}", url);
@@ -500,6 +500,23 @@ pub fn run() {
                         );
                     }
 
+                    // Phase 6 — overlay modal "Open System Settings" buttons.
+                    // The frontend can't open `x-apple.systempreferences:` URLs
+                    // directly without the @tauri-apps/plugin-opener JS package
+                    // (we have only the Rust side). Routing through
+                    // wolfee-action keeps the dep surface unchanged and reuses
+                    // the existing macOS `open` shell invocation.
+                    "open-system-settings-microphone" => {
+                        open_url(
+                            "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone",
+                        );
+                    }
+                    "open-system-settings-screen-recording" => {
+                        open_url(
+                            "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+                        );
+                    }
+
                     // Internal action emitted by Phase 3's DeepgramClient
                     // when CopilotState transitions inside the WS task
                     // (Listening ⇄ Reconnecting). Tray rendering reads
@@ -634,6 +651,38 @@ pub fn run() {
                                          ending backend session and reverting state",
                                         e
                                     );
+                                    // Phase 6: if the failure was specifically a
+                                    // TCC denial, show the overlay and emit
+                                    // copilot-permission-needed so the React
+                                    // side can render the modal with a deep
+                                    // link to the right System Settings panel.
+                                    // Other errors stay tray-only (they're
+                                    // either transient or device-unavailable —
+                                    // not user-actionable in the same way).
+                                    if let AudioError::PermissionDenied(kind) = &e {
+                                        let kind_str = match kind {
+                                            PermissionKind::Microphone => "Microphone",
+                                            PermissionKind::ScreenRecording => "ScreenRecording",
+                                        };
+                                        if let Err(err) = copilot::window::show_overlay(&handle) {
+                                            log::warn!(
+                                                "[Copilot] show_overlay for permission modal failed: {}",
+                                                err
+                                            );
+                                        }
+                                        if let Err(err) = handle.emit(
+                                            "copilot-permission-needed",
+                                            serde_json::json!({
+                                                "kind": kind_str,
+                                                "session_id": session_id.clone(),
+                                            }),
+                                        ) {
+                                            log::warn!(
+                                                "[Copilot] copilot-permission-needed emit failed: {}",
+                                                err
+                                            );
+                                        }
+                                    }
                                     let _ = api
                                         .end_session(&session_id, EndReason::Error)
                                         .await;
