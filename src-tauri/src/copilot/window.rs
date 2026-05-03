@@ -20,6 +20,16 @@ pub fn create_overlay_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()
         .title("Wolfee Copilot")
         .decorations(false)
         .always_on_top(true)
+        // Critical for the "fullscreen Zoom/Meet" use case: by default,
+        // each macOS fullscreen app gets its own Space, and an
+        // always-on-top window from the default Space won't render
+        // there. visible_on_all_workspaces=true sets the macOS
+        // NSWindowCollectionBehaviorCanJoinAllSpaces +
+        // NSWindowCollectionBehaviorFullScreenAuxiliary flags so the
+        // overlay floats over fullscreen apps regardless of Space.
+        // Surfaced by Sub-prompt 4 verification 2026-05-03 — PO had
+        // Zoom in fullscreen, overlay only appeared on the home Space.
+        .visible_on_all_workspaces(true)
         .skip_taskbar(true)
         .resizable(false)
         .inner_size(OVERLAY_WIDTH, OVERLAY_HEIGHT)
