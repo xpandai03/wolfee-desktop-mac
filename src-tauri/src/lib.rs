@@ -7,6 +7,10 @@ mod uploader;
 
 use auth::AuthConfig;
 use copilot::audio::{AudioError, CopilotAudioCapture, PermissionKind};
+use copilot::intelligence::state::{
+    ActiveSuggestionMutex, MomentCooldownMutex, RollingSummaryMutex,
+};
+use copilot::intelligence::{spawn_workers, IntelligenceWorkers};
 use copilot::session::api::{EndReason, SessionApi};
 use copilot::state::{
     CopilotAudioCaptureMutex, CopilotState, CopilotStateMutex, TranscriptBufferMutex,
@@ -47,6 +51,13 @@ where
         })
         .unwrap_or_else(|e| panic!("Failed to spawn thread {}: {}", name, e));
 }
+
+/// Tauri-managed wrapper around the active session's intelligence
+/// workers. `None` between sessions; populated when
+/// `start-copilot-session` finishes spawning workers and taken back
+/// out + stopped by `end-copilot-session`. tokio::Mutex because
+/// IntelligenceWorkers::stop() is async (await across the guard).
+struct IntelligenceWorkersMutex(tokio::sync::Mutex<Option<IntelligenceWorkers>>);
 
 // Phase 5 had a `spawn_frame_logger` here that just counted AudioFrames
 // every 5s for runtime verification. Phase 3 replaces it with
@@ -129,6 +140,13 @@ pub fn run() {
         .manage(CopilotStateMutex::default())
         .manage(CopilotAudioCaptureMutex::default())
         .manage(TranscriptBufferMutex::default())
+        // Sub-prompt 3 (Intelligence) state.
+        .manage(RollingSummaryMutex::default())
+        .manage(MomentCooldownMutex::default())
+        .manage(ActiveSuggestionMutex::default())
+        // Storage for the live IntelligenceWorkers handles. tokio::Mutex
+        // because we hold the guard across `await` (workers.stop() is async).
+        .manage(IntelligenceWorkersMutex(tokio::sync::Mutex::new(None)))
         .on_window_event(|window, event| {
             // Keep Rust state in sync when the overlay window hides via Esc / blur.
             if window.label() == copilot::window::OVERLAY_LABEL {
@@ -517,6 +535,91 @@ pub fn run() {
                         );
                     }
 
+                    // Sub-prompt 3 — ⌘⌥G hotkey OR tray "Generate
+                    // Suggestion" menu item. Fires the suggest_client
+                    // with trigger_source=hotkey, bypassing the moment
+                    // detector entirely.
+                    "trigger-copilot-suggestion" => {
+                        // Read CopilotState — only fire during Listening
+                        // (or Reconnecting; rolling summary still useful).
+                        let copilot_mutex = handle_ref.state::<CopilotStateMutex>();
+                        let cur = copilot_mutex.0.lock().unwrap().clone();
+                        let session_id = match cur {
+                            CopilotState::Listening { session_id, .. }
+                            | CopilotState::Reconnecting { session_id, .. } => session_id,
+                            other => {
+                                log::debug!(
+                                    "[Copilot] hotkey ⌘⌥G ignored — state: {}",
+                                    other
+                                );
+                                return;
+                            }
+                        };
+
+                        let device_token = match state.auth_token.lock().unwrap().clone() {
+                            Some(t) => t,
+                            None => {
+                                log::warn!(
+                                    "[Copilot] hotkey ⌘⌥G ignored — not authed"
+                                );
+                                return;
+                            }
+                        };
+
+                        // Snapshot transcript window + rolling summary.
+                        // Drop locks before await per Phase 6 lesson.
+                        let window_text = {
+                            let buf = handle_ref.state::<TranscriptBufferMutex>();
+                            let g = match buf.0.lock() {
+                                Ok(g) => g,
+                                Err(_) => return,
+                            };
+                            let utts = g.last_n_seconds(90);
+                            if utts.is_empty() {
+                                log::info!(
+                                    "[Copilot] hotkey ⌘⌥G — empty transcript window, no-op"
+                                );
+                                return;
+                            }
+                            copilot::intelligence::format_transcript_window(&utts)
+                        };
+                        let rolling_summary = match handle_ref
+                            .state::<RollingSummaryMutex>()
+                            .0
+                            .lock()
+                        {
+                            Ok(g) => g.as_ref().map(|x| x.text.clone()),
+                            Err(_) => None,
+                        };
+
+                        let backend_url = backend_url_clone.clone();
+                        let api = std::sync::Arc::new(
+                            copilot::intelligence::api::IntelligenceApi::new(
+                                backend_url,
+                                device_token,
+                            ),
+                        );
+                        copilot::intelligence::suggest_client::spawn_for_hotkey(
+                            handle_ref.clone(),
+                            session_id,
+                            api,
+                            window_text,
+                            rolling_summary,
+                        );
+                    }
+
+                    // Sub-prompt 4 will emit this when the user dismisses
+                    // a suggestion via Esc / click-outside / click-suggestion.
+                    // Releases the ActiveSuggestionMutex so the next
+                    // moment detector / hotkey trigger can fire.
+                    "copilot-suggestion-dismissed" => {
+                        if let Ok(mut g) =
+                            handle_ref.state::<ActiveSuggestionMutex>().0.lock()
+                        {
+                            *g = None;
+                        }
+                    }
+
                     // Internal action emitted by Phase 3's DeepgramClient
                     // when CopilotState transitions inside the WS task
                     // (Listening ⇄ Reconnecting). Tray rendering reads
@@ -742,8 +845,22 @@ pub fn run() {
                                 handle.clone(),
                             );
 
+                            // 6. Spawn Sub-prompt 3 intelligence workers
+                            //    (rolling summary + moment detector). These
+                            //    consume TranscriptBufferMutex and emit
+                            //    copilot-* Tauri events for Sub-prompt 4.
+                            let workers = spawn_workers(
+                                handle.clone(),
+                                session_id.clone(),
+                                backend_url.clone(),
+                                device_token.clone(),
+                            );
+                            let workers_mutex = handle.state::<IntelligenceWorkersMutex>();
+                            *workers_mutex.0.lock().await = Some(workers);
+                            drop(workers_mutex);
+
                             log::info!(
-                                "[Copilot] session live — id={}, Deepgram client spawned",
+                                "[Copilot] session live — id={}, Deepgram + intelligence workers spawned",
                                 session_id
                             );
                         });
@@ -803,6 +920,32 @@ pub fn run() {
                         // running on the same long-lived runtime keeps
                         // everything tidy and symmetrical with start.
                         tauri::async_runtime::spawn(async move {
+                            // 1a. Stop intelligence workers FIRST so they
+                            //     don't keep firing LLM calls during teardown.
+                            //     `IntelligenceWorkers::stop()` signals via
+                            //     watch::Sender + awaits both join handles
+                            //     with a 5s soft timeout.
+                            let workers_mutex = handle.state::<IntelligenceWorkersMutex>();
+                            let workers_opt = workers_mutex.0.lock().await.take();
+                            drop(workers_mutex);
+                            if let Some(workers) = workers_opt {
+                                workers.stop().await;
+                                log::info!("[Copilot] intelligence workers stopped");
+                            }
+                            // Clear intelligence mutexes so a subsequent
+                            // session starts clean.
+                            if let Ok(mut g) = handle.state::<RollingSummaryMutex>().0.lock() {
+                                *g = None;
+                            }
+                            if let Ok(mut g) = handle.state::<MomentCooldownMutex>().0.lock() {
+                                g.last_fired.clear();
+                                g.last_llm_verify = None;
+                                g.session_id.clear();
+                            }
+                            if let Ok(mut g) = handle.state::<ActiveSuggestionMutex>().0.lock() {
+                                *g = None;
+                            }
+
                             // 1. Stop audio capture (drops mic + sys + pump).
                             //    Bind State outside the await so its borrow of
                             //    `handle` lives across the suspend point.

@@ -8,20 +8,36 @@ use crate::copilot::{
 
 /// Register the Copilot hotkeys.
 ///
-/// Sub-prompt 1: `⌘⌥W` toggles the overlay. User-customizable hotkey UI ships
-/// in Sub-prompt 6 (per design doc §6). Pause-Copilot hotkey (`⌘⌥⇧W`,
-/// Decision N9) is added in Sub-prompt 6 too.
+/// Sub-prompt 1: `⌘⌥W` toggles the overlay. Sub-prompt 3: `⌘⌥G`
+/// generates an on-demand suggestion during a Listening session
+/// (Decision N4). User-customizable hotkey UI ships in Sub-prompt 6.
+/// Pause-Copilot hotkey (`⌘⌥⇧W`, Decision N9) is added in Sub-prompt 6.
 pub fn register<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::Error>> {
+    // ⌘⌥W — toggle overlay (Sub-prompt 1, sacred).
     let toggle_shortcut = Shortcut::new(Some(Modifiers::SUPER | Modifiers::ALT), Code::KeyW);
-
     let app_handle = app.clone();
     app.global_shortcut().on_shortcut(toggle_shortcut, move |_app, _shortcut, event| {
         if event.state() == ShortcutState::Pressed {
             toggle_overlay(&app_handle);
         }
     })?;
-
     log::info!("[Copilot] Registered hotkey ⌘⌥W (toggle overlay)");
+
+    // ⌘⌥G — generate suggestion on demand (Sub-prompt 3, Decision N4).
+    let suggest_shortcut = Shortcut::new(Some(Modifiers::SUPER | Modifiers::ALT), Code::KeyG);
+    let app_handle2 = app.clone();
+    app.global_shortcut().on_shortcut(suggest_shortcut, move |_app, _shortcut, event| {
+        if event.state() == ShortcutState::Pressed {
+            // Route through the standard wolfee-action listener so
+            // the lib.rs handler does the cooldown + state checks
+            // alongside the tray-menu path. Single source of truth
+            // for what "trigger a suggestion" means.
+            use tauri::Emitter;
+            let _ = app_handle2.emit("wolfee-action", "trigger-copilot-suggestion");
+        }
+    })?;
+    log::info!("[Copilot] Registered hotkey ⌘⌥G (generate suggestion)");
+
     Ok(())
 }
 
