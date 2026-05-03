@@ -1,0 +1,336 @@
+//! Backend HTTP client for the intelligence endpoints
+//! (Sub-prompt 3, plan §8.1).
+//!
+//! Separate from `copilot::session::api` (which is sacred) so we
+//! can extend without touching Sub-prompt 2 surface. Reuses
+//! `reqwest::Client` patterns from Sub-prompt 2 and the locked
+//! `Authorization: Bearer <device_token>` auth.
+
+use std::time::Duration;
+
+use eventsource_stream::{Event, Eventsource};
+use futures_util::stream::{Stream, StreamExt};
+use serde::{Deserialize, Serialize};
+
+const REQUEST_TIMEOUT_SECS: u64 = 30;
+const SUGGEST_REQUEST_TIMEOUT_SECS: u64 = 60; // SSE streams take longer
+
+#[derive(Debug)]
+pub enum IntelligenceApiError {
+    Network(String),
+    Unauthorized,
+    /// 429 from server-side rate limit. `retry_after_seconds` is
+    /// parsed from the `Retry-After` header when present.
+    RateLimited { retry_after_seconds: Option<u64> },
+    /// 409 — concurrent suggest stream in flight for this session.
+    /// Caller should drop, not retry.
+    ConcurrentSuggestion,
+    BadRequest { status: u16, body: String },
+    ServerError { status: u16, body: String },
+    Decode(String),
+}
+
+impl std::fmt::Display for IntelligenceApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Network(s) => write!(f, "network: {s}"),
+            Self::Unauthorized => write!(f, "unauthorized (401)"),
+            Self::RateLimited { retry_after_seconds } => {
+                write!(f, "rate_limited retry_after={:?}", retry_after_seconds)
+            }
+            Self::ConcurrentSuggestion => write!(f, "concurrent_suggestion (409)"),
+            Self::BadRequest { status, body } => write!(f, "{status}: {body}"),
+            Self::ServerError { status, body } => write!(f, "{status}: {body}"),
+            Self::Decode(s) => write!(f, "decode: {s}"),
+        }
+    }
+}
+
+impl std::error::Error for IntelligenceApiError {}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SummaryRequest {
+    pub window: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous: Option<String>,
+    pub mode: SummaryMode,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SummaryMode {
+    Incremental,
+    Full,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SummaryResponse {
+    pub summary: String,
+    #[serde(rename = "generated_at")]
+    pub generated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DetectMomentRequest {
+    pub candidate_triggers: Vec<String>,
+    pub transcript_window: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rolling_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DetectMomentResponse {
+    pub should_suggest: bool,
+    pub trigger: String,
+    pub trigger_phrase: Option<String>,
+    pub urgency: u8,
+    pub rationale: String,
+    pub is_speaker_mid_statement: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SuggestRequest {
+    pub trigger_source: String, // "moment" | "hotkey"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger_phrase: Option<String>,
+    pub transcript_window: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rolling_summary: Option<String>,
+}
+
+/// Parsed SSE event from the /suggest stream.
+#[derive(Debug, Clone)]
+pub enum SuggestSseEvent {
+    Start {
+        id: String,
+        moment_type: String,
+    },
+    Delta {
+        text: String,
+    },
+    Complete {
+        payload: SuggestPayload,
+    },
+    Error {
+        reason: String,
+    },
+    Done,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SuggestPayload {
+    pub suggestion_id: String,
+    pub moment_type: String,
+    pub primary: String,
+    pub secondary: Option<String>,
+    pub confidence: f64,
+    pub reasoning: String,
+    pub ttl_seconds: u32,
+}
+
+pub struct IntelligenceApi {
+    backend_url: String,
+    device_token: String,
+    client: reqwest::Client,
+    suggest_client: reqwest::Client,
+}
+
+impl IntelligenceApi {
+    pub fn new(backend_url: String, device_token: String) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        // Suggest client has a longer timeout because the SSE stream
+        // can run for several seconds; reqwest's timeout is the
+        // total-request timeout including streaming.
+        let suggest_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(SUGGEST_REQUEST_TIMEOUT_SECS))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self {
+            backend_url,
+            device_token,
+            client,
+            suggest_client,
+        }
+    }
+
+    pub async fn post_summary(
+        &self,
+        session_id: &str,
+        req: SummaryRequest,
+    ) -> Result<SummaryResponse, IntelligenceApiError> {
+        let url = format!(
+            "{}/api/copilot/sessions/{}/intelligence/summary",
+            self.backend_url, session_id
+        );
+        let res = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.device_token))
+            .json(&req)
+            .send()
+            .await
+            .map_err(|e| IntelligenceApiError::Network(e.to_string()))?;
+        translate_status(&res)?;
+        res.json::<SummaryResponse>()
+            .await
+            .map_err(|e| IntelligenceApiError::Decode(e.to_string()))
+    }
+
+    pub async fn post_detect_moment(
+        &self,
+        session_id: &str,
+        req: DetectMomentRequest,
+    ) -> Result<DetectMomentResponse, IntelligenceApiError> {
+        let url = format!(
+            "{}/api/copilot/sessions/{}/intelligence/detect-moment",
+            self.backend_url, session_id
+        );
+        let res = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.device_token))
+            .json(&req)
+            .send()
+            .await
+            .map_err(|e| IntelligenceApiError::Network(e.to_string()))?;
+        translate_status(&res)?;
+        res.json::<DetectMomentResponse>()
+            .await
+            .map_err(|e| IntelligenceApiError::Decode(e.to_string()))
+    }
+
+    /// Open the /suggest SSE stream. Returns a stream of parsed
+    /// `SuggestSseEvent` values. Closes when the server emits
+    /// `done: true` or the underlying connection drops.
+    pub async fn post_suggest_sse(
+        &self,
+        session_id: &str,
+        req: SuggestRequest,
+    ) -> Result<impl Stream<Item = Result<SuggestSseEvent, IntelligenceApiError>>, IntelligenceApiError>
+    {
+        let url = format!(
+            "{}/api/copilot/sessions/{}/intelligence/suggest",
+            self.backend_url, session_id
+        );
+        let res = self
+            .suggest_client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.device_token))
+            .header("Accept", "text/event-stream")
+            .json(&req)
+            .send()
+            .await
+            .map_err(|e| IntelligenceApiError::Network(e.to_string()))?;
+        translate_status(&res)?;
+
+        let byte_stream = res
+            .bytes_stream()
+            .map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
+
+        let events = byte_stream.eventsource().map(parse_sse_event);
+        Ok(events)
+    }
+}
+
+fn parse_sse_event(
+    res: Result<Event, eventsource_stream::EventStreamError<std::io::Error>>,
+) -> Result<SuggestSseEvent, IntelligenceApiError> {
+    let evt = res.map_err(|e| IntelligenceApiError::Network(format!("sse: {e}")))?;
+    if evt.data.is_empty() {
+        return Err(IntelligenceApiError::Decode("empty SSE chunk".into()));
+    }
+    // Backend writes `data: {json}` per chunk. eventsource-stream has
+    // already stripped the `data:` prefix; we just JSON-parse the rest.
+    let parsed: serde_json::Value = serde_json::from_str(&evt.data)
+        .map_err(|e| IntelligenceApiError::Decode(format!("sse json: {e}")))?;
+
+    // Two terminal forms: `{"done": true}` and the various typed events.
+    if parsed.get("done").and_then(|v| v.as_bool()) == Some(true) {
+        return Ok(SuggestSseEvent::Done);
+    }
+    let kind = parsed
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    match kind {
+        "suggestion-start" => {
+            let id = parsed
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let moment_type = parsed
+                .get("moment_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("general")
+                .to_string();
+            Ok(SuggestSseEvent::Start { id, moment_type })
+        }
+        "delta" => {
+            let text = parsed
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            Ok(SuggestSseEvent::Delta { text })
+        }
+        "complete" => {
+            let payload_v = parsed
+                .get("payload")
+                .ok_or_else(|| IntelligenceApiError::Decode("complete missing payload".into()))?;
+            let payload: SuggestPayload = serde_json::from_value(payload_v.clone())
+                .map_err(|e| IntelligenceApiError::Decode(format!("complete payload: {e}")))?;
+            Ok(SuggestSseEvent::Complete { payload })
+        }
+        "error" => {
+            let reason = parsed
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            Ok(SuggestSseEvent::Error { reason })
+        }
+        _ => Err(IntelligenceApiError::Decode(format!(
+            "unknown sse type: {kind}"
+        ))),
+    }
+}
+
+fn translate_status(res: &reqwest::Response) -> Result<(), IntelligenceApiError> {
+    let status = res.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    if status.as_u16() == 401 {
+        return Err(IntelligenceApiError::Unauthorized);
+    }
+    if status.as_u16() == 409 {
+        return Err(IntelligenceApiError::ConcurrentSuggestion);
+    }
+    if status.as_u16() == 429 {
+        let retry_after = res
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok());
+        return Err(IntelligenceApiError::RateLimited {
+            retry_after_seconds: retry_after,
+        });
+    }
+    if status.is_client_error() {
+        Err(IntelligenceApiError::BadRequest {
+            status: status.as_u16(),
+            body: String::new(),
+        })
+    } else {
+        Err(IntelligenceApiError::ServerError {
+            status: status.as_u16(),
+            body: String::new(),
+        })
+    }
+}

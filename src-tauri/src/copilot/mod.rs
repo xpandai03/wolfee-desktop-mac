@@ -6,6 +6,7 @@
 
 pub mod audio;
 pub mod hotkey;
+pub mod intelligence;
 pub mod session;
 pub mod state;
 pub mod transcribe;

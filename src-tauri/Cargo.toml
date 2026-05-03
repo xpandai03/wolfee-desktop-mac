@@ -15,7 +15,7 @@ tauri-plugin-deep-link = "2"
 tauri-plugin-store = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-reqwest = { version = "0.12", features = ["multipart", "json"] }
+reqwest = { version = "0.12", features = ["multipart", "json", "stream"] }
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4"] }
 dirs = "6"
@@ -62,6 +62,13 @@ features = ["std", "sink"]
 version = "0.23"
 default-features = false
 features = ["ring", "std"]
+
+# Sub-prompt 3 (Intelligence). Streaming-Server-Sent-Events parser
+# for the /suggest endpoint's SSE response. Generic byte-stream
+# parser — composes cleanly with reqwest::Response::bytes_stream().
+# Lightweight, no transitive web framework deps.
+[dependencies.eventsource-stream]
+version = "0.2"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
