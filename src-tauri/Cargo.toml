@@ -43,6 +43,14 @@ version = "0.16"
 [dependencies.bytes]
 version = "1"
 
+# Sub-prompt 2 Phase 3 (Deepgram WS). Already a transitive dep via
+# tokio-tungstenite — declared here so we can use SinkExt / StreamExt
+# directly on WebSocketStream.
+[dependencies.futures-util]
+version = "0.3"
+default-features = false
+features = ["std", "sink"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 chrono = "0.4"

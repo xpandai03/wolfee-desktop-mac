@@ -177,11 +177,10 @@ impl SessionApi {
             .map_err(|e| SessionApiError::Decode(e.to_string()))
     }
 
-    /// `POST /api/copilot/sessions/:sessionId/deepgram-token` — Phase 3
-    /// will call this just before opening the WS. Stub-quality
-    /// implementation here so the SessionApi is complete; Phase 3 will
-    /// add the JWT-refresh / re-mint logic.
-    #[allow(dead_code)]
+    /// `POST /api/copilot/sessions/:sessionId/deepgram-token` — used by
+    /// the Deepgram WS client (Phase 3) to mint a fresh JWT before
+    /// connecting and again whenever the JWT-refresh window opens
+    /// (`expires_at - now < 5 min`).
     pub async fn fetch_deepgram_token(
         &self,
         session_id: &str,
