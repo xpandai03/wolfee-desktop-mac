@@ -9,6 +9,7 @@ use auth::AuthConfig;
 use copilot::audio::CopilotAudioCapture;
 use copilot::session::api::{EndReason, SessionApi};
 use copilot::state::{CopilotAudioCaptureMutex, CopilotState, CopilotStateMutex};
+use copilot::transcribe::deepgram::DeepgramClient;
 use recorder::Recorder;
 use state::{AppState, LinkingStatus, RecordingState, UploadStatus};
 use std::sync::{Arc, Mutex};
@@ -45,79 +46,13 @@ where
         .unwrap_or_else(|e| panic!("Failed to spawn thread {}: {}", name, e));
 }
 
-/// Phase 5 frame counter — Phase 3 will replace this with the Deepgram
-/// WebSocket sender.
-///
-/// Hosted on Tauri's global async runtime so it shares a long-lived
-/// runtime with the mux pump (which is `tokio::spawn`'d inside
-/// `CopilotAudioCapture::start`). Earlier we used `spawn_async` here
-/// and for the session handlers — that built a one-shot
-/// `current_thread` runtime that died when the spawning closure
-/// returned, cancelling the mux pump 3 ms after the session went live
-/// and silently breaking the audio gate (see verification report
-/// 2026-05-02). Using `tauri::async_runtime::spawn` keeps everything
-/// on the same persistent runtime.
-///
-/// Logs every 5 s: frame count, total bytes, and a quick non-zero
-/// check on each channel so the PO can verify both mic + system audio
-/// are flowing during runtime verification.
-fn spawn_frame_logger(
-    mut rx: tokio::sync::mpsc::Receiver<copilot::audio::AudioFrame>,
-) {
-    tauri::async_runtime::spawn(async move {
-        let mut count: u64 = 0;
-        let mut total_bytes: u64 = 0;
-        let mut last_log = std::time::Instant::now();
-        let mut last_l_nonzero = false;
-        let mut last_r_nonzero = false;
-
-        log::info!("[Copilot/audio] frame logger started");
-
-        while let Some(frame) = rx.recv().await {
-            count += 1;
-            total_bytes += (frame.pcm_s16le_stereo.len() * 2) as u64;
-
-            // Quick channel-population check: scan the latest frame
-            // for non-zero L (mic) and R (system) samples. Aggregated
-            // across the 5s window so transient silence on either side
-            // doesn't flap the readout.
-            let mut l_nonzero = false;
-            let mut r_nonzero = false;
-            for (i, &s) in frame.pcm_s16le_stereo.iter().enumerate() {
-                if s != 0 {
-                    if i % 2 == 0 {
-                        l_nonzero = true;
-                    } else {
-                        r_nonzero = true;
-                    }
-                    if l_nonzero && r_nonzero {
-                        break;
-                    }
-                }
-            }
-            last_l_nonzero |= l_nonzero;
-            last_r_nonzero |= r_nonzero;
-
-            if last_log.elapsed().as_secs() >= 5 {
-                log::info!(
-                    "[Copilot/audio] frames in last 5s: {} ({} KB), \
-                     mic_nonzero={}, system_nonzero={}",
-                    count,
-                    total_bytes / 1024,
-                    last_l_nonzero,
-                    last_r_nonzero
-                );
-                count = 0;
-                total_bytes = 0;
-                last_l_nonzero = false;
-                last_r_nonzero = false;
-                last_log = std::time::Instant::now();
-            }
-        }
-
-        log::info!("[Copilot/audio] frame channel closed — logger exiting");
-    });
-}
+// Phase 5 had a `spawn_frame_logger` here that just counted AudioFrames
+// every 5s for runtime verification. Phase 3 replaces it with
+// `copilot::transcribe::deepgram::DeepgramClient::spawn`, which owns
+// the same Receiver and forwards frames to Deepgram's WebSocket. The
+// runtime-ownership note (use `tauri::async_runtime::spawn`, never the
+// dedicated `spawn_async`) carries over to the new client — see the
+// comment on its `spawn` method.
 
 pub fn run() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -554,6 +489,20 @@ pub fn run() {
                         );
                     }
 
+                    // Internal action emitted by Phase 3's DeepgramClient
+                    // when CopilotState transitions inside the WS task
+                    // (Listening ⇄ Reconnecting). Tray rendering reads
+                    // CopilotState from app state, so the repaint just
+                    // needs to call update_tray_menu — no payload needed.
+                    "refresh-copilot-tray" => {
+                        tray::update_tray_menu(
+                            &tray_clone,
+                            handle_ref,
+                            state.current_state(),
+                            state.auth_token.lock().unwrap().is_some(),
+                        );
+                    }
+
                     "open-copilot-settings" => {
                         // Sub-prompt 1 placeholder. Full Settings window in Sub-prompt 6.
                         log::info!(
@@ -697,12 +646,12 @@ pub fn run() {
                             *cap_mutex.0.lock().await = Some(capture);
                             drop(cap_mutex);
 
-                            // 4. Spawn frame logger (Phase 3 will replace with Deepgram WS).
-                            //    Logs every 5 seconds: count + sample-of-last-frame stats so
-                            //    the PO can verify both channels populated during runtime.
-                            spawn_frame_logger(frame_rx);
-
-                            // 5. Transition to Listening + refresh tray.
+                            // 4. Transition to Listening + refresh tray BEFORE
+                            //    spawning the Deepgram client. The client's
+                            //    reconnect path flips state to Reconnecting on
+                            //    failure; doing the Listening transition first
+                            //    avoids a race where a fast initial-mint failure
+                            //    overrides StartingSession.
                             {
                                 let copilot_mutex = handle.state::<CopilotStateMutex>();
                                 *copilot_mutex.0.lock().unwrap() = CopilotState::Listening {
@@ -717,8 +666,24 @@ pub fn run() {
                                 app_state.current_state(),
                                 app_state.auth_token.lock().unwrap().is_some(),
                             );
+
+                            // 5. Spawn the Deepgram WebSocket client. It owns
+                            //    frame_rx and runs until either audio capture
+                            //    closes the channel (clean exit) or the 60s
+                            //    persistent-failure window elapses (in which
+                            //    case the wrapper emits wolfee-action:
+                            //    end-copilot-session so this same listener
+                            //    tears the session down).
+                            let api_arc = std::sync::Arc::new(api);
+                            let _dg_handle = DeepgramClient::spawn(
+                                session_id.clone(),
+                                api_arc,
+                                frame_rx,
+                                handle.clone(),
+                            );
+
                             log::info!(
-                                "[Copilot] session live — id={}, listening for audio",
+                                "[Copilot] session live — id={}, Deepgram client spawned",
                                 session_id
                             );
                         });

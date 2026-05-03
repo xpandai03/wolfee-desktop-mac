@@ -6626,6 +6626,7 @@ dependencies = [
  "cpal",
  "dirs",
  "env_logger",
+ "futures-util",
  "hostname",
  "log",
  "reqwest 0.12.28",
