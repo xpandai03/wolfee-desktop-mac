@@ -45,8 +45,27 @@ fn toggle_overlay<R: Runtime>(app: &AppHandle<R>) {
     let state_mutex = app.state::<CopilotStateMutex>();
     let mut state = state_mutex.0.lock().unwrap();
 
-    // Match by reference so non-Copy variants (StartingSession et al
-    // from Sub-prompt 2) don't trigger a move out of the MutexGuard.
+    // Two state classes need different behavior:
+    //
+    //   1. Idle / Paused / ShowingOverlay — pre-session states.
+    //      The hotkey transitions Idle/Paused → ShowingOverlay
+    //      (showing the window AND mutating CopilotState). It also
+    //      transitions ShowingOverlay → Idle on hide. CopilotState
+    //      tracks visibility because there's no audio capture yet.
+    //
+    //   2. StartingSession / Listening / Reconnecting / EndingSession —
+    //      the Sub-prompt 2 lifecycle states. These represent audio
+    //      capture being live; CopilotState must NOT be overwritten
+    //      to ShowingOverlay (that would corrupt the session_id +
+    //      tear down workers in end-copilot-session). For these the
+    //      hotkey only flips window visibility — overlay shown OR
+    //      hidden alongside the live session, CopilotState untouched.
+    //      Use the window's actual visibility to decide direction.
+    //
+    // The original Sub-prompt 1 code only handled class 1 and
+    // silently no-op'd class 2, which made the overlay invisible
+    // during a Listening session — Sub-prompt 4 verification 2026-05-03
+    // surfaced the bug.
     match &*state {
         CopilotState::Idle | CopilotState::Paused => {
             log::info!("[Copilot] Hotkey: showing overlay (was {})", *state);
@@ -64,11 +83,32 @@ fn toggle_overlay<R: Runtime>(app: &AppHandle<R>) {
             }
             *state = CopilotState::Idle;
         }
-        // During an active listening session (or its setup/teardown)
-        // the hotkey is a no-op for V1. Sub-prompt 4 (Overlay polish)
-        // can repurpose it for "show suggestions" UX.
-        other => {
-            log::debug!("[Copilot] Hotkey ignored — current state: {}", other);
+        CopilotState::StartingSession { .. }
+        | CopilotState::Listening { .. }
+        | CopilotState::Reconnecting { .. }
+        | CopilotState::EndingSession { .. } => {
+            // Drop the lock before window operations — they may
+            // trigger event-loop callbacks that re-enter state
+            // (focus-changed handler hides on blur, etc.).
+            let session_state = state.clone();
+            drop(state);
+            if window::is_overlay_visible(app) {
+                log::info!(
+                    "[Copilot] Hotkey: hiding overlay during session ({})",
+                    session_state
+                );
+                if let Err(e) = window::hide_overlay(app) {
+                    log::error!("[Copilot] hide_overlay failed: {}", e);
+                }
+            } else {
+                log::info!(
+                    "[Copilot] Hotkey: showing overlay during session ({})",
+                    session_state
+                );
+                if let Err(e) = window::show_overlay(app) {
+                    log::error!("[Copilot] show_overlay failed: {}", e);
+                }
+            }
         }
     }
 }

@@ -82,7 +82,6 @@ pub fn hide_overlay<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     Ok(())
 }
 
-#[allow(dead_code)]
 pub fn is_overlay_visible<R: Runtime>(app: &AppHandle<R>) -> bool {
     app.get_webview_window(OVERLAY_LABEL)
         .and_then(|w| w.is_visible().ok())
