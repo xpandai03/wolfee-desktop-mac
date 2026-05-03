@@ -1,8 +1,7 @@
-import React, { useEffect, useState } from "react";
+import React from "react";
 import { motion } from "framer-motion";
 import { cn } from "@/lib/utils";
 import { labelFor } from "@/lib/triggerLabels";
-import { copyToClipboard } from "@/lib/copyToClipboard";
 import { ReasoningIndicator } from "./ReasoningIndicator";
 import type { ActiveSuggestion, UiPhase } from "@/state/types";
 
@@ -139,32 +138,3 @@ function SuggestionCardImpl({
 }
 
 export const SuggestionCard = React.memo(SuggestionCardImpl);
-
-/**
- * Side-effect helper: dismisses the suggestion AND emits the
- * `wolfee-action: copilot-suggestion-dismissed` string per Decision N5
- * (V1 — plain string payload; Sub-prompt 6 may upgrade).
- */
-export async function emitDismiss(): Promise<void> {
-  // Dynamic import keeps this out of the main bundle until used.
-  const { emit } = await import("@tauri-apps/api/event");
-  await emit("wolfee-action", "copilot-suggestion-dismissed");
-}
-
-/**
- * Helper that runs the copy-to-clipboard flow + dispatches the
- * COPY_FLASH action via the supplied callback. Used by the
- * onClick handler in SuggestionCard.
- */
-export function useCopyFlow(
-  primary: string | null | undefined,
-  onFlash: () => void,
-) {
-  const [, setStarted] = useState(0);
-  useEffect(() => void setStarted, []);
-  return async () => {
-    if (!primary) return;
-    const ok = await copyToClipboard(primary);
-    if (ok) onFlash();
-  };
-}

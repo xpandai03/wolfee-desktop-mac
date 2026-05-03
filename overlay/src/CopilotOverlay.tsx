@@ -1,6 +1,27 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useReducer, useRef, useState } from "react";
+import { AnimatePresence } from "framer-motion";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
+
+import { TopBar } from "@/components/TopBar";
+import { TranscriptZone } from "@/components/TranscriptZone";
+import { SuggestionCard } from "@/components/SuggestionCard";
+import { FooterHint } from "@/components/FooterHint";
+import {
+  initialOverlayState,
+  isInTtlFadeWindow,
+  overlayReducer,
+} from "@/state/overlayReducer";
+import { copyToClipboard } from "@/lib/copyToClipboard";
+import type {
+  TranscriptChunkPayload,
+  SummaryUpdatedPayload,
+  MomentDetectedPayload,
+  SuggestionPendingPayload,
+  SuggestionStreamingPayload,
+  SuggestionCompletePayload,
+  SuggestionFailedPayload,
+} from "@/state/types";
 
 type PermissionKind = "Microphone" | "ScreenRecording";
 
@@ -9,59 +30,16 @@ interface PermissionNeededPayload {
   session_id: string;
 }
 
-interface TranscriptChunkPayload {
-  session_id: string;
-  channel: "user" | "speakers";
-  is_final: boolean;
-  transcript: string;
-  confidence: number;
-  started_at_ms: number;
-  ended_at_ms: number;
-}
-
-// ── Sub-prompt 3 (Intelligence) Tauri event payloads ──────────────
-interface CopilotSummaryUpdatedPayload {
-  session_id: string;
-  summary: string;
-  generated_at_ms: number;
-  generation_count: number;
-}
-
-interface CopilotMomentDetectedPayload {
-  session_id: string;
-  trigger: string;
-  trigger_phrase: string | null;
-  urgency: number;
-  rationale: string;
-}
-
-interface CopilotSuggestionPayload {
-  session_id: string;
-  suggestion_id: string;
-  moment_type: string;
-  primary: string;
-  secondary: string | null;
-  confidence: number;
-  reasoning: string;
-  ttl_seconds: number;
-}
-
-interface CopilotSuggestionStreamingPayload {
-  session_id: string;
-  suggestion_id: string;
-  kind: "start" | "delta" | "complete";
-  text: string | null;
-  moment_type: string | null;
-}
-
-interface CopilotSuggestionFailedPayload {
-  session_id: string;
-  reason: string;
-}
+const TICK_INTERVAL_MS = 250;
+const FAILURE_TOAST_MS = 1_200;
 
 export default function CopilotOverlay() {
   const [permissionNeeded, setPermissionNeeded] =
     useState<PermissionNeededPayload | null>(null);
+  const [overlayState, dispatch] = useReducer(
+    overlayReducer,
+    initialOverlayState,
+  );
 
   // Mirror the latest value into a ref so the focus/key listeners — which
   // are registered once at mount — can read the current state without
@@ -71,19 +49,52 @@ export default function CopilotOverlay() {
     permissionNeededRef.current = permissionNeeded;
   }, [permissionNeeded]);
 
+  // Same pattern for the active-suggestion uiPhase: the Esc handler
+  // is registered once at mount, so it reads via ref.
+  const uiPhaseRef = useRef(overlayState.uiPhase);
+  useEffect(() => {
+    uiPhaseRef.current = overlayState.uiPhase;
+  }, [overlayState.uiPhase]);
+
+  // ── Tick interval — drives 2s reasoning fallback + 30s TTL ─────
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      dispatch({ type: "TICK", nowMs: Date.now() });
+    }, TICK_INTERVAL_MS);
+    return () => window.clearInterval(id);
+  }, []);
+
+  // ── Failure toast auto-clear (1.2s) ────────────────────────────
+  useEffect(() => {
+    if (!overlayState.failureToast) return;
+    const t = window.setTimeout(() => {
+      dispatch({ type: "CLEAR_FAILURE_TOAST" });
+    }, FAILURE_TOAST_MS);
+    return () => window.clearTimeout(t);
+  }, [overlayState.failureToast]);
+
+  // ── Window-level keydown + focus + Tauri event listeners ───────
   useEffect(() => {
     const win = getCurrentWebviewWindow();
 
     const handleKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
+      // Phase 6 Esc precedence (sacred): if the modal is up, dismiss it.
       if (permissionNeededRef.current) {
-        // Modal is up — Esc dismisses the modal, not the window. The
-        // user can re-trigger from the tray once they've granted
-        // permission.
         setPermissionNeeded(null);
-      } else {
-        void win.hide();
+        return;
       }
+      // Sub-prompt 4: Esc dismisses an active suggestion before
+      // hiding the window. Pressing Esc with no suggestion still
+      // hides (Sub-prompt 1 behavior preserved).
+      const phase = uiPhaseRef.current;
+      if (phase === "Reasoning" || phase === "Streaming" || phase === "Showing") {
+        dispatch({ type: "DISMISS_SUGGESTION", via: "esc" });
+        // Tell Rust to release ActiveSuggestionMutex (V1 string payload).
+        void emit("wolfee-action", "copilot-suggestion-dismissed");
+        return;
+      }
+      void win.hide();
     };
     window.addEventListener("keydown", handleKey);
 
@@ -98,9 +109,9 @@ export default function CopilotOverlay() {
 
     let permUnlisten: UnlistenFn | undefined;
     let transcriptUnlisten: UnlistenFn | undefined;
-    // Sub-prompt 3 — Intelligence event listeners (stub: log only).
     let summaryUnlisten: UnlistenFn | undefined;
     let momentUnlisten: UnlistenFn | undefined;
+    let pendingUnlisten: UnlistenFn | undefined;
     let suggestionUnlisten: UnlistenFn | undefined;
     let suggestionStreamingUnlisten: UnlistenFn | undefined;
     let suggestionFailedUnlisten: UnlistenFn | undefined;
@@ -114,80 +125,54 @@ export default function CopilotOverlay() {
         },
       );
 
-      // Sub-prompt 4 will render the live transcript UI from these
-      // events. Phase 6 just confirms they're flowing — the WS client
-      // emits one per partial + final.
       transcriptUnlisten = await listen<TranscriptChunkPayload>(
         "transcript-chunk",
         (event) => {
-          const p = event.payload;
-          console.log(
-            `[Copilot] transcript-chunk ${p.is_final ? "FINAL" : "partial"} ` +
-              `${p.channel} (${p.confidence.toFixed(2)}): ${p.transcript}`,
-          );
+          dispatch({ type: "TRANSCRIPT_CHUNK", payload: event.payload });
         },
       );
 
-      // Sub-prompt 3 (Intelligence) — six new events. Sub-prompt 4
-      // will render summary panel + suggestion cards from these.
-      // For now we just console.log so the verification flow can
-      // confirm events flow over the IPC bridge.
-      summaryUnlisten = await listen<CopilotSummaryUpdatedPayload>(
+      summaryUnlisten = await listen<SummaryUpdatedPayload>(
         "copilot-summary-updated",
         (event) => {
-          const p = event.payload;
-          console.log(
-            `[Copilot] summary-updated count=${p.generation_count} ` +
-              `(${p.summary.length} chars)`,
-          );
+          dispatch({ type: "SUMMARY_UPDATED", payload: event.payload });
         },
       );
 
-      momentUnlisten = await listen<CopilotMomentDetectedPayload>(
+      momentUnlisten = await listen<MomentDetectedPayload>(
         "copilot-moment-detected",
         (event) => {
-          const p = event.payload;
-          console.log(
-            `[Copilot] moment-detected trigger=${p.trigger} urgency=${p.urgency}: ` +
-              `${p.rationale}`,
-          );
+          dispatch({ type: "MOMENT_DETECTED", payload: event.payload });
         },
       );
 
-      suggestionUnlisten = await listen<CopilotSuggestionPayload>(
-        "copilot-suggestion",
+      // Sub-prompt 4 N3 — emitted instantly on ⌘⌥G or moment fire.
+      // Eliminates 200-800ms dead air before the first streaming delta.
+      pendingUnlisten = await listen<SuggestionPendingPayload>(
+        "copilot-suggestion-pending",
         (event) => {
-          const p = event.payload;
-          console.log(
-            `[Copilot] suggestion id=${p.suggestion_id} ` +
-              `confidence=${p.confidence.toFixed(2)}: ${p.primary}`,
-          );
+          dispatch({ type: "SUGGESTION_PENDING", payload: event.payload });
         },
       );
 
-      suggestionStreamingUnlisten = await listen<CopilotSuggestionStreamingPayload>(
+      suggestionStreamingUnlisten = await listen<SuggestionStreamingPayload>(
         "copilot-suggestion-streaming",
         (event) => {
-          const p = event.payload;
-          if (p.kind === "delta" && p.text) {
-            // Per-token deltas — too noisy for production console.log,
-            // but useful during verification. Sub-prompt 4 will
-            // render these inline.
-            console.log(`[Copilot] suggestion-delta: ${p.text}`);
-          } else if (p.kind === "start") {
-            console.log(
-              `[Copilot] suggestion-start id=${p.suggestion_id} ` +
-                `moment=${p.moment_type ?? "(unknown)"}`,
-            );
-          }
+          dispatch({ type: "SUGGESTION_STREAMING", payload: event.payload });
         },
       );
 
-      suggestionFailedUnlisten = await listen<CopilotSuggestionFailedPayload>(
+      suggestionUnlisten = await listen<SuggestionCompletePayload>(
+        "copilot-suggestion",
+        (event) => {
+          dispatch({ type: "SUGGESTION_COMPLETE", payload: event.payload });
+        },
+      );
+
+      suggestionFailedUnlisten = await listen<SuggestionFailedPayload>(
         "copilot-suggestion-failed",
         (event) => {
-          const p = event.payload;
-          console.warn(`[Copilot] suggestion-failed: ${p.reason}`);
+          dispatch({ type: "SUGGESTION_FAILED", payload: event.payload });
         },
       );
     })();
@@ -199,12 +184,14 @@ export default function CopilotOverlay() {
       transcriptUnlisten?.();
       summaryUnlisten?.();
       momentUnlisten?.();
+      pendingUnlisten?.();
       suggestionUnlisten?.();
       suggestionStreamingUnlisten?.();
       suggestionFailedUnlisten?.();
     };
   }, []);
 
+  // ── Phase 6 sacred path — modal short-circuits everything else ─
   if (permissionNeeded) {
     return (
       <PermissionModal
@@ -214,26 +201,62 @@ export default function CopilotOverlay() {
     );
   }
 
+  // ── Sub-prompt 4 — main overlay layout ─────────────────────────
+  const { uiPhase, transcript, active, copiedFlashAt, failureToast } =
+    overlayState;
+  const hasActiveSession = transcript.length > 0;
+  const isFading = isInTtlFadeWindow(overlayState, Date.now());
+
+  const handleDismiss = () => {
+    dispatch({ type: "DISMISS_SUGGESTION", via: "click" });
+    void emit("wolfee-action", "copilot-suggestion-dismissed");
+  };
+
+  const handleCopy = async () => {
+    if (!active?.finalPrimary) return;
+    const ok = await copyToClipboard(active.finalPrimary);
+    if (ok) dispatch({ type: "COPY_FLASH" });
+  };
+
   return (
-    <div className="w-full h-full flex items-start justify-center p-3 bg-zinc-950">
-      <div
-        className="w-full px-6 py-5 rounded-2xl border border-copilot-accent/40 shadow-2xl shadow-copilot-glow bg-zinc-900 text-white"
-        role="dialog"
-        aria-label="Wolfee Copilot suggestion overlay"
-      >
-        <div className="flex items-center gap-2">
-          <span className="inline-block w-2 h-2 rounded-full bg-copilot-accent shadow-[0_0_8px_var(--tw-shadow-color)] shadow-copilot-accent" />
-          <h1 className="text-base font-semibold tracking-tight">Wolfee Copilot</h1>
-        </div>
-        <p className="text-2xl font-semibold mt-3 leading-tight">Hello Copilot</p>
-        <p className="text-xs text-zinc-400 mt-2">
-          Press <kbd className="rounded bg-white/10 px-1.5 py-0.5 font-mono">Esc</kbd> or click
-          outside to dismiss.
-        </p>
+    <div className="w-full h-full flex flex-col bg-zinc-950 text-zinc-100 select-none">
+      <TopBar uiPhase={uiPhase} hasActiveSession={hasActiveSession} />
+      <TranscriptZone utterances={transcript} />
+
+      {/* Suggestion zone (130px) */}
+      <div className="h-[130px] flex items-center justify-center">
+        <AnimatePresence mode="wait">
+          {active ? (
+            <div key="card" className="w-full">
+              <SuggestionCard
+                uiPhase={uiPhase}
+                active={active}
+                isFading={isFading}
+                copiedFlashAt={copiedFlashAt}
+                onDismiss={handleDismiss}
+                onCopy={handleCopy}
+              />
+            </div>
+          ) : (
+            <div
+              key="idle"
+              className="text-zinc-500 text-[13px] opacity-60 text-center px-3"
+            >
+              Listening… <kbd className="font-mono text-[12px]">⌘⌥G</kbd> to ask
+            </div>
+          )}
+        </AnimatePresence>
       </div>
+
+      <FooterHint failureToast={failureToast} />
     </div>
   );
 }
+
+// ──────────────────────────────────────────────────────────────────
+// Phase 6 PermissionModal — SACRED, preserved verbatim from
+// Sub-prompt 2 commit b8a19fb. Do not modify in Sub-prompt 4.
+// ──────────────────────────────────────────────────────────────────
 
 function PermissionModal({
   payload,
