@@ -30,7 +30,8 @@
       "signingIdentity": "Developer ID Application: XPAND TECHNOLOGY LLC (LT73Z72CKR)",
       "entitlements": "../entitlements.plist",
       "exceptionDomain": null,
-      "minimumSystemVersion": "13.0"
+      "minimumSystemVersion": "13.0",
+      "infoPlist": "Info.plist"
     },
     "windows": {
       "certificateThumbprint": null,

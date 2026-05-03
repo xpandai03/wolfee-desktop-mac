@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+		TCC purpose strings. Required by macOS Catalina+ in addition to the
+		Hardened Runtime entitlements in ../entitlements.plist. Without
+		NSMicrophoneUsageDescription, macOS silently zero-fills the cpal
+		input callback buffers — no prompt, no error, just silence. The
+		Phase 3 Deepgram verification on 2026-05-03 found this the hard
+		way (Layer A diagnostic showed max_abs=0.0 across 65s of clear
+		speech).
+	-->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Wolfee Copilot listens to your meeting audio so it can show you live insights and follow-up suggestions during the call. Audio is captured only while a Copilot session is active.</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>Wolfee Copilot captures your computer's audio output so it can transcribe the other parties on a call. Only audio is recorded — no screen contents are captured.</string>
+</dict>
+</plist>
