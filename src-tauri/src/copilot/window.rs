@@ -73,6 +73,22 @@ fn elevate_window_level<R: Runtime>(window: &tauri::WebviewWindow<R>) {
     // to NSFloatingWindowLevel (3) — too low for fullscreen apps.
     const NS_SCREEN_SAVER_WINDOW_LEVEL: i64 = 1000;
 
+    // NSWindowCollectionBehavior bit-mask. Tauri 2's
+    // `visible_on_all_workspaces(true)` builder call doesn't always
+    // include `FullScreenAuxiliary` — verified empirically on
+    // 2026-05-03: PO had Chrome in fullscreen and overlay still
+    // opened on the home Space. Setting the flags directly via
+    // setCollectionBehavior: bypasses Tauri's abstraction.
+    //
+    //   CanJoinAllSpaces       (1 << 0 = 1)   — visible in every Space
+    //   Stationary             (1 << 4 = 16)  — doesn't auto-move between Spaces
+    //   IgnoresCycle           (1 << 6 = 64)  — excluded from Cmd-` window cycle
+    //   FullScreenAuxiliary    (1 << 8 = 256) — renders on fullscreen-app Spaces
+    //
+    // FullScreenAuxiliary is the critical flag for the fullscreen
+    // overlay use case — same bit Apple's volume HUD uses.
+    const NS_COLLECTION_BEHAVIOR: usize = 1 | 16 | 64 | 256;
+
     let ns_window_ptr = match window.ns_window() {
         Ok(p) => p,
         Err(e) => {
@@ -85,16 +101,20 @@ fn elevate_window_level<R: Runtime>(window: &tauri::WebviewWindow<R>) {
     };
 
     // SAFETY: ns_window() returns a non-null pointer to a valid
-    // NSWindow instance owned by the macOS runtime. setLevel: is a
-    // standard NSWindow method that takes an NSInteger and returns
-    // void. We're not retaining or releasing — just calling.
+    // NSWindow instance owned by the macOS runtime. Both setLevel:
+    // and setCollectionBehavior: are documented NSWindow methods
+    // that take NSInteger / NSWindowCollectionBehavior (NSUInteger)
+    // and return void. We're not retaining / releasing — just
+    // calling. msg_send! is the canonical bridge.
     unsafe {
         let ns_window = ns_window_ptr as *mut AnyObject;
         let _: () = msg_send![ns_window, setLevel: NS_SCREEN_SAVER_WINDOW_LEVEL];
+        let _: () = msg_send![ns_window, setCollectionBehavior: NS_COLLECTION_BEHAVIOR];
     }
     log::info!(
-        "[Copilot] Overlay window level elevated to NSScreenSaverWindowLevel ({})",
-        NS_SCREEN_SAVER_WINDOW_LEVEL
+        "[Copilot] Overlay window level={} + collection_behavior=0x{:X}",
+        NS_SCREEN_SAVER_WINDOW_LEVEL,
+        NS_COLLECTION_BEHAVIOR
     );
 }
 
