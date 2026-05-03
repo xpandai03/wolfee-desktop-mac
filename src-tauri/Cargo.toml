@@ -51,6 +51,18 @@ version = "0.3"
 default-features = false
 features = ["std", "sink"]
 
+# Sub-prompt 2 Phase 3. rustls 0.23 requires an explicit
+# `CryptoProvider::install_default()` before any TLS connection;
+# tokio-tungstenite + reqwest both pull rustls in transitively but
+# never install. Without this, the first TLS handshake (Deepgram WS
+# upgrade) panics on a tokio worker thread, killing connect_async
+# silently. We declare rustls directly to call the API; the dep was
+# already in Cargo.lock so the binary doesn't grow.
+[dependencies.rustls]
+version = "0.23"
+default-features = false
+features = ["ring", "std"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 chrono = "0.4"

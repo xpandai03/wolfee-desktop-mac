@@ -8,7 +8,9 @@ mod uploader;
 use auth::AuthConfig;
 use copilot::audio::CopilotAudioCapture;
 use copilot::session::api::{EndReason, SessionApi};
-use copilot::state::{CopilotAudioCaptureMutex, CopilotState, CopilotStateMutex};
+use copilot::state::{
+    CopilotAudioCaptureMutex, CopilotState, CopilotStateMutex, TranscriptBufferMutex,
+};
 use copilot::transcribe::deepgram::DeepgramClient;
 use recorder::Recorder;
 use state::{AppState, LinkingStatus, RecordingState, UploadStatus};
@@ -58,6 +60,14 @@ pub fn run() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp_millis()
         .init();
+
+    // rustls 0.23 requires an explicit CryptoProvider before any TLS
+    // connection. tokio-tungstenite and reqwest both pull rustls in
+    // transitively but never call `install_default()`, so the first
+    // TLS handshake (Deepgram WS upgrade) panics on a tokio worker
+    // thread and silently kills connect_async. install_default()
+    // returns Err if a provider is already installed — fine, ignore it.
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     const VERSION: &str = env!("CARGO_PKG_VERSION");
     const BUILD_TS: &str = env!("BUILD_TIMESTAMP");
@@ -118,6 +128,7 @@ pub fn run() {
         .manage(app_state)
         .manage(CopilotStateMutex::default())
         .manage(CopilotAudioCaptureMutex::default())
+        .manage(TranscriptBufferMutex::default())
         .on_window_event(|window, event| {
             // Keep Rust state in sync when the overlay window hides via Esc / blur.
             if window.label() == copilot::window::OVERLAY_LABEL {
