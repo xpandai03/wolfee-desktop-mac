@@ -1,0 +1,170 @@
+import React, { useEffect, useState } from "react";
+import { motion } from "framer-motion";
+import { cn } from "@/lib/utils";
+import { labelFor } from "@/lib/triggerLabels";
+import { copyToClipboard } from "@/lib/copyToClipboard";
+import { ReasoningIndicator } from "./ReasoningIndicator";
+import type { ActiveSuggestion, UiPhase } from "@/state/types";
+
+/**
+ * The centerpiece of the overlay (plan §4).
+ *
+ * Renders three states: Reasoning (dots) → Streaming (filling text)
+ * → Showing (final card with primary + optional secondary + footer).
+ *
+ * Wrapped by AnimatePresence in the parent for mount/unmount animations.
+ */
+
+interface Props {
+  uiPhase: UiPhase;
+  active: ActiveSuggestion;
+  isFading: boolean;
+  copiedFlashAt: number | null;
+  onDismiss: () => void;
+  onCopy: () => void;
+}
+
+function SuggestionCardImpl({
+  uiPhase,
+  active,
+  isFading,
+  copiedFlashAt,
+  onDismiss,
+  onCopy,
+}: Props) {
+  const glyph = active.triggerSource === "hotkey" ? "✦" : "⚠";
+  const label = labelFor(active.trigger);
+  const sourceText = active.triggerSource === "hotkey" ? "manual" : "auto";
+
+  // Streaming text accumulates in active.streamingPrimary; on
+  // SUGGESTION_COMPLETE the reducer sets finalPrimary equal to it,
+  // but we prefer finalPrimary when present (covers cases where the
+  // server emits a slightly different completion text than what we
+  // accumulated from deltas).
+  const displayPrimary = active.finalPrimary ?? active.streamingPrimary;
+
+  // Brief "Copied ✓" flash when copiedFlashAt is recent.
+  const showCopied =
+    copiedFlashAt !== null && Date.now() - copiedFlashAt < 1200;
+  // Card-level flash overlay tied to the same trigger.
+  const showFlashOverlay = showCopied;
+
+  const handlePrimaryClick = () => {
+    if (uiPhase !== "Showing" || !active.finalPrimary) return;
+    onCopy();
+  };
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 8 }}
+      animate={{ opacity: isFading ? 0.6 : 1, y: 0 }}
+      exit={{ opacity: 0, y: 4 }}
+      transition={
+        // Long fade if we're entering the TTL warning window;
+        // standard 200ms otherwise.
+        isFading
+          ? { duration: 5, ease: "linear" }
+          : { duration: 0.2, ease: "easeOut" }
+      }
+      className={cn(
+        "relative mx-3 rounded-xl border border-white/10 bg-zinc-900/95",
+        "px-3 py-2 shadow-lg shadow-copilot-glow/20",
+        "transition-colors duration-200",
+        showFlashOverlay && "bg-copilot-accent/10",
+      )}
+      role="dialog"
+      aria-live="polite"
+      aria-label="Wolfee Copilot suggestion"
+    >
+      {/* Badge row */}
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-1.5 min-w-0">
+          <span className="inline-flex items-center gap-1 rounded-full bg-copilot-accent/15 text-copilot-accent text-[10px] font-semibold uppercase tracking-wider px-2 py-0.5">
+            <span aria-hidden>{glyph}</span>
+            <span>{label}</span>
+          </span>
+          <span className="text-[10px] text-zinc-500">· {sourceText}</span>
+        </div>
+        <button
+          type="button"
+          onClick={onDismiss}
+          aria-label="Dismiss suggestion"
+          className="text-zinc-500 hover:text-zinc-300 text-xs leading-none px-1"
+        >
+          ×
+        </button>
+      </div>
+
+      {/* Primary slot — Reasoning dots OR streaming/final text */}
+      <button
+        type="button"
+        onClick={handlePrimaryClick}
+        disabled={uiPhase !== "Showing"}
+        tabIndex={uiPhase === "Showing" ? 0 : -1}
+        className={cn(
+          "mt-2 text-left w-full text-sm font-medium text-zinc-50 leading-snug",
+          "focus:outline-none focus-visible:ring-1 focus-visible:ring-copilot-accent/40 rounded",
+          uiPhase === "Showing" && active.finalPrimary
+            ? "cursor-pointer hover:text-white"
+            : "cursor-default",
+        )}
+      >
+        {uiPhase === "Reasoning" ? (
+          <ReasoningIndicator />
+        ) : displayPrimary ? (
+          displayPrimary
+        ) : (
+          // Streaming has started but no text yet — show inline cursor
+          <span className="inline-block w-2 h-3.5 bg-copilot-accent/50 align-text-bottom animate-pulse" />
+        )}
+      </button>
+
+      {/* Secondary (only when complete) */}
+      {uiPhase === "Showing" && active.finalSecondary && (
+        <p className="text-xs text-zinc-300 leading-snug mt-1.5 before:content-['↳_'] before:text-zinc-500">
+          {active.finalSecondary}
+        </p>
+      )}
+
+      {/* Footer hint */}
+      <p className="text-[11px] text-zinc-500 mt-2 leading-none">
+        {showCopied
+          ? "Copied ✓"
+          : uiPhase === "Showing"
+            ? "Esc · Click to copy"
+            : ""}
+      </p>
+    </motion.div>
+  );
+}
+
+export const SuggestionCard = React.memo(SuggestionCardImpl);
+
+/**
+ * Side-effect helper: dismisses the suggestion AND emits the
+ * `wolfee-action: copilot-suggestion-dismissed` string per Decision N5
+ * (V1 — plain string payload; Sub-prompt 6 may upgrade).
+ */
+export async function emitDismiss(): Promise<void> {
+  // Dynamic import keeps this out of the main bundle until used.
+  const { emit } = await import("@tauri-apps/api/event");
+  await emit("wolfee-action", "copilot-suggestion-dismissed");
+}
+
+/**
+ * Helper that runs the copy-to-clipboard flow + dispatches the
+ * COPY_FLASH action via the supplied callback. Used by the
+ * onClick handler in SuggestionCard.
+ */
+export function useCopyFlow(
+  primary: string | null | undefined,
+  onFlash: () => void,
+) {
+  const [, setStarted] = useState(0);
+  useEffect(() => void setStarted, []);
+  return async () => {
+    if (!primary) return;
+    const ok = await copyToClipboard(primary);
+    if (ok) onFlash();
+  };
+}
