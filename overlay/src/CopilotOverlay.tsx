@@ -64,6 +64,20 @@ export default function CopilotOverlay() {
     return () => window.clearInterval(id);
   }, []);
 
+  // ── Dev-mode mock event generator (Ctrl+Shift+M) ───────────────
+  // Only registered when import.meta.env.DEV is true. Tree-shaken
+  // out of production builds.
+  useEffect(() => {
+    if (!import.meta.env.DEV) return;
+    let cleanup: (() => void) | undefined;
+    void import("@/dev/mockEvents").then(({ registerMockHotkey }) => {
+      cleanup = registerMockHotkey();
+    });
+    return () => {
+      cleanup?.();
+    };
+  }, []);
+
   // ── Failure toast auto-clear (1.2s) ────────────────────────────
   useEffect(() => {
     if (!overlayState.failureToast) return;
