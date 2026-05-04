@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { emit } from "@tauri-apps/api/event";
 
 /**
  * Sub-prompt 4.5 context paste page.
@@ -9,9 +9,12 @@ import { invoke } from "@tauri-apps/api/core";
  * loads this view rather than the main overlay. Three textareas with
  * char counters; Submit/Cancel; Esc cancels; Cmd+Enter submits.
  *
- * Submitting calls `submit_context` Tauri command — Rust-side that
+ * Submitting emits a `wolfee-action` event with type=submit-copilot-
+ * context — the Rust handle_structured_action dispatcher in lib.rs
  * creates the backend session, POSTs /context, spawns audio +
  * intelligence workers, shows the overlay, and destroys this window.
+ * Cancelling emits type=cancel-copilot-context which just destroys
+ * the window.
  *
  * Empty submission is allowed (graceful degradation to pre-4.5
  * behavior — prompts will see "(not provided)" placeholders).
@@ -72,14 +75,21 @@ export function ContextWindow() {
     setIsSubmitting(true);
     setErrorMsg(null);
     try {
-      await invoke("submit_context", {
-        aboutUser: fields.about_user.trim() || null,
-        aboutCall: fields.about_call.trim() || null,
+      // Snake_case keys — the Rust dispatcher reads via
+      // serde_json::Value::get("about_user") etc., so the JS payload
+      // shape must match exactly (no camelCase auto-conversion here
+      // because we're going through wolfee-action, not Tauri commands).
+      await emit("wolfee-action", {
+        type: "submit-copilot-context",
+        about_user: fields.about_user.trim() || null,
+        about_call: fields.about_call.trim() || null,
         objections: fields.objections.trim() || null,
       });
-      // Rust closes this window on success; nothing to do here.
+      // Rust closes this window once the session-start flow lands;
+      // nothing to do here. Leave isSubmitting=true so the form
+      // stays disabled — the window is about to be destroyed.
     } catch (err) {
-      console.error("[ContextWindow] submit_context failed:", err);
+      console.error("[ContextWindow] submit emit failed:", err);
       setErrorMsg(typeof err === "string" ? err : "Failed to start session");
       setIsSubmitting(false);
     }
@@ -87,9 +97,9 @@ export function ContextWindow() {
 
   const handleCancel = async () => {
     try {
-      await invoke("cancel_context");
+      await emit("wolfee-action", "cancel-copilot-context");
     } catch (err) {
-      console.error("[ContextWindow] cancel_context failed:", err);
+      console.error("[ContextWindow] cancel emit failed:", err);
     }
   };
 
