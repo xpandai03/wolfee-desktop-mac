@@ -311,10 +311,20 @@ async fn run_stream<R: Runtime>(
 }
 
 fn emit_complete<R: Runtime>(app: &AppHandle<R>, session_id: &str, payload: SuggestPayload) {
+    // Sub-prompt 4 verification 2026-05-04 round 7 — earlier this
+    // struct had #[serde(flatten)] on the payload field. That
+    // emitted a FLAT JSON object ({session_id, suggestion_id, primary, ...})
+    // but the JS reducer's SUGGESTION_COMPLETE handler reads
+    // `action.payload.payload.primary` (NESTED — matching dev-mode
+    // mockEvents.ts). The flat shape made `action.payload.payload`
+    // undefined, the reducer threw on `.primary`, React unmounted the
+    // tree, and the user saw the bare body bg-zinc-950 — i.e. a
+    // "black screen the moment generation finished."
+    //
+    // Fix: emit the NESTED shape that the JS code already expects.
     #[derive(Serialize)]
     struct CompletePayload {
         session_id: String,
-        #[serde(flatten)]
         payload: SuggestPayload,
     }
     let _ = app.emit(

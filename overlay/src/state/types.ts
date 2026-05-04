@@ -59,7 +59,9 @@ export interface SuggestionStreamingPayload {
 
 export interface SuggestionCompletePayload {
   session_id: string;
-  suggestion_id: string;
+  // Inner payload is what the suggest_client.rs run_stream emits via
+  // #[derive(Serialize)] CompletePayload { session_id, payload }.
+  // The reducer reads action.payload.payload — not flat.
   payload: {
     suggestion_id: string;
     moment_type: string;
