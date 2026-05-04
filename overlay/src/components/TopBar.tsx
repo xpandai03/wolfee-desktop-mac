@@ -9,6 +9,18 @@ import type { UiPhase } from "@/state/types";
  * to wire. The X explicitly hides the overlay window — needed because
  * we removed auto-hide-on-blur (overlay used to flicker shut the
  * instant another app reclaimed focus).
+ *
+ * Sub-prompt 4.5 polish: the top bar is also the drag handle for
+ * repositioning the overlay during a call (PO feedback — overlay
+ * was locked at top-center and sometimes covered shared-screen
+ * content). data-tauri-drag-region makes click+drag move the
+ * window. The two <button> children are auto-excluded by Tauri 2
+ * (interactive elements bypass drag-region) so click-on-Settings
+ * and click-on-X still fire their handlers normally.
+ *
+ * Drag position is NOT persisted across show/hide — show_overlay
+ * re-positions to top-center per Sub-prompt 1 design. Persistence
+ * deferred to Sub-prompt 6.
  */
 
 interface Props {
@@ -28,15 +40,24 @@ export function TopBar({ uiPhase, hasActiveSession }: Props) {
   };
 
   return (
-    <div className="flex items-center justify-between px-3 py-1.5 h-7 select-none">
-      <div className="flex items-center gap-1.5">
+    <div
+      data-tauri-drag-region
+      className="flex items-center justify-between px-3 py-1.5 h-7 select-none cursor-grab active:cursor-grabbing"
+    >
+      <div data-tauri-drag-region className="flex items-center gap-1.5">
         <span
+          data-tauri-drag-region
           className={cn(
             "inline-block w-1.5 h-1.5 rounded-full",
             dotClass,
           )}
         />
-        <span className="text-[11px] text-zinc-400 leading-none">{label}</span>
+        <span
+          data-tauri-drag-region
+          className="text-[11px] text-zinc-400 leading-none"
+        >
+          {label}
+        </span>
       </div>
       <div className="flex items-center gap-1.5">
         <button
@@ -45,7 +66,7 @@ export function TopBar({ uiPhase, hasActiveSession }: Props) {
             console.log("[Copilot] settings clicked — Sub-prompt 6")
           }
           aria-label="Open Wolfee Copilot settings"
-          className="text-zinc-500 hover:text-zinc-300 transition-colors"
+          className="text-zinc-500 hover:text-zinc-300 transition-colors cursor-pointer"
         >
           <Settings className="w-3.5 h-3.5" />
         </button>
@@ -53,7 +74,7 @@ export function TopBar({ uiPhase, hasActiveSession }: Props) {
           type="button"
           onClick={handleClose}
           aria-label="Close Wolfee Copilot overlay"
-          className="text-zinc-500 hover:text-zinc-200 transition-colors"
+          className="text-zinc-500 hover:text-zinc-200 transition-colors cursor-pointer"
         >
           <X className="w-4 h-4" />
         </button>
