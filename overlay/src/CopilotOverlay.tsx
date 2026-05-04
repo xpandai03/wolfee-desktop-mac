@@ -7,6 +7,7 @@ import { TopBar } from "@/components/TopBar";
 import { TranscriptZone } from "@/components/TranscriptZone";
 import { SuggestionCard } from "@/components/SuggestionCard";
 import { FooterHint } from "@/components/FooterHint";
+import { cn } from "@/lib/utils";
 import {
   initialOverlayState,
   isInTtlFadeWindow,
@@ -233,10 +234,15 @@ export default function CopilotOverlay() {
     overlayState;
   const hasActiveSession = transcript.length > 0;
   const isFading = isInTtlFadeWindow(overlayState, Date.now());
+  const isExpanded = active?.expanded === true;
 
   const handleDismiss = () => {
     dispatch({ type: "DISMISS_SUGGESTION", via: "click" });
     void emit("wolfee-action", "copilot-suggestion-dismissed");
+  };
+
+  const handleToggleExpanded = () => {
+    dispatch({ type: "TOGGLE_EXPANDED" });
   };
 
   const handleCopy = async () => {
@@ -248,19 +254,32 @@ export default function CopilotOverlay() {
   return (
     <div className="w-full h-full flex flex-col bg-zinc-950 text-zinc-100 select-none">
       <TopBar uiPhase={uiPhase} hasActiveSession={hasActiveSession} />
-      <TranscriptZone utterances={transcript} />
 
-      {/* Suggestion zone (130px) */}
-      <div className="h-[130px] flex items-center justify-center">
+      {/*
+        When a suggestion is expanded, hide the transcript zone so the
+        suggestion card has the whole content area to breathe (per PO
+        2026-05-04 — "make it bigger" / "side view"). When collapsed,
+        the original two-zone layout is restored: transcript top,
+        suggestion bottom.
+      */}
+      {!isExpanded && <TranscriptZone utterances={transcript} />}
+
+      <div
+        className={cn(
+          "flex items-center justify-center",
+          isExpanded ? "flex-1" : "h-[130px]",
+        )}
+      >
         <AnimatePresence mode="wait">
           {active ? (
             <div key="card" className="w-full">
               <SuggestionCard
                 uiPhase={uiPhase}
                 active={active}
-                isFading={isFading}
+                isFading={isFading && !isExpanded}
                 copiedFlashAt={copiedFlashAt}
                 onDismiss={handleDismiss}
+                onToggleExpanded={handleToggleExpanded}
                 onCopy={handleCopy}
               />
             </div>
@@ -275,7 +294,7 @@ export default function CopilotOverlay() {
         </AnimatePresence>
       </div>
 
-      <FooterHint failureToast={failureToast} />
+      {!isExpanded && <FooterHint failureToast={failureToast} />}
     </div>
   );
 }

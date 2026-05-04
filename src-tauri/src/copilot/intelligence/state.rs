@@ -50,20 +50,24 @@ impl TriggerType {
         }
     }
 
-    /// Default cooldown per trigger type (plan §5.1). Lower =
-    /// more eager surfacing. Sensitivity preset can override these
-    /// (Sub-prompt 6 ships the toggle UI; V1 launches at "Low" per
-    /// Decision N8 which scales these up).
+    /// Default cooldown per trigger type (plan §5.1).
+    ///
+    /// Original Low-preset values were 60-180s per trigger — combined
+    /// with the 60s LLM cadence cap, suggestions felt too rare for
+    /// PO during live testing 2026-05-04. Halved across the board so
+    /// the same trigger type can fire more often as the call evolves
+    /// (e.g., multiple objections within a few minutes are now each
+    /// surfaced rather than collapsed into one).
     pub fn default_cooldown_seconds(&self) -> u64 {
         match self {
-            Self::Objection => 60,
-            Self::PricingQuestion => 45,
-            Self::SilenceAfterQuestion => 90,
-            Self::DecisionMoment => 120,
-            Self::BuyingSignal => 90,
-            Self::CompetitorMentioned => 180,
-            Self::Confusion => 60,
-            Self::QuestionAsked => 45,
+            Self::Objection => 30,
+            Self::PricingQuestion => 20,
+            Self::SilenceAfterQuestion => 45,
+            Self::DecisionMoment => 60,
+            Self::BuyingSignal => 45,
+            Self::CompetitorMentioned => 90,
+            Self::Confusion => 30,
+            Self::QuestionAsked => 20,
         }
     }
 

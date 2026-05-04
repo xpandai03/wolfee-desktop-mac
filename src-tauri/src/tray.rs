@@ -180,6 +180,23 @@ fn build_menu<R: Runtime>(
             None::<&str>,
         )?;
         menu.append(&end_session)?;
+
+        // Manual suggestion trigger — same path as ⌘⌥G but discoverable
+        // via tray for users who don't memorize hotkeys (PO 2026-05-04
+        // feedback: "the hot keys are also not easy to kind of hit and
+        // memorize"). Enabled only during Listening/Reconnecting.
+        let suggest_enabled = matches!(
+            copilot_state,
+            CopilotState::Listening { .. } | CopilotState::Reconnecting { .. }
+        );
+        let suggest_item = MenuItem::with_id(
+            app,
+            "copilot_generate_suggestion",
+            "Generate Suggestion  ⌘⌥G",
+            suggest_enabled,
+            None::<&str>,
+        )?;
+        menu.append(&suggest_item)?;
     }
 
     let session_sep_bottom = MenuItem::with_id(app, "copilot_session_sep_bottom", "—", false, None::<&str>)?;
@@ -402,6 +419,10 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, id: &str) {
         "copilot_end_session" => {
             log::info!("[Tray] End Copilot Session clicked");
             let _ = app.emit("wolfee-action", "end-copilot-session");
+        }
+        "copilot_generate_suggestion" => {
+            log::info!("[Tray] Generate Suggestion clicked");
+            let _ = app.emit("wolfee-action", "trigger-copilot-suggestion");
         }
 
         // ─── Linking / upload status row clicks ───

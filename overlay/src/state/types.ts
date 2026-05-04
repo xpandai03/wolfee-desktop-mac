@@ -123,7 +123,18 @@ export interface ActiveSuggestion {
   /** Final payload, populated by SUGGESTION_COMPLETE. Null while still streaming. */
   finalPrimary: string | null;
   finalSecondary: string | null;
+  /** Reasoning string from the LLM. Visible in expanded view only. */
+  reasoning: string | null;
+  /** Confidence (0.0-1.0). Currently shown only in expanded view, per Decision N4. */
+  confidence: number;
   ttlSeconds: number;
+  /**
+   * User clicked the suggestion to "keep" it — TTL paused, full
+   * primary + secondary + reasoning visible at larger sizes. Stays
+   * until X is clicked. Auto-suggestions arriving while expanded
+   * are queued (V1 just drops them; replaces on collapse).
+   */
+  expanded: boolean;
 }
 
 export interface OverlayState {
@@ -155,6 +166,7 @@ export type Action =
   | { type: "SUGGESTION_COMPLETE"; payload: SuggestionCompletePayload }
   | { type: "SUGGESTION_FAILED"; payload: SuggestionFailedPayload }
   | { type: "DISMISS_SUGGESTION"; via: DismissReason }
+  | { type: "TOGGLE_EXPANDED" }
   | { type: "COPY_FLASH" }
   | { type: "CLEAR_FAILURE_TOAST" }
   | { type: "TICK"; nowMs: number };

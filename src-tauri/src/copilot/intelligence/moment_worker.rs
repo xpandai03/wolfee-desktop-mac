@@ -33,11 +33,19 @@ use super::state::{
 };
 use super::suggest_client;
 
-// ── Sensitivity preset (V1 default = Low) ───────────────────────
-// Sub-prompt 6 reads from tauri-plugin-store; for V1 we hardcode.
-const HEURISTIC_INTERVAL_SECS: u64 = 10;
-const LLM_CADENCE_CAP_SECS: u64 = 60;
-const URGENCY_THRESHOLD: u8 = 4;
+// ── Sensitivity preset (V1 default = High after PO 2026-05-04 retune) ───
+// Original Decision N8 locked "Low" for the conservative launch
+// (heuristic 10s / LLM cap 60s / urgency≥4). PO feedback after live
+// testing: hotkey-only feels constant, suggestions felt too rare
+// when they should be reactive to the transcript. Bumped to "High"
+// so the AI surfaces suggestions on real moments without the user
+// pressing ⌘⌥G every time. ~4-6× more frequent than Low.
+//
+// Sub-prompt 6 will surface this as a user-toggle (Off/Low/Medium/
+// High) per design Decision N4. For now hardcoded.
+const HEURISTIC_INTERVAL_SECS: u64 = 5;
+const LLM_CADENCE_CAP_SECS: u64 = 15;
+const URGENCY_THRESHOLD: u8 = 3;
 
 /// Window we send to the verifier prompt (90s of transcript).
 const VERIFIER_WINDOW_SECS: u64 = 90;

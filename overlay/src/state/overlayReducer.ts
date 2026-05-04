@@ -113,6 +113,13 @@ export function overlayReducer(
     case "SUGGESTION_COMPLETE": {
       const { payload } = action.payload;
       if (state.active === null) return state;
+      // If a previous suggestion is currently expanded, the user has
+      // explicitly "kept" it — don't blow it away with a new auto-fire.
+      // The new suggestion is dropped silently (Sub-prompt 6 could
+      // queue these into a history view; V1 keeps it simple).
+      if (state.active.expanded && state.uiPhase === "Showing") {
+        return state;
+      }
       return {
         ...state,
         uiPhase: "Showing",
@@ -121,12 +128,28 @@ export function overlayReducer(
           suggestionId: payload.suggestion_id,
           finalPrimary: payload.primary,
           finalSecondary: payload.secondary,
+          reasoning: payload.reasoning,
+          confidence: payload.confidence,
           ttlSeconds: payload.ttl_seconds,
           // Sync streamingPrimary in case finalPrimary differs from accumulated
           streamingPrimary: payload.primary,
+          expanded: false,
         },
         reasoningStartedAtMs: null,
         showingStartedAtMs: Date.now(),
+      };
+    }
+
+    case "TOGGLE_EXPANDED": {
+      if (state.active === null || state.uiPhase !== "Showing") return state;
+      const expanded = !state.active.expanded;
+      return {
+        ...state,
+        active: { ...state.active, expanded },
+        // Reset the showing-started clock when collapsing so TTL
+        // restarts from "now" rather than penalizing the user for
+        // having read the expanded view.
+        showingStartedAtMs: expanded ? state.showingStartedAtMs : Date.now(),
       };
     }
 
@@ -183,9 +206,14 @@ export function overlayReducer(
         };
       }
 
+      // Auto-dismiss after TTL — but ONLY if the user hasn't
+      // expanded the suggestion. Expanded means "keep this until I
+      // X out" per the PO 2026-05-04 UX feedback.
       if (
         next.uiPhase === "Showing" &&
         next.showingStartedAtMs !== null &&
+        next.active !== null &&
+        !next.active.expanded &&
         action.nowMs - next.showingStartedAtMs >= SHOWING_TTL_MS
       ) {
         next = {
@@ -232,7 +260,10 @@ function enterReasoning(
     streamingPrimary: "",
     finalPrimary: null,
     finalSecondary: null,
+    reasoning: null,
+    confidence: 0,
     ttlSeconds: 30,
+    expanded: false,
   };
   return {
     ...state,
