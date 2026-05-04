@@ -275,6 +275,39 @@ async fn run_stream<R: Runtime>(
             }
         }
     }
+
+    // Stream ended without ever emitting Done — backend silently
+    // closed the SSE response (typically when the route handler
+    // throws after sending headers but before any chunk lands;
+    // surfaced 2026-05-04 against the deployed /suggest endpoint
+    // returning 500 mid-stream).
+    //
+    // If we never saw a single token, the user got a brief
+    // Reasoning indicator and then nothing — they have no idea
+    // what happened. Release the mutex immediately so a quick
+    // retry isn't silently dropped, and emit a failure so the
+    // overlay can clear out of Reasoning state.
+    if !first_token_seen {
+        log::warn!(
+            "[Copilot/intel/suggest] stream closed silently with no tokens — id={}",
+            short(&suggestion_id)
+        );
+        emit_failed(
+            &app,
+            &session_id,
+            "stream_closed_no_tokens".to_string(),
+        );
+        release_active(&app, &suggestion_id);
+    } else {
+        // Some text arrived but Done never did. Treat as soft
+        // failure — release so the user can try again rather than
+        // getting silently blocked for 30s.
+        log::warn!(
+            "[Copilot/intel/suggest] stream ended without Done after partial output — id={}",
+            short(&suggestion_id)
+        );
+        release_active(&app, &suggestion_id);
+    }
 }
 
 fn emit_complete<R: Runtime>(app: &AppHandle<R>, session_id: &str, payload: SuggestPayload) {
