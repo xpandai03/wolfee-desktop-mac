@@ -89,9 +89,17 @@ export type TriggerType =
   | "confusion"
   | "competitor_mentioned"
   | "question_asked"
-  | "general";
+  | "general"
+  // Sub-prompt 4.5 quick-action moment_types — surfaced for badge label
+  // routing (labelFor) and reducer payload typing.
+  | "follow_up"
+  | "fact_check"
+  | "recap";
 
 export type TriggerSource = "moment" | "hotkey";
+
+// Sub-prompt 4.5 — the 4 user-clickable action buttons.
+export type QuickActionType = "ask" | "follow_up" | "fact_check" | "recap";
 
 // ── Reducer state ────────────────────────────────────────────────
 

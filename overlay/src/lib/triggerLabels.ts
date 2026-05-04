@@ -18,6 +18,10 @@ export const triggerLabels: Record<TriggerType, string> = {
   competitor_mentioned: "COMPETITOR",
   question_asked: "QUESTION",
   general: "GENERAL",
+  // Sub-prompt 4.5 quick-action labels.
+  follow_up: "FOLLOW-UP",
+  fact_check: "FACT CHECK",
+  recap: "RECAP",
 };
 
 export function labelFor(trigger: TriggerType | null | undefined): string {

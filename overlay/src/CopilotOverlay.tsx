@@ -6,6 +6,7 @@ import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { TopBar } from "@/components/TopBar";
 import { TranscriptZone } from "@/components/TranscriptZone";
 import { SuggestionCard } from "@/components/SuggestionCard";
+import { ActionButtonsRow } from "@/components/ActionButtonsRow";
 import { FooterHint } from "@/components/FooterHint";
 import { cn } from "@/lib/utils";
 import {
@@ -22,6 +23,7 @@ import type {
   SuggestionStreamingPayload,
   SuggestionCompletePayload,
   SuggestionFailedPayload,
+  QuickActionType,
 } from "@/state/types";
 
 type PermissionKind = "Microphone" | "ScreenRecording";
@@ -251,6 +253,21 @@ export default function CopilotOverlay() {
     if (ok) dispatch({ type: "COPY_FLASH" });
   };
 
+  // Sub-prompt 4.5 — fire a quick-action via the Rust JSON dispatch.
+  // The handler aborts any in-flight auto-suggestion (Decision N1).
+  const handleQuickAction = (action: QuickActionType) => {
+    void emit("wolfee-action", {
+      type: "trigger-copilot-quick-action",
+      action,
+    });
+  };
+
+  // Idle = "no suggestion in flight, no expanded card" → show 2x2 grid
+  // of action buttons in the full 130px suggestion zone.
+  // Active = anything else → show 28px icon strip above the card.
+  const buttonsMode: "idle" | "active" =
+    !active && uiPhase === "Idle" ? "idle" : "active";
+
   return (
     <div className="w-full h-full flex flex-col bg-zinc-950 text-zinc-100 select-none">
       <TopBar uiPhase={uiPhase} hasActiveSession={hasActiveSession} />
@@ -264,35 +281,44 @@ export default function CopilotOverlay() {
       */}
       {!isExpanded && <TranscriptZone utterances={transcript} />}
 
-      <div
-        className={cn(
-          "flex items-center justify-center",
-          isExpanded ? "flex-1" : "h-[130px]",
-        )}
-      >
-        <AnimatePresence mode="wait">
-          {active ? (
-            <div key="card" className="w-full">
-              <SuggestionCard
-                uiPhase={uiPhase}
-                active={active}
-                isFading={isFading && !isExpanded}
-                copiedFlashAt={copiedFlashAt}
-                onDismiss={handleDismiss}
-                onToggleExpanded={handleToggleExpanded}
-                onCopy={handleCopy}
-              />
-            </div>
-          ) : (
-            <div
-              key="idle"
-              className="text-zinc-500 text-[13px] opacity-60 text-center px-3"
-            >
-              Listening… <kbd className="font-mono text-[12px]">⌘⌥G</kbd> to ask
-            </div>
+      {/* Sub-prompt 4.5 action buttons: 2x2 grid when idle, compact
+          strip above the suggestion when active. AnimatePresence
+          inside ActionButtonsRow handles the cross-fade. */}
+      {!isExpanded && (
+        <ActionButtonsRow
+          mode={buttonsMode}
+          onAction={handleQuickAction}
+          disabled={uiPhase === "Reasoning" || uiPhase === "Streaming"}
+        />
+      )}
+
+      {/* Suggestion card area — only rendered when there's an active
+          suggestion OR we're expanded (so a previously-expanded card
+          stays visible). Idle state is fully owned by ActionButtonsRow. */}
+      {(active || isExpanded) && (
+        <div
+          className={cn(
+            "flex items-center justify-center",
+            isExpanded ? "flex-1" : "h-[102px]",
           )}
-        </AnimatePresence>
-      </div>
+        >
+          <AnimatePresence mode="wait">
+            {active ? (
+              <div key="card" className="w-full">
+                <SuggestionCard
+                  uiPhase={uiPhase}
+                  active={active}
+                  isFading={isFading && !isExpanded}
+                  copiedFlashAt={copiedFlashAt}
+                  onDismiss={handleDismiss}
+                  onToggleExpanded={handleToggleExpanded}
+                  onCopy={handleCopy}
+                />
+              </div>
+            ) : null}
+          </AnimatePresence>
+        </div>
+      )}
 
       {!isExpanded && <FooterHint failureToast={failureToast} />}
     </div>

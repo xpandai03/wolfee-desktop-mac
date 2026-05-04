@@ -78,13 +78,17 @@ export function overlayReducer(
     case "SUGGESTION_PENDING": {
       // Sub-prompt 4 N3 — fired instantly on hotkey or moment.
       // Reasoning indicator appears with no dead air.
-      if (state.uiPhase === "Streaming" || state.uiPhase === "Showing") {
-        // Concurrent suggestion is blocked at the Rust side
-        // (ActiveSuggestionMutex), so this branch shouldn't fire.
-        // Defensive: ignore.
+      const { trigger_source, trigger, trigger_phrase } = action.payload;
+      // Sub-prompt 4.5 Decision N1 — user-click wins. A hotkey/quick-
+      // action pending event always preempts whatever's currently
+      // showing. Auto (moment) pendings still defer to anything in
+      // flight (Rust side won't fire concurrently for moment anyway).
+      if (
+        trigger_source !== "hotkey" &&
+        (state.uiPhase === "Streaming" || state.uiPhase === "Showing")
+      ) {
         return state;
       }
-      const { trigger_source, trigger, trigger_phrase } = action.payload;
       return enterReasoning(
         state,
         trigger_source,
