@@ -112,13 +112,26 @@ export default function CopilotOverlay() {
     };
     window.addEventListener("keydown", handleKey);
 
-    // Hide on focus loss, but ONLY when no modal is showing. Otherwise
-    // clicking "Open System Settings" would steal focus and yank the
-    // modal away before the user can come back to click "Try again".
-    const focusUnlistenPromise = win.onFocusChanged(({ payload: focused }) => {
-      if (!focused && !permissionNeededRef.current) {
-        void win.hide();
-      }
+    // 2026-05-04: removed the auto-hide-on-focus-loss handler. With
+    // Accessory activation policy, the overlay rarely takes focus
+    // anyway — and the prior listener was firing the moment Chrome
+    // (or any other fullscreen app) reclaimed focus, which made the
+    // overlay flicker visible-then-gone the instant a suggestion
+    // appeared. Surfaced by PO 2026-05-04 as "blacked out."
+    //
+    // New dismiss model:
+    //   - ⌘⌥W toggles the overlay window
+    //   - X button in TopBar hides it
+    //   - Esc dismisses an active suggestion (if any) or hides the
+    //     window otherwise (only effective when overlay has focus)
+    //
+    // Keep the focusUnlistenPromise variable (typed) because the
+    // permission-modal Esc path was the last legitimate consumer.
+    // We still register a listener — but it's a no-op for window
+    // hiding now, retained as a hook for Sub-prompt 6 if PO wants
+    // a different behavior (e.g., "auto-hide if user goes idle").
+    const focusUnlistenPromise = win.onFocusChanged(({ payload: _focused }) => {
+      // intentional no-op
     });
 
     let permUnlisten: UnlistenFn | undefined;

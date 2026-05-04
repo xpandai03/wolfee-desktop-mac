@@ -147,7 +147,13 @@ pub fn show_overlay<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     // Re-position each time so monitor changes (lid open / external display) are honored.
     position_top_center(&window);
     window.show()?;
-    window.set_focus()?;
+    // 2026-05-04: do NOT call set_focus(). The overlay should appear
+    // ON TOP of whatever the user is working in (Chrome, Zoom, etc.)
+    // without stealing keyboard focus from that app. Click-on-overlay
+    // gives focus naturally if the user wants to interact (Esc to
+    // dismiss, etc.). Stealing focus + auto-hiding on focus loss
+    // (the prior pattern) was the root cause of the "blacked out"
+    // bug surfaced by PO 2026-05-04.
     Ok(())
 }
 

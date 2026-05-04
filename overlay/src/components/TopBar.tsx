@@ -1,11 +1,14 @@
-import { Settings } from "lucide-react";
+import { Settings, X } from "lucide-react";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { cn } from "@/lib/utils";
 import type { UiPhase } from "@/state/types";
 
 /**
- * Top bar (28px tall) — status pill on the left, Settings ⚙ hook
- * on the right. Settings is a no-op in V1 per plan §12; Sub-prompt 6
- * wires it to a real settings panel.
+ * Top bar (28px tall) — status pill on the left, Settings ⚙ + X
+ * close button on the right. Settings is a no-op stub for Sub-prompt 6
+ * to wire. The X explicitly hides the overlay window — needed because
+ * we removed auto-hide-on-blur (overlay used to flicker shut the
+ * instant another app reclaimed focus).
  */
 
 interface Props {
@@ -15,6 +18,14 @@ interface Props {
 
 export function TopBar({ uiPhase, hasActiveSession }: Props) {
   const { dotClass, label } = derivePill(uiPhase, hasActiveSession);
+
+  const handleClose = async () => {
+    // Hide via the webview window directly — the Rust state stays
+    // synced because hotkey.rs's toggle_overlay reads window
+    // visibility (not CopilotState) when deciding show vs hide.
+    const win = getCurrentWebviewWindow();
+    await win.hide();
+  };
 
   return (
     <div className="flex items-center justify-between px-3 py-1.5 h-7 select-none">
@@ -27,16 +38,26 @@ export function TopBar({ uiPhase, hasActiveSession }: Props) {
         />
         <span className="text-[11px] text-zinc-400 leading-none">{label}</span>
       </div>
-      <button
-        type="button"
-        onClick={() =>
-          console.log("[Copilot] settings clicked — Sub-prompt 6")
-        }
-        aria-label="Open Wolfee Copilot settings"
-        className="text-zinc-500 hover:text-zinc-300 transition-colors"
-      >
-        <Settings className="w-4 h-4" />
-      </button>
+      <div className="flex items-center gap-1.5">
+        <button
+          type="button"
+          onClick={() =>
+            console.log("[Copilot] settings clicked — Sub-prompt 6")
+          }
+          aria-label="Open Wolfee Copilot settings"
+          className="text-zinc-500 hover:text-zinc-300 transition-colors"
+        >
+          <Settings className="w-3.5 h-3.5" />
+        </button>
+        <button
+          type="button"
+          onClick={handleClose}
+          aria-label="Close Wolfee Copilot overlay"
+          className="text-zinc-500 hover:text-zinc-200 transition-colors"
+        >
+          <X className="w-4 h-4" />
+        </button>
+      </div>
     </div>
   );
 }

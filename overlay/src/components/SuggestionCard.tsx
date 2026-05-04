@@ -35,12 +35,14 @@ function SuggestionCardImpl({
   const label = labelFor(active.trigger);
   const sourceText = active.triggerSource === "hotkey" ? "manual" : "auto";
 
-  // Streaming text accumulates in active.streamingPrimary; on
-  // SUGGESTION_COMPLETE the reducer sets finalPrimary equal to it,
-  // but we prefer finalPrimary when present (covers cases where the
-  // server emits a slightly different completion text than what we
-  // accumulated from deltas).
-  const displayPrimary = active.finalPrimary ?? active.streamingPrimary;
+  // We don't render `streamingPrimary` because OpenAI's JSON-mode
+  // stream emits raw JSON tokens ({"primary":"the actual text"...) —
+  // displaying that as text shows JSON garbage. Instead, keep showing
+  // the Reasoning indicator while the LLM streams, and only render
+  // text once SUGGESTION_COMPLETE has arrived with `finalPrimary` set
+  // (uiPhase === "Showing"). Text pops in instantly when ready, no
+  // "code-like AI-y" intermediate state.
+  const displayPrimary = active.finalPrimary;
 
   // Brief "Copied ✓" flash when copiedFlashAt is recent.
   const showCopied =
@@ -108,13 +110,13 @@ function SuggestionCardImpl({
             : "cursor-default",
         )}
       >
-        {uiPhase === "Reasoning" ? (
-          <ReasoningIndicator />
-        ) : displayPrimary ? (
+        {uiPhase === "Showing" && displayPrimary ? (
           displayPrimary
         ) : (
-          // Streaming has started but no text yet — show inline cursor
-          <span className="inline-block w-2 h-3.5 bg-copilot-accent/50 align-text-bottom animate-pulse" />
+          // Reasoning OR Streaming OR Showing-but-no-primary-yet —
+          // keep the dots so the user sees "AI is thinking" through
+          // the whole LLM round-trip.
+          <ReasoningIndicator />
         )}
       </button>
 

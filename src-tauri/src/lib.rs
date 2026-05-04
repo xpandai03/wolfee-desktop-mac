@@ -147,17 +147,18 @@ pub fn run() {
         // Storage for the live IntelligenceWorkers handles. tokio::Mutex
         // because we hold the guard across `await` (workers.stop() is async).
         .manage(IntelligenceWorkersMutex(tokio::sync::Mutex::new(None)))
-        .on_window_event(|window, event| {
-            // Keep Rust state in sync when the overlay window hides via Esc / blur.
-            if window.label() == copilot::window::OVERLAY_LABEL {
-                if let WindowEvent::Focused(false) = event {
-                    let app = window.app_handle();
-                    // Hide the overlay on focus loss — matches the frontend's blur listener;
-                    // either path is fine (idempotent).
-                    let _ = copilot::window::hide_overlay(app);
-                    copilot::hotkey::on_overlay_hidden(app);
-                }
-            }
+        .on_window_event(|window, _event| {
+            // 2026-05-04: removed the WindowEvent::Focused(false) →
+            // hide_overlay handler. With the new "overlay stays
+            // visible" model, focus loss should NOT auto-hide.
+            // Surfaced by PO as "blacked out" — overlay flickered
+            // gone the instant Chrome reclaimed focus after a
+            // suggestion appeared.
+            //
+            // The handler is kept (rather than dropping the whole
+            // .on_window_event block) so future listeners can hang
+            // off it without re-introducing the wiring.
+            let _ = window.label();
         })
         .setup(move |app| {
             let handle = app.handle().clone();
