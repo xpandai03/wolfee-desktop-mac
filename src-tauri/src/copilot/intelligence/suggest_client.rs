@@ -24,11 +24,26 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 use uuid::Uuid;
 
-use super::api::{IntelligenceApi, SuggestPayload, SuggestRequest, SuggestSseEvent};
+use super::api::{
+    IntelligenceApi, QuickActionRequest, QuickActionType, SuggestPayload, SuggestRequest,
+    SuggestSseEvent,
+};
 use super::state::{ActiveSuggestion, ActiveSuggestionMutex, TriggerSource};
 
 const TTFT_HARD_CAP: Duration = Duration::from_secs(2);
 const ACTIVE_TTL: Duration = Duration::from_secs(30);
+
+/// Discriminator for which backend SSE endpoint a stream task
+/// should hit. Auto = /suggest (moment + hotkey paths). User-clicked
+/// quick-actions = /quick-action with a typed action enum.
+#[derive(Debug, Clone)]
+enum StreamMode {
+    Auto {
+        trigger: Option<String>,
+        trigger_phrase: Option<String>,
+    },
+    QuickAction(QuickActionType),
+}
 
 #[derive(Debug, Clone, Serialize)]
 struct StreamingPayload {
@@ -63,8 +78,10 @@ pub fn spawn_for_moment<R: Runtime>(
         session_id,
         api,
         trigger_source,
-        trigger,
-        trigger_phrase,
+        StreamMode::Auto {
+            trigger,
+            trigger_phrase,
+        },
         transcript_window,
         rolling_summary,
     );
@@ -84,8 +101,32 @@ pub fn spawn_for_hotkey<R: Runtime>(
         session_id,
         api,
         TriggerSource::Hotkey,
-        None,
-        None,
+        StreamMode::Auto {
+            trigger: None,
+            trigger_phrase: None,
+        },
+        transcript_window,
+        rolling_summary,
+    );
+}
+
+/// Public entry: Sub-prompt 4.5 quick-action button click. Always
+/// wins concurrency over an in-flight auto-suggestion (Decision N1)
+/// — user intent takes priority.
+pub fn spawn_for_quick_action<R: Runtime>(
+    app: AppHandle<R>,
+    session_id: String,
+    api: Arc<IntelligenceApi>,
+    action: QuickActionType,
+    transcript_window: String,
+    rolling_summary: Option<String>,
+) {
+    spawn_inner(
+        app,
+        session_id,
+        api,
+        TriggerSource::Hotkey, // closest existing telemetry enum (user-initiated)
+        StreamMode::QuickAction(action),
         transcript_window,
         rolling_summary,
     );
@@ -96,14 +137,22 @@ fn spawn_inner<R: Runtime>(
     session_id: String,
     api: Arc<IntelligenceApi>,
     trigger_source: TriggerSource,
-    trigger: Option<String>,
-    trigger_phrase: Option<String>,
+    mode: StreamMode,
     transcript_window: String,
     rolling_summary: Option<String>,
 ) {
-    // Concurrency gate — claim the active suggestion slot or drop.
+    // User-click-wins (Decision N1): a QuickAction always preempts
+    // an in-flight Auto suggestion. Auto suggestions still respect
+    // the existing "drop if active" rule.
+    let is_user_initiated = matches!(mode, StreamMode::QuickAction(_));
+
     let suggestion_id = Uuid::new_v4().to_string();
-    let claimed = {
+
+    // Step 1 — under the lock, decide whether to abort the existing
+    // entry. We MUST drop the guard before calling abort()/spawning
+    // since abort() touches tokio internals that may want to acquire
+    // their own locks.
+    let to_abort: Option<std::sync::Arc<tauri::async_runtime::JoinHandle<()>>> = {
         let active_state = app.state::<ActiveSuggestionMutex>();
         let mut guard = match active_state.0.lock() {
             Ok(g) => g,
@@ -111,42 +160,69 @@ fn spawn_inner<R: Runtime>(
         };
         if let Some(existing) = guard.as_ref() {
             if existing.started_at.elapsed() < ACTIVE_TTL {
+                if !is_user_initiated {
+                    log::info!(
+                        "[Copilot/intel/suggest] dropping new {} trigger — previous suggestion still active (id={}, age={}s)",
+                        trigger_source.as_str(),
+                        short(&existing.suggestion_id),
+                        existing.started_at.elapsed().as_secs()
+                    );
+                    return;
+                }
                 log::info!(
-                    "[Copilot/intel/suggest] dropping new {} trigger — previous suggestion still active (id={}, age={}s)",
-                    trigger_source.as_str(),
+                    "[Copilot/intel/suggest] user-initiated quick-action preempting active id={} (age={}s)",
                     short(&existing.suggestion_id),
                     existing.started_at.elapsed().as_secs()
                 );
-                return;
             }
-            // Previous TTL elapsed — replace.
         }
-        *guard = Some(ActiveSuggestion {
-            session_id: session_id.clone(),
-            suggestion_id: suggestion_id.clone(),
-            started_at: Instant::now(),
-            trigger_source,
-        });
-        true
+        // Take the abort handle out of the existing entry (if any) so
+        // we can call .abort() outside the guard.
+        guard.as_mut().and_then(|a| a.abort.take())
     };
-    if !claimed {
-        return;
+
+    if let Some(handle) = to_abort {
+        // tauri::async_runtime::JoinHandle::abort takes &self.
+        handle.abort();
     }
 
-    tauri::async_runtime::spawn(async move {
-        run_stream(
-            app,
-            session_id,
-            api,
-            suggestion_id,
-            trigger_source,
-            trigger,
-            trigger_phrase,
-            transcript_window,
-            rolling_summary,
-        )
-        .await;
+    // Step 2 — spawn the stream task. Wrap the JoinHandle in Arc so
+    // both this scope and the ActiveSuggestion entry can hold it.
+    let join_handle = {
+        let app = app.clone();
+        let api = api.clone();
+        let session_id = session_id.clone();
+        let suggestion_id = suggestion_id.clone();
+        tauri::async_runtime::spawn(async move {
+            run_stream(
+                app,
+                session_id,
+                api,
+                suggestion_id,
+                trigger_source,
+                mode,
+                transcript_window,
+                rolling_summary,
+            )
+            .await;
+        })
+    };
+    let join_arc = std::sync::Arc::new(join_handle);
+
+    // Step 3 — claim the slot with our suggestion_id + JoinHandle.
+    let active_state = app.state::<ActiveSuggestionMutex>();
+    let mut guard = match active_state.0.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    *guard = Some(ActiveSuggestion {
+        session_id: session_id.clone(),
+        suggestion_id: suggestion_id.clone(),
+        started_at: Instant::now(),
+        trigger_source,
+        abort: Some(join_arc),
     });
+    drop(guard);
 }
 
 async fn run_stream<R: Runtime>(
@@ -155,23 +231,51 @@ async fn run_stream<R: Runtime>(
     api: Arc<IntelligenceApi>,
     suggestion_id: String,
     trigger_source: TriggerSource,
-    trigger: Option<String>,
-    trigger_phrase: Option<String>,
+    mode: StreamMode,
     transcript_window: String,
     rolling_summary: Option<String>,
 ) {
-    let req = SuggestRequest {
-        trigger_source: trigger_source.as_str().to_string(),
-        trigger,
-        trigger_phrase,
-        transcript_window,
-        rolling_summary,
-    };
-
     let stream_started = Instant::now();
     let mut first_token_seen = false;
 
-    let stream_result = api.post_suggest_sse(&session_id, req).await;
+    // Two SSE endpoints, identical wire shape — pick based on mode.
+    // Box::pin both branches to a single dyn-stream so the rest of
+    // run_stream stays branch-free.
+    type SseStream = std::pin::Pin<
+        Box<
+            dyn futures_util::Stream<
+                    Item = Result<SuggestSseEvent, super::api::IntelligenceApiError>,
+                > + Send,
+        >,
+    >;
+    let stream_result: Result<SseStream, super::api::IntelligenceApiError> = match &mode {
+        StreamMode::Auto {
+            trigger,
+            trigger_phrase,
+        } => {
+            let req = SuggestRequest {
+                trigger_source: trigger_source.as_str().to_string(),
+                trigger: trigger.clone(),
+                trigger_phrase: trigger_phrase.clone(),
+                transcript_window,
+                rolling_summary,
+            };
+            api.post_suggest_sse(&session_id, req)
+                .await
+                .map(|s| Box::pin(s) as SseStream)
+        }
+        StreamMode::QuickAction(action) => {
+            let req = QuickActionRequest {
+                action: *action,
+                transcript_window,
+                rolling_summary,
+            };
+            api.post_quick_action_sse(&session_id, req)
+                .await
+                .map(|s| Box::pin(s) as SseStream)
+        }
+    };
+
     let mut stream = match stream_result {
         Ok(s) => s,
         Err(e) => {
@@ -186,9 +290,14 @@ async fn run_stream<R: Runtime>(
         }
     };
 
+    let mode_label = match &mode {
+        StreamMode::Auto { .. } => "auto",
+        StreamMode::QuickAction(a) => a.as_str(),
+    };
     log::info!(
-        "[Copilot/intel/suggest] stream open id={} source={} session={}",
+        "[Copilot/intel/suggest] stream open id={} mode={} source={} session={}",
         short(&suggestion_id),
+        mode_label,
         trigger_source.as_str(),
         short(&session_id)
     );

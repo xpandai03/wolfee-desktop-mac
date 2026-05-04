@@ -144,14 +144,21 @@ impl Default for MomentCooldownMutex {
 }
 
 /// Track whether a suggest stream is in flight (concurrency gate
-/// per plan §6.3). New trigger while an active suggestion is
-/// streaming → drop the new request.
+/// per plan §6.3). New auto trigger while an active suggestion is
+/// streaming → drop the new request. New user-clicked quick-action
+/// while an active suggestion is streaming → abort the current task
+/// and replace (Sub-prompt 4.5 Decision N1: user-click wins).
 #[derive(Debug, Clone)]
 pub struct ActiveSuggestion {
     pub session_id: String,
     pub suggestion_id: String,
     pub started_at: Instant,
     pub trigger_source: TriggerSource,
+    /// JoinHandle for the spawned SSE task, wrapped in Arc so the
+    /// struct stays Clone. Calling `.abort()` on the JoinHandle
+    /// terminates the underlying tokio task. None for entries
+    /// created from non-tauri code paths (e.g. tests).
+    pub abort: Option<std::sync::Arc<tauri::async_runtime::JoinHandle<()>>>,
 }
 
 pub struct ActiveSuggestionMutex(pub Mutex<Option<ActiveSuggestion>>);

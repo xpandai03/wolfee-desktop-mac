@@ -100,6 +100,56 @@ pub struct SuggestRequest {
     pub rolling_summary: Option<String>,
 }
 
+// ── Sub-prompt 4.5 ─────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ContextRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub about_user: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub about_call: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub objections: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuickActionType {
+    Ask,
+    FollowUp,
+    FactCheck,
+    Recap,
+}
+
+impl QuickActionType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::FollowUp => "follow_up",
+            Self::FactCheck => "fact_check",
+            Self::Recap => "recap",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "ask" => Some(Self::Ask),
+            "follow_up" => Some(Self::FollowUp),
+            "fact_check" => Some(Self::FactCheck),
+            "recap" => Some(Self::Recap),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct QuickActionRequest {
+    pub action: QuickActionType,
+    pub transcript_window: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rolling_summary: Option<String>,
+}
+
 /// Parsed SSE event from the /suggest stream.
 #[derive(Debug, Clone)]
 pub enum SuggestSseEvent {
@@ -215,6 +265,65 @@ impl IntelligenceApi {
     {
         let url = format!(
             "{}/api/copilot/sessions/{}/intelligence/suggest",
+            self.backend_url, session_id
+        );
+        let res = self
+            .suggest_client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.device_token))
+            .header("Accept", "text/event-stream")
+            .json(&req)
+            .send()
+            .await
+            .map_err(|e| IntelligenceApiError::Network(e.to_string()))?;
+        translate_status(&res)?;
+
+        let byte_stream = res
+            .bytes_stream()
+            .map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
+
+        let events = byte_stream.eventsource().map(parse_sse_event);
+        Ok(events)
+    }
+
+    // ── Sub-prompt 4.5 ─────────────────────────────────────────────
+
+    /// POST /api/copilot/sessions/:id/context — submit the 3 user-pasted
+    /// context fields. Empty/blank values are sent as `null` so the
+    /// backend stores NULL (which renders as "(not provided)" in
+    /// prompt templates). All fields independently optional.
+    pub async fn post_context(
+        &self,
+        session_id: &str,
+        req: ContextRequest,
+    ) -> Result<(), IntelligenceApiError> {
+        let url = format!(
+            "{}/api/copilot/sessions/{}/context",
+            self.backend_url, session_id
+        );
+        let res = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.device_token))
+            .json(&req)
+            .send()
+            .await
+            .map_err(|e| IntelligenceApiError::Network(e.to_string()))?;
+        translate_status(&res)?;
+        Ok(())
+    }
+
+    /// POST /api/copilot/sessions/:id/intelligence/quick-action — same
+    /// SSE shape as /suggest. Used by the 4 action buttons in the
+    /// overlay (ask/follow_up/fact_check/recap).
+    pub async fn post_quick_action_sse(
+        &self,
+        session_id: &str,
+        req: QuickActionRequest,
+    ) -> Result<impl Stream<Item = Result<SuggestSseEvent, IntelligenceApiError>>, IntelligenceApiError>
+    {
+        let url = format!(
+            "{}/api/copilot/sessions/{}/intelligence/quick-action",
             self.backend_url, session_id
         );
         let res = self
