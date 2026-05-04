@@ -162,6 +162,27 @@ pub fn run() {
         .setup(move |app| {
             let handle = app.handle().clone();
 
+            // Sub-prompt 4 fix 2026-05-04 — set activation policy to
+            // Accessory so the overlay floats above fullscreen apps
+            // on macOS Sequoia. Three previous attempts (visible_on_
+            // all_workspaces, NSScreenSaverWindowLevel,
+            // FullScreenAuxiliary collection-behavior bit) didn't fix
+            // the issue alone; macOS Sequoia changed the rules so an
+            // app must ALSO be in Accessory activation policy
+            // (LSUIElement-equivalent) for fullscreen overlay to work.
+            // Same recipe Raycast / 1Password / Spotlight use.
+            //
+            // Tradeoffs (acceptable per design Decision N7 — Wolfee
+            // Desktop is tray-driven):
+            //   - No dock icon (fine — already tray-icon-only model)
+            //   - Not visible in Cmd-Tab (fine — tray menu is the entry)
+            //   - Tray icon stays exactly the same
+            #[cfg(target_os = "macos")]
+            {
+                app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+                log::info!("[Copilot] activation policy set to Accessory");
+            }
+
             // Create tray icon
             let tray = tray::create_tray(&handle)?;
             let is_authed = auth_config.is_authenticated();
