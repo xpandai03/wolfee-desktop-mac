@@ -67,6 +67,385 @@ struct IntelligenceWorkersMutex(tokio::sync::Mutex<Option<IntelligenceWorkers>>)
 // dedicated `spawn_async`) carries over to the new client — see the
 // comment on its `spawn` method.
 
+/// Sub-prompt 4.5 context fields, captured from the context paste
+/// window. All optional — empty submission falls back to pre-4.5
+/// "no context" behavior.
+#[derive(Debug, Clone, Default)]
+struct CopilotContextFields {
+    about_user: Option<String>,
+    about_call: Option<String>,
+    objections: Option<String>,
+}
+
+impl CopilotContextFields {
+    fn is_empty(&self) -> bool {
+        self.about_user.as_ref().map_or(true, |s| s.trim().is_empty())
+            && self.about_call.as_ref().map_or(true, |s| s.trim().is_empty())
+            && self.objections.as_ref().map_or(true, |s| s.trim().is_empty())
+    }
+
+    fn from_value(v: &serde_json::Value) -> Self {
+        fn read(v: &serde_json::Value, key: &str) -> Option<String> {
+            v.get(key)
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty())
+        }
+        Self {
+            about_user: read(v, "about_user"),
+            about_call: read(v, "about_call"),
+            objections: read(v, "objections"),
+        }
+    }
+}
+
+/// Module-level session-start worker. Extracted from the old inline
+/// `start-copilot-session` action handler for Sub-prompt 4.5 so both
+/// the legacy path (no context) and the new context-window path
+/// (with 3 paste fields) share identical lifecycle plumbing. The
+/// only branch is the optional /context POST after the session is
+/// minted backend-side.
+fn spawn_session_workers(
+    handle: tauri::AppHandle,
+    tray: Arc<tauri::tray::TrayIcon>,
+    session_id: String,
+    backend_url: String,
+    device_token: String,
+    context: CopilotContextFields,
+) {
+    {
+        let copilot_mutex = handle.state::<CopilotStateMutex>();
+        *copilot_mutex.0.lock().unwrap() =
+            CopilotState::StartingSession { session_id: session_id.clone() };
+        let app_state: tauri::State<'_, AppState> = handle.state();
+        tray::update_tray_menu(
+            &tray,
+            &handle,
+            app_state.current_state(),
+            app_state.auth_token.lock().unwrap().is_some(),
+        );
+    }
+
+    tauri::async_runtime::spawn(async move {
+        let api = SessionApi::new(backend_url.clone(), device_token.clone());
+
+        // 1. Mint session id backend-side.
+        match api.create_session(&session_id).await {
+            Ok(resp) => {
+                log::info!(
+                    "[Copilot] backend session created — id={}, startedAt={}",
+                    resp.session_id, resp.started_at
+                );
+            }
+            Err(e) => {
+                log::error!(
+                    "[Copilot] create_session failed: {} — aborting start",
+                    e
+                );
+                let copilot_mutex = handle.state::<CopilotStateMutex>();
+                *copilot_mutex.0.lock().unwrap() = CopilotState::Idle;
+                let app_state: tauri::State<'_, AppState> = handle.state();
+                tray::update_tray_menu(
+                    &tray,
+                    &handle,
+                    app_state.current_state(),
+                    app_state.auth_token.lock().unwrap().is_some(),
+                );
+                copilot::context_window::close_context_window(&handle);
+                return;
+            }
+        }
+
+        // 1.5. Sub-prompt 4.5 — POST /context BEFORE audio starts so
+        //      the very first /summary/moment/suggest call sees the
+        //      paste-in fields. Best-effort: a /context failure is
+        //      logged but doesn't abort the session (degrades to
+        //      no-context mode, same as pre-4.5).
+        if !context.is_empty() {
+            let intel_api = copilot::intelligence::api::IntelligenceApi::new(
+                backend_url.clone(),
+                device_token.clone(),
+            );
+            let req = copilot::intelligence::api::ContextRequest {
+                about_user: context.about_user.clone(),
+                about_call: context.about_call.clone(),
+                objections: context.objections.clone(),
+            };
+            match intel_api.post_context(&session_id, req).await {
+                Ok(()) => log::info!("[Copilot] context posted to backend session={}", &session_id[..8.min(session_id.len())]),
+                Err(e) => log::warn!("[Copilot] /context failed (degrading to no-context): {}", e),
+            }
+        }
+
+        // 2. Start audio capture (mic + system + mux pump).
+        let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<copilot::audio::AudioFrame>(64);
+
+        let capture = match CopilotAudioCapture::start(session_id.clone(), frame_tx).await {
+            Ok(c) => c,
+            Err(e) => {
+                log::error!(
+                    "[Copilot] audio capture start failed: {} — \
+                     ending backend session and reverting state",
+                    e
+                );
+                if let AudioError::PermissionDenied(kind) = &e {
+                    let kind_str = match kind {
+                        PermissionKind::Microphone => "Microphone",
+                        PermissionKind::ScreenRecording => "ScreenRecording",
+                    };
+                    if let Err(err) = copilot::window::show_overlay(&handle) {
+                        log::warn!(
+                            "[Copilot] show_overlay for permission modal failed: {}",
+                            err
+                        );
+                    }
+                    if let Err(err) = handle.emit(
+                        "copilot-permission-needed",
+                        serde_json::json!({
+                            "kind": kind_str,
+                            "session_id": session_id.clone(),
+                        }),
+                    ) {
+                        log::warn!(
+                            "[Copilot] copilot-permission-needed emit failed: {}",
+                            err
+                        );
+                    }
+                }
+                let _ = api.end_session(&session_id, EndReason::Error).await;
+                let copilot_mutex = handle.state::<CopilotStateMutex>();
+                *copilot_mutex.0.lock().unwrap() = CopilotState::Idle;
+                let app_state: tauri::State<'_, AppState> = handle.state();
+                tray::update_tray_menu(
+                    &tray,
+                    &handle,
+                    app_state.current_state(),
+                    app_state.auth_token.lock().unwrap().is_some(),
+                );
+                copilot::context_window::close_context_window(&handle);
+                return;
+            }
+        };
+
+        // 3. Stash capture handle in managed state.
+        let cap_mutex = handle.state::<CopilotAudioCaptureMutex>();
+        *cap_mutex.0.lock().await = Some(capture);
+        drop(cap_mutex);
+
+        // 4. Transition to Listening + refresh tray BEFORE Deepgram spawn.
+        {
+            let copilot_mutex = handle.state::<CopilotStateMutex>();
+            *copilot_mutex.0.lock().unwrap() = CopilotState::Listening {
+                session_id: session_id.clone(),
+                started_at: std::time::Instant::now(),
+            };
+        }
+        let app_state: tauri::State<'_, AppState> = handle.state();
+        tray::update_tray_menu(
+            &tray,
+            &handle,
+            app_state.current_state(),
+            app_state.auth_token.lock().unwrap().is_some(),
+        );
+
+        // 5. Spawn the Deepgram WebSocket client.
+        let api_arc = std::sync::Arc::new(api);
+        let _dg_handle = DeepgramClient::spawn(
+            session_id.clone(),
+            api_arc,
+            frame_rx,
+            handle.clone(),
+        );
+
+        // 6. Spawn Sub-prompt 3 intelligence workers.
+        let workers = spawn_workers(
+            handle.clone(),
+            session_id.clone(),
+            backend_url.clone(),
+            device_token.clone(),
+        );
+        let workers_mutex = handle.state::<IntelligenceWorkersMutex>();
+        *workers_mutex.0.lock().await = Some(workers);
+        drop(workers_mutex);
+
+        // 7. Sub-prompt 4.5: now that the session is live, close the
+        //    context paste window (no-op if it was already destroyed
+        //    on a /context error path, idempotent).
+        copilot::context_window::close_context_window(&handle);
+
+        // 8. Show the overlay so the user has something to look at
+        //    immediately (auto-suggestions take ~30-60s to start
+        //    firing, but click-driven action buttons work right away).
+        if let Err(e) = copilot::window::show_overlay(&handle) {
+            log::warn!("[Copilot] show_overlay after session start failed: {}", e);
+        }
+
+        log::info!(
+            "[Copilot] session live — id={}, Deepgram + intelligence workers spawned",
+            session_id
+        );
+    });
+}
+
+/// Sub-prompt 4.5 — dispatcher for `wolfee-action` events whose
+/// payload is a JSON object with a `type` field. Carries typed args
+/// (e.g. submit-copilot-context's 3 strings, trigger-copilot-quick-action's
+/// action enum). Plain string payloads still go through the legacy
+/// match block in lib.rs::run.
+fn handle_structured_action(
+    action_type: &str,
+    payload: &serde_json::Value,
+    tray: &Arc<tauri::tray::TrayIcon>,
+    backend_url: &str,
+) {
+    let handle = tray.app_handle();
+    match action_type {
+        // ─────────────────────────────────────────
+        // SUBMIT CONTEXT → start session with paste-in fields
+        // ─────────────────────────────────────────
+        "submit-copilot-context" => {
+            log::info!("[Copilot] Context submitted — starting session");
+
+            // Idempotent: ignore if not Idle/ShowingOverlay.
+            let copilot_mutex = handle.state::<CopilotStateMutex>();
+            {
+                let cur = copilot_mutex.0.lock().unwrap();
+                if !matches!(*cur, CopilotState::Idle | CopilotState::ShowingOverlay) {
+                    log::info!(
+                        "[Copilot] Ignoring submit-context — current state: {}",
+                        *cur
+                    );
+                    return;
+                }
+            }
+
+            let device_token = {
+                let app_state: tauri::State<'_, AppState> = handle.state();
+                let token_opt = app_state.auth_token.lock().unwrap().clone();
+                match token_opt {
+                    Some(t) => t,
+                    None => {
+                        log::warn!(
+                            "[Copilot] Cannot submit context — not paired."
+                        );
+                        return;
+                    }
+                }
+            };
+
+            let context = CopilotContextFields::from_value(payload);
+            let session_id = uuid::Uuid::new_v4().to_string();
+            spawn_session_workers(
+                handle.clone(),
+                tray.clone(),
+                session_id,
+                backend_url.to_string(),
+                device_token,
+                context,
+            );
+        }
+
+        // ─────────────────────────────────────────
+        // TRIGGER QUICK-ACTION → spawn suggest_client with action
+        // ─────────────────────────────────────────
+        "trigger-copilot-quick-action" => {
+            let action = match payload
+                .get("action")
+                .and_then(|v| v.as_str())
+                .and_then(copilot::intelligence::api::QuickActionType::from_str)
+            {
+                Some(a) => a,
+                None => {
+                    log::warn!(
+                        "[Copilot] trigger-copilot-quick-action: invalid action {:?}",
+                        payload.get("action")
+                    );
+                    return;
+                }
+            };
+
+            let session_id = {
+                let copilot_mutex = handle.state::<CopilotStateMutex>();
+                let cur = copilot_mutex.0.lock().unwrap().clone();
+                match cur {
+                    CopilotState::Listening { session_id, .. }
+                    | CopilotState::Reconnecting { session_id, .. } => session_id,
+                    other => {
+                        log::debug!(
+                            "[Copilot] quick-action ignored — state: {}",
+                            other
+                        );
+                        return;
+                    }
+                }
+            };
+
+            let device_token = {
+                let app_state: tauri::State<'_, AppState> = handle.state();
+                let token_opt = app_state.auth_token.lock().unwrap().clone();
+                match token_opt {
+                    Some(t) => t,
+                    None => {
+                        log::warn!("[Copilot] quick-action ignored — not authed");
+                        return;
+                    }
+                }
+            };
+
+            let window_text = {
+                let buf = handle.state::<TranscriptBufferMutex>();
+                let g = match buf.0.lock() {
+                    Ok(g) => g,
+                    Err(_) => return,
+                };
+                let utts = g.last_n_seconds(90);
+                if utts.is_empty() {
+                    log::info!(
+                        "[Copilot] quick-action — empty transcript, sending placeholder"
+                    );
+                    "(no transcript yet)".to_string()
+                } else {
+                    copilot::intelligence::format_transcript_window(&utts)
+                }
+            };
+            let rolling_summary = match handle.state::<RollingSummaryMutex>().0.lock() {
+                Ok(g) => g.as_ref().map(|x| x.text.clone()),
+                Err(_) => None,
+            };
+
+            let api = std::sync::Arc::new(
+                copilot::intelligence::api::IntelligenceApi::new(
+                    backend_url.to_string(),
+                    device_token,
+                ),
+            );
+
+            // Sub-prompt 4 N3 — fire pending event so the overlay
+            // shows the Reasoning indicator immediately.
+            let _ = handle.emit(
+                "copilot-suggestion-pending",
+                serde_json::json!({
+                    "trigger_source": "hotkey",
+                    "trigger": action.as_str(),
+                }),
+            );
+
+            copilot::intelligence::suggest_client::spawn_for_quick_action(
+                handle.clone(),
+                session_id,
+                api,
+                action,
+                window_text,
+                rolling_summary,
+            );
+        }
+
+        other => {
+            log::warn!("[App] Unknown structured action: {}", other);
+        }
+    }
+}
+
 pub fn run() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp_millis()
@@ -203,8 +582,27 @@ pub fn run() {
             let backend_url_clone = backend_url.clone();
 
             handle.listen("wolfee-action", move |event| {
-                let action = event.payload();
-                let action = action.trim_matches('"');
+                let raw_payload = event.payload();
+
+                // Sub-prompt 4.5: structured (JSON object) payloads carry
+                // typed args (e.g. `{type: "submit-copilot-context",
+                // about_user: "..."}`). Plain string payloads (e.g.
+                // `"start-recording"`) keep the legacy match below.
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw_payload) {
+                    if let Some(obj) = parsed.as_object() {
+                        if let Some(action_type) = obj.get("type").and_then(|v| v.as_str()) {
+                            handle_structured_action(
+                                action_type,
+                                &parsed,
+                                &tray_clone,
+                                &backend_url_clone,
+                            );
+                            return;
+                        }
+                    }
+                }
+
+                let action = raw_payload.trim_matches('"');
 
                 let handle_ref = tray_clone.app_handle();
                 let state: tauri::State<'_, AppState> = handle_ref.state();
@@ -673,11 +1071,16 @@ pub fn run() {
 
                     // ─────────────────────────────────────────
                     // COPILOT (Sub-prompt 2 Phase 5 — Listening lifecycle)
+                    //
+                    // Sub-prompt 4.5 retune: the tray click no longer
+                    // immediately mints a session. Instead it opens the
+                    // context paste window. The user's submit fires a
+                    // wolfee-action with type=submit-copilot-context which
+                    // dispatches to the JSON branch above.
                     // ─────────────────────────────────────────
                     "start-copilot-session" => {
-                        log::info!("[Copilot] Tray: Start Copilot Session clicked");
+                        log::info!("[Copilot] Tray: Start Copilot Session — opening context window");
 
-                        // Idempotent: ignore if not Idle/ShowingOverlay.
                         let copilot_mutex = handle_ref.state::<CopilotStateMutex>();
                         {
                             let cur = copilot_mutex.0.lock().unwrap();
@@ -690,20 +1093,14 @@ pub fn run() {
                             }
                         }
 
-                        // Auth check — lib.rs has the device_token in AppState; backend_url
-                        // captured at builder time.
-                        let device_token = match state.auth_token.lock().unwrap().clone() {
-                            Some(t) => t,
-                            None => {
-                                log::warn!(
-                                    "[Copilot] Cannot start session — not paired. \
-                                     Click 'Link with Wolfee...' first."
-                                );
-                                return;
-                            }
-                        };
+                        if state.auth_token.lock().unwrap().is_none() {
+                            log::warn!(
+                                "[Copilot] Cannot start session — not paired. \
+                                 Click 'Link with Wolfee...' first."
+                            );
+                            return;
+                        }
 
-                        // Soft warning per Decision N6: recorder coexistence is allowed.
                         if state.current_state() == RecordingState::Recording {
                             log::warn!(
                                 "[Copilot] Notes recorder is also running — Copilot will \
@@ -711,189 +1108,17 @@ pub fn run() {
                             );
                         }
 
-                        // Client-generated session UUID per Decision N6.
-                        let session_id = uuid::Uuid::new_v4().to_string();
-                        let backend_url = backend_url_clone.clone();
+                        if let Err(e) = copilot::context_window::open_context_window(handle_ref) {
+                            log::error!("[Copilot] open_context_window failed: {}", e);
+                        }
+                    }
 
-                        // Transition to Starting + refresh tray.
-                        *copilot_mutex.0.lock().unwrap() =
-                            CopilotState::StartingSession { session_id: session_id.clone() };
-                        tray::update_tray_menu(
-                            &tray_clone,
-                            handle_ref,
-                            state.current_state(),
-                            true,
-                        );
-
-                        let tray = tray_clone.clone();
-                        let handle = handle_ref.clone();
-
-                        // Hosted on Tauri's global async runtime so the mux
-                        // pump that CopilotAudioCapture::start tokio::spawn's
-                        // inherits a long-lived runtime. spawn_async builds a
-                        // one-shot current_thread runtime that dies on closure
-                        // return, which silently cancelled the pump 3 ms after
-                        // the session went live in the 2026-05-02 verification
-                        // run. tauri::async_runtime::spawn shares Tauri's
-                        // global runtime that lives for the app lifetime.
-                        tauri::async_runtime::spawn(async move {
-                            let api = SessionApi::new(backend_url.clone(), device_token.clone());
-
-                            // 1. Mint session id backend-side.
-                            match api.create_session(&session_id).await {
-                                Ok(resp) => {
-                                    log::info!(
-                                        "[Copilot] backend session created — id={}, startedAt={}",
-                                        resp.session_id,
-                                        resp.started_at
-                                    );
-                                }
-                                Err(e) => {
-                                    log::error!(
-                                        "[Copilot] create_session failed: {} — aborting start",
-                                        e
-                                    );
-                                    let copilot_mutex = handle.state::<CopilotStateMutex>();
-                                    *copilot_mutex.0.lock().unwrap() = CopilotState::Idle;
-                                    let app_state: tauri::State<'_, AppState> = handle.state();
-                                    tray::update_tray_menu(
-                                        &tray,
-                                        &handle,
-                                        app_state.current_state(),
-                                        app_state.auth_token.lock().unwrap().is_some(),
-                                    );
-                                    return;
-                                }
-                            }
-
-                            // 2. Start audio capture (mic + system + mux pump).
-                            let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<
-                                copilot::audio::AudioFrame,
-                            >(64);
-
-                            let capture = match CopilotAudioCapture::start(
-                                session_id.clone(),
-                                frame_tx,
-                            )
-                            .await
-                            {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    log::error!(
-                                        "[Copilot] audio capture start failed: {} — \
-                                         ending backend session and reverting state",
-                                        e
-                                    );
-                                    // Phase 6: if the failure was specifically a
-                                    // TCC denial, show the overlay and emit
-                                    // copilot-permission-needed so the React
-                                    // side can render the modal with a deep
-                                    // link to the right System Settings panel.
-                                    // Other errors stay tray-only (they're
-                                    // either transient or device-unavailable —
-                                    // not user-actionable in the same way).
-                                    if let AudioError::PermissionDenied(kind) = &e {
-                                        let kind_str = match kind {
-                                            PermissionKind::Microphone => "Microphone",
-                                            PermissionKind::ScreenRecording => "ScreenRecording",
-                                        };
-                                        if let Err(err) = copilot::window::show_overlay(&handle) {
-                                            log::warn!(
-                                                "[Copilot] show_overlay for permission modal failed: {}",
-                                                err
-                                            );
-                                        }
-                                        if let Err(err) = handle.emit(
-                                            "copilot-permission-needed",
-                                            serde_json::json!({
-                                                "kind": kind_str,
-                                                "session_id": session_id.clone(),
-                                            }),
-                                        ) {
-                                            log::warn!(
-                                                "[Copilot] copilot-permission-needed emit failed: {}",
-                                                err
-                                            );
-                                        }
-                                    }
-                                    let _ = api
-                                        .end_session(&session_id, EndReason::Error)
-                                        .await;
-                                    let copilot_mutex = handle.state::<CopilotStateMutex>();
-                                    *copilot_mutex.0.lock().unwrap() = CopilotState::Idle;
-                                    let app_state: tauri::State<'_, AppState> = handle.state();
-                                    tray::update_tray_menu(
-                                        &tray,
-                                        &handle,
-                                        app_state.current_state(),
-                                        app_state.auth_token.lock().unwrap().is_some(),
-                                    );
-                                    return;
-                                }
-                            };
-
-                            // 3. Stash capture handle in managed state.
-                            //    Bind the State outside the await so its borrow
-                            //    of `handle` lives across the suspend point.
-                            let cap_mutex = handle.state::<CopilotAudioCaptureMutex>();
-                            *cap_mutex.0.lock().await = Some(capture);
-                            drop(cap_mutex);
-
-                            // 4. Transition to Listening + refresh tray BEFORE
-                            //    spawning the Deepgram client. The client's
-                            //    reconnect path flips state to Reconnecting on
-                            //    failure; doing the Listening transition first
-                            //    avoids a race where a fast initial-mint failure
-                            //    overrides StartingSession.
-                            {
-                                let copilot_mutex = handle.state::<CopilotStateMutex>();
-                                *copilot_mutex.0.lock().unwrap() = CopilotState::Listening {
-                                    session_id: session_id.clone(),
-                                    started_at: std::time::Instant::now(),
-                                };
-                            }
-                            let app_state: tauri::State<'_, AppState> = handle.state();
-                            tray::update_tray_menu(
-                                &tray,
-                                &handle,
-                                app_state.current_state(),
-                                app_state.auth_token.lock().unwrap().is_some(),
-                            );
-
-                            // 5. Spawn the Deepgram WebSocket client. It owns
-                            //    frame_rx and runs until either audio capture
-                            //    closes the channel (clean exit) or the 60s
-                            //    persistent-failure window elapses (in which
-                            //    case the wrapper emits wolfee-action:
-                            //    end-copilot-session so this same listener
-                            //    tears the session down).
-                            let api_arc = std::sync::Arc::new(api);
-                            let _dg_handle = DeepgramClient::spawn(
-                                session_id.clone(),
-                                api_arc,
-                                frame_rx,
-                                handle.clone(),
-                            );
-
-                            // 6. Spawn Sub-prompt 3 intelligence workers
-                            //    (rolling summary + moment detector). These
-                            //    consume TranscriptBufferMutex and emit
-                            //    copilot-* Tauri events for Sub-prompt 4.
-                            let workers = spawn_workers(
-                                handle.clone(),
-                                session_id.clone(),
-                                backend_url.clone(),
-                                device_token.clone(),
-                            );
-                            let workers_mutex = handle.state::<IntelligenceWorkersMutex>();
-                            *workers_mutex.0.lock().await = Some(workers);
-                            drop(workers_mutex);
-
-                            log::info!(
-                                "[Copilot] session live — id={}, Deepgram + intelligence workers spawned",
-                                session_id
-                            );
-                        });
+                    // Sub-prompt 4.5 — user closed the context window without
+                    // submitting. Just destroy the window; CopilotState stays
+                    // Idle, no session was created.
+                    "cancel-copilot-context" => {
+                        log::info!("[Copilot] Context cancelled — closing window");
+                        copilot::context_window::close_context_window(handle_ref);
                     }
 
                     "end-copilot-session" => {
