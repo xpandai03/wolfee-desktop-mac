@@ -17,7 +17,9 @@ import {
   MOCK_TRANSCRIPT_LINES,
   MOCK_SUGGESTIONS,
   MOCK_SUMMARY_TEXTS,
+  MOCK_QUICK_ACTIONS,
 } from "./fixtures";
+import type { QuickActionType } from "@/state/types";
 
 const FAKE_SESSION_ID = "mock-session-00000000";
 
@@ -168,8 +170,72 @@ export function runMockSession(): () => void {
 }
 
 /**
+ * Sub-prompt 4.5 — fire the SSE event sequence for one of the 4
+ * quick-action button mocks (ask / follow_up / fact_check / recap).
+ * Mirrors the auto-suggestion flow: pending → start → multiple
+ * delta chunks → complete. Useful for iterating visual design on
+ * the action buttons without backend running.
+ */
+export async function runMockQuickAction(action: QuickActionType): Promise<void> {
+  const sug = MOCK_QUICK_ACTIONS[action];
+  console.log(`[Copilot/dev] mock quick-action: ${action}`);
+
+  await emit("copilot-suggestion-pending", {
+    trigger_source: "hotkey",
+    trigger: sug.trigger,
+    trigger_phrase: null,
+  });
+
+  await sleep(400 + Math.random() * 400);
+
+  const suggestionId = `mock-${action}-${Date.now()}`;
+  await emit("copilot-suggestion-streaming", {
+    session_id: FAKE_SESSION_ID,
+    suggestion_id: suggestionId,
+    kind: "start",
+    text: null,
+    moment_type: sug.trigger,
+  });
+
+  const words = sug.primary.split(/(\s+)/);
+  for (let i = 0; i < words.length; i++) {
+    await sleep(50 + Math.random() * 70);
+    await emit("copilot-suggestion-streaming", {
+      session_id: FAKE_SESSION_ID,
+      suggestion_id: suggestionId,
+      kind: "delta",
+      text: words[i],
+      moment_type: null,
+    });
+  }
+
+  await sleep(120);
+  await emit("copilot-suggestion", {
+    session_id: FAKE_SESSION_ID,
+    suggestion_id: suggestionId,
+    payload: {
+      suggestion_id: suggestionId,
+      moment_type: sug.trigger,
+      primary: sug.primary,
+      secondary: sug.secondary,
+      confidence: sug.confidence,
+      reasoning: sug.reasoning,
+      ttl_seconds: 30,
+    },
+  });
+}
+
+/**
  * Wire Ctrl+Shift+M as the mock-mode toggle. Idempotent: returns
  * a teardown that removes the listener.
+ *
+ * Sub-prompt 4.5 extension — number keys 2/3/4/5 (held with
+ * Ctrl+Shift) fire the 4 quick-action mocks individually:
+ *   Ctrl+Shift+M = full mock session (auto suggestions every 30s)
+ *   Ctrl+Shift+2 = Ask mock
+ *   Ctrl+Shift+3 = Follow-up mock
+ *   Ctrl+Shift+4 = Fact-check mock
+ *   Ctrl+Shift+5 = Recap mock
  *
  * GUARD: only register if `import.meta.env.DEV`. Production builds
  * (vite build) tree-shake the call away.
@@ -179,13 +245,28 @@ export function registerMockHotkey(): () => void {
 
   let stop: (() => void) | null = null;
   const handle = (e: KeyboardEvent) => {
-    if (!(e.ctrlKey && e.shiftKey && (e.key === "M" || e.key === "m"))) return;
-    e.preventDefault();
-    if (stop) {
-      stop();
-      stop = null;
-    } else {
-      stop = runMockSession();
+    if (!(e.ctrlKey && e.shiftKey)) return;
+    if (e.key === "M" || e.key === "m") {
+      e.preventDefault();
+      if (stop) {
+        stop();
+        stop = null;
+      } else {
+        stop = runMockSession();
+      }
+      return;
+    }
+    // Sub-prompt 4.5 — number-key shortcuts for individual mock actions.
+    const map: Record<string, QuickActionType> = {
+      "2": "ask",
+      "3": "follow_up",
+      "4": "fact_check",
+      "5": "recap",
+    };
+    const action = map[e.key];
+    if (action) {
+      e.preventDefault();
+      void runMockQuickAction(action);
     }
   };
   window.addEventListener("keydown", handle);

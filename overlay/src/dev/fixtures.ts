@@ -78,3 +78,48 @@ export const MOCK_SUMMARY_TEXTS = [
   "Discovery call with VP Sales at a 50-person team. They're evaluating pipeline orchestration tools. Budget concerns surfacing — they were thinking $7-8K, our list is $12K.",
   "Mid-discovery. Prospect mentioned Salesforce as an alternative offering a steep discount. Pain point: scattered notes across reps. Budget gap of ~30% surfaced.",
 ];
+
+// Sub-prompt 4.5 — fixtures for the 4 quick-action button mocks.
+// Mirror the SuggestPayload shape so the existing reducer +
+// SuggestionCard render them without branching.
+export const MOCK_QUICK_ACTIONS: Record<
+  "ask" | "follow_up" | "fact_check" | "recap",
+  MockSuggestion
+> = {
+  ask: {
+    trigger: "general",
+    trigger_phrase: "",
+    primary:
+      "Re-anchor on what matters: 'Of everything we've covered, what's the one thing that would make this a no-brainer for you?'",
+    secondary: "Listen for hesitations — they map to your real objections.",
+    confidence: 0.75,
+    reasoning: "User pressed Ask — reframe on priority",
+  },
+  follow_up: {
+    trigger: "follow_up",
+    trigger_phrase: "",
+    primary:
+      "1. What would have to be true to lock this in by end of quarter?\n2. Who else needs to weigh in before you can sign?\n3. If pricing wasn't the issue, are we the right fit otherwise?",
+    secondary: null,
+    confidence: 0.80,
+    reasoning: "3 tactical follow-ups — qualifying, decision-maker, fit",
+  },
+  fact_check: {
+    trigger: "fact_check",
+    trigger_phrase: "",
+    primary:
+      "Their claim: 'Salesforce is offering a steep discount.' Verdict: questionable. Counter-evidence: their list price hasn't changed publicly; 'steep discount' is often quoted but rarely the final number.",
+    secondary: "Ask: 'What does that discount get you in writing?'",
+    confidence: 0.65,
+    reasoning: "Vague competitor-discount claim — surface the spec",
+  },
+  recap: {
+    trigger: "recap",
+    trigger_phrase: "",
+    primary:
+      "Recap: They flagged Salesforce as an alternative + a 30% budget gap ($8K vs $12K). You countered with ROI math. They asked about kickoff timing. Open: who else needs to approve?",
+    secondary: null,
+    confidence: 0.72,
+    reasoning: "Last 2 min — competitor + budget + buying signal",
+  },
+};
