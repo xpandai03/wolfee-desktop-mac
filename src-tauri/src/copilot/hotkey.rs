@@ -38,6 +38,20 @@ pub fn register<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error
     })?;
     log::info!("[Copilot] Registered hotkey ⌘⌥G (generate suggestion)");
 
+    // ⌘+\ — Sub-prompt 4.5 alias for ⌘⌥W. Cluely uses Cmd+\ as the
+    // hide-all gesture and PO testing showed it's the natural muscle-
+    // memory shortcut. Same toggle_overlay handler — pure aliasing,
+    // no separate behavior.
+    let hide_alias = Shortcut::new(Some(Modifiers::SUPER), Code::Backslash);
+    let app_handle3 = app.clone();
+    app.global_shortcut()
+        .on_shortcut(hide_alias, move |_app, _shortcut, event| {
+            if event.state() == ShortcutState::Pressed {
+                toggle_overlay(&app_handle3);
+            }
+        })?;
+    log::info!("[Copilot] Registered hotkey ⌘+\\ (toggle overlay alias)");
+
     Ok(())
 }
 

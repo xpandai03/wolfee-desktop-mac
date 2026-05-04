@@ -5,6 +5,7 @@
 //! Sub-prompts 2 / 3 / 5 / 6 respectively.
 
 pub mod audio;
+pub mod context_window;
 pub mod hotkey;
 pub mod intelligence;
 pub mod session;
