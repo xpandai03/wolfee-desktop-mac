@@ -6,10 +6,12 @@ import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { Strip } from "@/components/Strip";
 import { ExpandedPanel } from "@/components/ExpandedPanel";
 import {
+  activeThreadMessages,
   initialOverlayState,
   overlayReducer,
 } from "@/state/overlayReducer";
 import type {
+  ChatMessage,
   TranscriptChunkPayload,
   SummaryUpdatedPayload,
   MomentDetectedPayload,
@@ -20,6 +22,27 @@ import type {
   QuickActionType,
   ExpandedTab,
 } from "@/state/types";
+
+/**
+ * Sub-prompt 4.7 — flatten a ChatMessage into the wire shape the
+ * backend expects in `chat_history` (a list of {role, content}
+ * pairs). User-question → role:user; ai-response / quick-action-
+ * result / auto-suggestion → role:assistant. Auto-suggestions don't
+ * normally end up in user threads but the type guard is cheap.
+ */
+function toChatHistoryWire(
+  msg: ChatMessage,
+): { role: "user" | "assistant"; content: string } | null {
+  switch (msg.type) {
+    case "user-question":
+      return { role: "user", content: msg.question };
+    case "ai-response":
+      return msg.text ? { role: "assistant", content: msg.text } : null;
+    case "quick-action-result":
+    case "auto-suggestion":
+      return { role: "assistant", content: msg.text };
+  }
+}
 
 /**
  * Sub-prompt 4.6 (Cluely 1:1) — root overlay component. Two visual
@@ -132,6 +155,7 @@ export default function CopilotOverlay() {
     let chatCompleteUnlisten: UnlistenFn | undefined;
     let chatFailedUnlisten: UnlistenFn | undefined;
     let pauseStateUnlisten: UnlistenFn | undefined;
+    let newThreadUnlisten: UnlistenFn | undefined;
 
     void (async () => {
       permUnlisten = await listen<PermissionNeededPayload>(
@@ -262,6 +286,19 @@ export default function CopilotOverlay() {
           setIsPaused(event.payload.paused);
         },
       );
+
+      // Sub-prompt 4.7 — ⌘⇧N hotkey from Rust dispatches NEW_THREAD
+      // and expands the panel so the user lands on the fresh chat.
+      newThreadUnlisten = await listen("copilot-new-thread", () => {
+        const threadId = `thread-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        dispatch({ type: "NEW_THREAD", threadId });
+        if (modeRef.current !== "expanded") {
+          void emit("wolfee-action", "expand-overlay");
+        }
+        window.setTimeout(() => {
+          inputRef.current?.focus();
+        }, 80);
+      });
     })();
 
     return () => {
@@ -280,6 +317,7 @@ export default function CopilotOverlay() {
       chatCompleteUnlisten?.();
       chatFailedUnlisten?.();
       pauseStateUnlisten?.();
+      newThreadUnlisten?.();
     };
   }, []);
 
@@ -313,6 +351,14 @@ export default function CopilotOverlay() {
     dispatch({ type: "UPDATE_INPUT_DRAFT", value });
   };
   const handleQuickAction = (action: QuickActionType) => {
+    // Sub-prompt 4.7 — auto-switch to Chat tab so the response is
+    // visible without an extra click. Also expand the panel if the
+    // user fired a quick-action while in strip mode (e.g. via a
+    // future hotkey path).
+    dispatch({ type: "SET_ACTIVE_TAB", tab: "chat" });
+    if (overlayState.mode !== "expanded") {
+      void emit("wolfee-action", "expand-overlay");
+    }
     void emit("wolfee-action", {
       type: "trigger-copilot-quick-action",
       action,
@@ -321,17 +367,37 @@ export default function CopilotOverlay() {
   const handleSubmitQuestion = (question: string) => {
     const questionId = `q-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const aiResponseId = `r-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    // Sub-prompt 4.7 — snapshot the active thread's prior messages
+    // BEFORE the dispatch so the chat_history we send to the backend
+    // doesn't include the just-pushed user question + AI skeleton.
+    const priorMessages = activeThreadMessages(overlayState);
     dispatch({
       type: "SUBMIT_USER_QUESTION",
       question,
       questionId,
       aiResponseId,
     });
+    const chatHistory = priorMessages
+      .map(toChatHistoryWire)
+      .filter((m): m is { role: "user" | "assistant"; content: string } => m !== null);
     void emit("wolfee-action", {
       type: "submit-chat-question",
       question,
       ai_response_id: aiResponseId,
+      chat_history: chatHistory,
     });
+  };
+
+  // Sub-prompt 4.7 — multi-thread management.
+  const handleNewThread = () => {
+    const threadId = `thread-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    dispatch({ type: "NEW_THREAD", threadId });
+  };
+  const handleSwitchThread = (threadId: string) => {
+    dispatch({ type: "SWITCH_THREAD", threadId });
+  };
+  const handleDeleteThread = (threadId: string) => {
+    dispatch({ type: "DELETE_THREAD", threadId });
   };
 
   const hasActiveSession = overlayState.fullTranscript.length > 0;
@@ -339,7 +405,12 @@ export default function CopilotOverlay() {
   const showPermissionModal = permissionNeeded !== null;
 
   return (
-    <div className="w-screen h-screen flex flex-col bg-zinc-950 text-zinc-100 select-none overflow-hidden">
+    // Sub-prompt 4.7 — the outer wrapper is now transparent so the
+    // glassmorphic strip + panel show their rounded edges over the
+    // desktop. Each component owns its own backdrop (Strip, Panel,
+    // and the ContextWindow page draw their own bg-zinc-950/70 +
+    // backdrop-blur). Wrapper just sizes the layout.
+    <div className="w-screen h-screen flex flex-col text-zinc-100 select-none overflow-hidden">
       <Strip
         mode={overlayState.mode}
         uiPhase={overlayState.uiPhase}
@@ -357,14 +428,21 @@ export default function CopilotOverlay() {
           <ExpandedPanel
             key="panel"
             activeTab={overlayState.activeTab}
-            chatThread={overlayState.chatThread}
+            chatThread={activeThreadMessages(overlayState)}
+            chatThreads={overlayState.chatThreads}
+            activeThreadId={overlayState.activeThreadId}
+            autoSuggestionStream={overlayState.autoSuggestionStream}
             fullTranscript={overlayState.fullTranscript}
             inputDraft={overlayState.inputDraft}
             isAiStreaming={isAiStreaming}
+            chatTabPulseAt={overlayState.chatTabPulseAt}
             onTabChange={handleTabChange}
             onDraftChange={handleDraftChange}
             onQuickAction={handleQuickAction}
             onSubmitQuestion={handleSubmitQuestion}
+            onNewThread={handleNewThread}
+            onSwitchThread={handleSwitchThread}
+            onDeleteThread={handleDeleteThread}
             inputRef={inputRef}
             bodyOverride={
               showPermissionModal ? (

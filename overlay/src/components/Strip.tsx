@@ -52,11 +52,18 @@ export function Strip({
       data-tauri-drag-region
       className={cn(
         "flex items-center justify-between h-11 px-3 gap-2",
-        "bg-zinc-950/95 backdrop-blur-sm",
-        "border-b border-white/10",
-        // Bottom border vanishes when expanded so the strip + panel
-        // read as one continuous surface.
-        mode === "expanded" && "border-b-zinc-800/60",
+        // Sub-prompt 4.7 — glassmorphic look: frosted backdrop blur +
+        // semi-transparent zinc + rounded edges + subtle highlight
+        // border + drop shadow for depth. Window must be transparent
+        // for the blur to actually frost what's behind it (set on
+        // create_overlay_window via `transparent: true`).
+        "bg-zinc-950/70 backdrop-blur-md backdrop-saturate-150",
+        "border border-white/10",
+        // Strip-only state: full pill look with rounded corners.
+        // Expanded state: top corners rounded, bottom corners merge
+        // into the panel below (which is also rounded as a unit).
+        mode === "expanded" ? "rounded-t-2xl rounded-b-none" : "rounded-2xl",
+        "shadow-lg shadow-black/40",
         "select-none cursor-grab active:cursor-grabbing",
       )}
     >

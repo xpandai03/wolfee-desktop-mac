@@ -19,13 +19,18 @@ pub fn create_overlay_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()
         return Ok(());
     }
 
-    // Note: Tauri 2's `transparent(true)` requires the `macos-private-api` feature
-    // (uses Apple private APIs). We ship Sub-prompt 1 with a solid dark backdrop;
-    // Sub-prompt 4 (UI polish) can opt in to private-API transparency if the design
-    // calls for it.
+    // Sub-prompt 4.7 — opt into Tauri's `transparent(true)` for the
+    // glassmorphic strip + panel look. This requires the
+    // `macos-private-api` Cargo feature + `app.macOSPrivateApi: true`
+    // in tauri.conf.json (both set 2026-05-04). With those two flags
+    // and the body's transparent CSS, the rounded edges show through
+    // to whatever's behind the window and the backdrop-blur frosts
+    // it like Cluely does. Apple's private APIs — fine for our DMG
+    // distribution, would block App Store but we don't ship there.
     let overlay = WebviewWindowBuilder::new(app, OVERLAY_LABEL, WebviewUrl::App("index.html".into()))
         .title("Wolfee Copilot")
         .decorations(false)
+        .transparent(true)
         .always_on_top(true)
         // Critical for the "fullscreen Zoom/Meet" use case: by default,
         // each macOS fullscreen app gets its own Space, and an

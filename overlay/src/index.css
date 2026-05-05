@@ -9,7 +9,12 @@ body,
   height: 100%;
   margin: 0;
   padding: 0;
-  background: #09090b; /* zinc-950 — solid dark; transparency lands with macos-private-api in SP4 */
+  /* Sub-prompt 4.7 — body is fully transparent so the strip + panel
+   * (which have their own bg-zinc-950/70 backdrop-blur) show their
+   * rounded edges over the desktop. Tauri 2's transparent(true) +
+   * macos-private-api feature flag carry the alpha channel through
+   * to the OS. Body color was solid #09090b in Sub-prompt 1-4.6. */
+  background: transparent;
   color-scheme: dark;
   -webkit-font-smoothing: antialiased;
   font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Inter, sans-serif;

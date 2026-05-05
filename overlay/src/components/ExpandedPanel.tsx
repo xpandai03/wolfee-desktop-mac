@@ -4,8 +4,10 @@ import { cn } from "@/lib/utils";
 import { ChatThread } from "./ChatThread";
 import { TranscriptView } from "./TranscriptView";
 import { InputBar } from "./InputBar";
+import { ThreadSwitcher } from "./ThreadSwitcher";
 import type {
   ChatMessage,
+  ChatThread as ChatThreadModel,
   ExpandedTab,
   QuickActionType,
   Utterance,
@@ -37,14 +39,29 @@ import type {
 
 interface Props {
   activeTab: ExpandedTab;
+  /** Messages of the active thread only (selector-derived). */
   chatThread: ChatMessage[];
+  /** All threads for the switcher chip-row. */
+  chatThreads: ChatThreadModel[];
+  activeThreadId: string | null;
+  /** Auto-fired moment suggestions — separate ribbon, not part of threads. */
+  autoSuggestionStream: ChatMessage[];
   fullTranscript: Utterance[];
   inputDraft: string;
   isAiStreaming: boolean;
+  /**
+   * Sub-prompt 4.7 — when truthy, briefly highlights the Chat tab
+   * (subtle ring) to signal that new content arrived while the user
+   * was on Transcript. Cleared by the reducer 2.5s after set.
+   */
+  chatTabPulseAt: number | null;
   onTabChange: (tab: ExpandedTab) => void;
   onDraftChange: (value: string) => void;
   onQuickAction: (action: QuickActionType) => void;
   onSubmitQuestion: (question: string) => void;
+  onNewThread: () => void;
+  onSwitchThread: (threadId: string) => void;
+  onDeleteThread: (threadId: string) => void;
   inputRef?: React.RefObject<HTMLTextAreaElement | null>;
   /**
    * Optional override for the body content (e.g. Phase 6 permission
@@ -57,13 +74,20 @@ interface Props {
 export function ExpandedPanel({
   activeTab,
   chatThread,
+  chatThreads,
+  activeThreadId,
+  autoSuggestionStream,
   fullTranscript,
   inputDraft,
   isAiStreaming,
+  chatTabPulseAt,
   onTabChange,
   onDraftChange,
   onQuickAction,
   onSubmitQuestion,
+  onNewThread,
+  onSwitchThread,
+  onDeleteThread,
   inputRef,
   bodyOverride,
 }: Props) {
@@ -73,17 +97,38 @@ export function ExpandedPanel({
       animate={{ opacity: 1, y: 0 }}
       exit={{ opacity: 0, y: -8 }}
       transition={{ duration: 0.18, ease: "easeOut" }}
-      className="flex-1 flex flex-col min-h-0 bg-zinc-950"
+      // Sub-prompt 4.7 — match the strip's glassmorphic look so the
+      // strip + panel read as one floating element. Top corners
+      // squared (the strip owns those); bottom corners rounded.
+      className="flex-1 flex flex-col min-h-0 bg-zinc-950/70 backdrop-blur-md backdrop-saturate-150 border border-t-0 border-white/10 rounded-b-2xl shadow-lg shadow-black/40"
     >
       {bodyOverride ? (
         <div className="flex-1 min-h-0">{bodyOverride}</div>
       ) : (
         <>
-          <TabBar activeTab={activeTab} onTabChange={onTabChange} />
+          <TabBar
+            activeTab={activeTab}
+            onTabChange={onTabChange}
+            chatTabPulseAt={chatTabPulseAt}
+          />
+
+          {activeTab === "chat" && (
+            <ThreadSwitcher
+              threads={chatThreads}
+              activeThreadId={activeThreadId}
+              onNewThread={onNewThread}
+              onSwitchThread={onSwitchThread}
+              onDeleteThread={onDeleteThread}
+            />
+          )}
 
           <div className="flex-1 flex flex-col min-h-0">
             {activeTab === "chat" ? (
-              <ChatThread messages={chatThread} />
+              <ChatThread
+                messages={chatThread}
+                autoSuggestionStream={autoSuggestionStream}
+                hasActiveThread={activeThreadId !== null}
+              />
             ) : (
               <TranscriptView utterances={fullTranscript} />
             )}
@@ -95,6 +140,7 @@ export function ExpandedPanel({
             onDraftChange={onDraftChange}
             onQuickAction={onQuickAction}
             onSubmitQuestion={onSubmitQuestion}
+            onNewThread={onNewThread}
             inputRef={inputRef}
           />
         </>
@@ -106,9 +152,10 @@ export function ExpandedPanel({
 interface TabBarProps {
   activeTab: ExpandedTab;
   onTabChange: (tab: ExpandedTab) => void;
+  chatTabPulseAt: number | null;
 }
 
-function TabBar({ activeTab, onTabChange }: TabBarProps) {
+function TabBar({ activeTab, onTabChange, chatTabPulseAt }: TabBarProps) {
   return (
     <div
       role="tablist"
@@ -119,6 +166,7 @@ function TabBar({ activeTab, onTabChange }: TabBarProps) {
         active={activeTab === "chat"}
         onClick={() => onTabChange("chat")}
         label="Chat"
+        pulse={chatTabPulseAt !== null && activeTab !== "chat"}
       />
       <Tab
         active={activeTab === "transcript"}
@@ -133,9 +181,10 @@ interface TabProps {
   active: boolean;
   onClick: () => void;
   label: string;
+  pulse?: boolean;
 }
 
-function Tab({ active, onClick, label }: TabProps) {
+function Tab({ active, onClick, label, pulse }: TabProps) {
   return (
     <button
       type="button"
@@ -153,6 +202,17 @@ function Tab({ active, onClick, label }: TabProps) {
         <motion.span
           layoutId="tab-underline"
           className="absolute left-2 right-2 -bottom-px h-[2px] rounded-full bg-copilot-accent"
+        />
+      )}
+      {/* Sub-prompt 4.7 — pulse dot on the inactive Chat tab when
+          new content arrives. Auto-clears via reducer TICK after 2.5s. */}
+      {pulse && (
+        <motion.span
+          key={`pulse-${label}`}
+          initial={{ opacity: 0, scale: 0.6 }}
+          animate={{ opacity: 1, scale: 1 }}
+          exit={{ opacity: 0 }}
+          className="absolute right-1 top-1.5 w-1.5 h-1.5 rounded-full bg-copilot-accent shadow-[0_0_6px_rgba(34,211,238,0.7)]"
         />
       )}
     </button>
