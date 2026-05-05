@@ -85,6 +85,9 @@ export default function CopilotOverlay() {
   );
   const [isPaused, setIsPaused] = useState(false);
   const [hasFinalizedSession, setHasFinalizedSession] = useState(false);
+  // Sub-prompt 4.9 — surface finalize failures to the user so a missing
+  // recap on wolfee.io isn't silently swallowed. Auto-clears 6s after set.
+  const [finalizeFailureReason, setFinalizeFailureReason] = useState<string | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   // Sub-prompt 4.8 — most recently finalized session id (drives the
   // View on Web link target). Ref so the click handler stays stable.
@@ -166,6 +169,7 @@ export default function CopilotOverlay() {
     let pauseStateUnlisten: UnlistenFn | undefined;
     let newThreadUnlisten: UnlistenFn | undefined;
     let finalizedUnlisten: UnlistenFn | undefined;
+    let sessionFailedUnlisten: UnlistenFn | undefined;
 
     void (async () => {
       permUnlisten = await listen<PermissionNeededPayload>(
@@ -309,6 +313,18 @@ export default function CopilotOverlay() {
         setHasFinalizedSession(true);
       });
 
+      // Sub-prompt 4.9 — finalize failure surfacing. Rust emits this
+      // when the /finalize POST returns non-2xx or networks out. Show
+      // the user a brief banner so a missing recap on wolfee.io
+      // isn't silently swallowed.
+      sessionFailedUnlisten = await listen<{
+        session_id: string;
+        reason: string;
+      }>("copilot-session-failed", (event) => {
+        console.warn("[Copilot] session finalize failed:", event.payload);
+        setFinalizeFailureReason(event.payload.reason || "unknown error");
+      });
+
       // Sub-prompt 4.7 — ⌘⇧N hotkey from Rust dispatches NEW_THREAD
       // and expands the panel so the user lands on the fresh chat.
       newThreadUnlisten = await listen("copilot-new-thread", () => {
@@ -341,8 +357,18 @@ export default function CopilotOverlay() {
       pauseStateUnlisten?.();
       newThreadUnlisten?.();
       finalizedUnlisten?.();
+      sessionFailedUnlisten?.();
     };
   }, []);
+
+  // Sub-prompt 4.9 — auto-clear the finalize failure banner after 6s.
+  useEffect(() => {
+    if (finalizeFailureReason === null) return;
+    const t = window.setTimeout(() => {
+      setFinalizeFailureReason(null);
+    }, 6000);
+    return () => window.clearTimeout(t);
+  }, [finalizeFailureReason]);
 
   // ── Strip control handlers ─────────────────────────────────────
   const handlePauseToggle = () => {
@@ -498,6 +524,17 @@ export default function CopilotOverlay() {
         onAppsClick={handleAppsClick}
         onClose={handleClose}
       />
+
+      {/* Sub-prompt 4.9 — finalize-failure banner. Pinned just below
+          the Strip so it's visible regardless of mode (strip vs
+          expanded). 6s auto-dismiss. Surfacing this fixes the silent
+          swallow that Issue 4 surfaced. */}
+      {finalizeFailureReason && (
+        <div className="px-3 py-1.5 bg-red-500/15 border-y border-red-500/30 backdrop-blur-md text-[11px] text-red-200 flex items-center gap-2 shrink-0">
+          <span className="font-semibold uppercase tracking-wider text-red-300">Recap upload failed —</span>
+          <span className="truncate">{finalizeFailureReason}</span>
+        </div>
+      )}
 
       <AnimatePresence initial={false}>
         {overlayState.mode === "expanded" && (

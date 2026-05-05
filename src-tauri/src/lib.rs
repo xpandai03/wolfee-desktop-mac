@@ -891,10 +891,23 @@ fn handle_structured_action(
                         }
                     }
                     Err(e) => {
-                        log::warn!(
+                        // Sub-prompt 4.9 — surface failures instead of
+                        // swallowing. Desktop overlay listens for this
+                        // event + renders a toast so the user knows the
+                        // recap won't appear at wolfee.io. Body excerpt
+                        // is captured by api.rs::finalize_session and
+                        // included in the Display impl of the error.
+                        log::error!(
                             "[Copilot] finalize_session failed: {} — session={}",
                             e,
                             &session_id_for_log[..8.min(session_id_for_log.len())]
+                        );
+                        let _ = handle_clone.emit(
+                            "copilot-session-failed",
+                            serde_json::json!({
+                                "session_id": session_id_for_log,
+                                "reason": e.to_string(),
+                            }),
                         );
                     }
                 }

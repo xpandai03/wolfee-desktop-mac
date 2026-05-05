@@ -556,7 +556,39 @@ impl IntelligenceApi {
             .send()
             .await
             .map_err(|e| IntelligenceApiError::Network(e.to_string()))?;
-        translate_status(&res)?;
+
+        // Sub-prompt 4.9 (Issue 4 instrumentation): unlike the other
+        // call sites, finalize_session captures the response body on
+        // non-2xx so the Rust handler can surface it. translate_status
+        // discards body for backward compat with the streaming SSE
+        // calls; we read it here BEFORE handing off to translate_status.
+        let status = res.status();
+        if !status.is_success() {
+            // Consume the response body — read up to ~1KB so we don't
+            // OOM on a giant HTML error page.
+            let body_text = match res.text().await {
+                Ok(t) => t.chars().take(1024).collect::<String>(),
+                Err(_) => String::from("(body read failed)"),
+            };
+            log::warn!(
+                "[Copilot/intel] finalize_session HTTP {} body: {}",
+                status.as_u16(),
+                body_text
+            );
+            if status.as_u16() == 401 {
+                return Err(IntelligenceApiError::Unauthorized);
+            }
+            if status.is_client_error() {
+                return Err(IntelligenceApiError::BadRequest {
+                    status: status.as_u16(),
+                    body: body_text,
+                });
+            }
+            return Err(IntelligenceApiError::ServerError {
+                status: status.as_u16(),
+                body: body_text,
+            });
+        }
         let body: FinalizeSessionResponse = res
             .json()
             .await
