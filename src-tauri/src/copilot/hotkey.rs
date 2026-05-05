@@ -52,6 +52,56 @@ pub fn register<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error
         })?;
     log::info!("[Copilot] Registered hotkey ⌘+\\ (toggle overlay alias)");
 
+    // ⌘+Enter — Sub-prompt 4.6 (Cluely 1:1) — focus the chat input
+    // box. If the panel is collapsed, expand it first; either way
+    // emit copilot-focus-input which the React side handles.
+    let focus_input_shortcut = Shortcut::new(Some(Modifiers::SUPER), Code::Enter);
+    let app_handle4 = app.clone();
+    app.global_shortcut()
+        .on_shortcut(focus_input_shortcut, move |_app, _shortcut, event| {
+            if event.state() == ShortcutState::Pressed {
+                use tauri::Emitter;
+                // Make sure the strip is visible before focus. If it's
+                // hidden the user can't see what they're typing into.
+                if !window::is_overlay_visible(&app_handle4) {
+                    if let Err(e) = window::show_overlay(&app_handle4) {
+                        log::warn!("[Copilot] ⌘+Enter show_overlay failed: {}", e);
+                        return;
+                    }
+                }
+                let _ = app_handle4.emit("copilot-focus-input", ());
+            }
+        })?;
+    log::info!("[Copilot] Registered hotkey ⌘+Enter (focus chat input)");
+
+    // Ctrl+Arrow — Sub-prompt 4.6 (Cluely 1:1) accessibility — nudge
+    // the overlay window 20px in the arrow direction. Mirrors Cluely's
+    // keyboard-only repositioning pattern.
+    register_nudge(app, Code::ArrowUp, 0, -20)?;
+    register_nudge(app, Code::ArrowDown, 0, 20)?;
+    register_nudge(app, Code::ArrowLeft, -20, 0)?;
+    register_nudge(app, Code::ArrowRight, 20, 0)?;
+    log::info!("[Copilot] Registered hotkey ⌃+arrows (nudge overlay 20px)");
+
+    Ok(())
+}
+
+fn register_nudge<R: Runtime>(
+    app: &AppHandle<R>,
+    arrow: Code,
+    dx: i32,
+    dy: i32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let shortcut = Shortcut::new(Some(Modifiers::CONTROL), arrow);
+    let app_handle = app.clone();
+    app.global_shortcut()
+        .on_shortcut(shortcut, move |_app, _shortcut, event| {
+            if event.state() == ShortcutState::Pressed {
+                if let Err(e) = window::nudge_overlay(&app_handle, dx, dy) {
+                    log::warn!("[Copilot] nudge_overlay failed: {}", e);
+                }
+            }
+        })?;
     Ok(())
 }
 

@@ -1,10 +1,17 @@
-use tauri::{AppHandle, Manager, PhysicalPosition, Runtime, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, LogicalSize, Manager, PhysicalPosition, Runtime, WebviewUrl, WebviewWindowBuilder};
 
 pub const OVERLAY_LABEL: &str = "copilot-overlay";
 
-const OVERLAY_WIDTH: f64 = 420.0;
-const OVERLAY_HEIGHT: f64 = 280.0;
-const TOP_MARGIN: f64 = 40.0;
+// Sub-prompt 4.6 (Cluely 1:1 redesign): single window with two
+// dynamically-sized modes. Strip is the always-visible thin bar at
+// the top of the screen (5 controls + status); Expanded reveals the
+// Chat/Transcript panel underneath. Same window — `set_size` flips
+// between them so the position stays stable on expand/collapse.
+const STRIP_WIDTH: f64 = 600.0;
+const STRIP_HEIGHT: f64 = 44.0;
+const EXPANDED_WIDTH: f64 = 600.0;
+const EXPANDED_HEIGHT: f64 = 520.0;
+const TOP_MARGIN: f64 = 24.0;
 
 pub fn create_overlay_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     if app.get_webview_window(OVERLAY_LABEL).is_some() {
@@ -31,8 +38,12 @@ pub fn create_overlay_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()
         // Zoom in fullscreen, overlay only appeared on the home Space.
         .visible_on_all_workspaces(true)
         .skip_taskbar(true)
-        .resizable(false)
-        .inner_size(OVERLAY_WIDTH, OVERLAY_HEIGHT)
+        // Sub-prompt 4.6 — must be resizable for the strip→expanded
+        // transition. We still hide the resize affordance (no
+        // decorations + invisible-by-default border) so the user
+        // never sees a resize handle.
+        .resizable(true)
+        .inner_size(STRIP_WIDTH, STRIP_HEIGHT)
         .visible(false)
         .focused(false)
         .shadow(false)
@@ -128,7 +139,7 @@ fn position_top_center<R: Runtime>(window: &tauri::WebviewWindow<R>) {
     };
     let size = monitor.size();
     let scale = monitor.scale_factor();
-    let window_px = (OVERLAY_WIDTH * scale) as i32;
+    let window_px = (STRIP_WIDTH * scale) as i32;
     let x = ((size.width as i32) - window_px) / 2;
     let y = (TOP_MARGIN * scale) as i32;
     if let Err(e) = window.set_position(PhysicalPosition { x, y }) {
@@ -144,16 +155,15 @@ pub fn show_overlay<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
             return Ok(());
         }
     };
-    // Re-position each time so monitor changes (lid open / external display) are honored.
-    position_top_center(&window);
+    // Sub-prompt 4.6: always restore to strip mode on show. Don't
+    // re-position: Cluely lets the user drag the window anywhere
+    // and expects it to stay there for the session. We only
+    // re-center on a fresh app launch (the build phase above).
+    let _ = set_strip_mode(&window);
     window.show()?;
     // 2026-05-04: do NOT call set_focus(). The overlay should appear
     // ON TOP of whatever the user is working in (Chrome, Zoom, etc.)
-    // without stealing keyboard focus from that app. Click-on-overlay
-    // gives focus naturally if the user wants to interact (Esc to
-    // dismiss, etc.). Stealing focus + auto-hiding on focus loss
-    // (the prior pattern) was the root cause of the "blacked out"
-    // bug surfaced by PO 2026-05-04.
+    // without stealing keyboard focus from that app.
     Ok(())
 }
 
@@ -168,4 +178,77 @@ pub fn is_overlay_visible<R: Runtime>(app: &AppHandle<R>) -> bool {
     app.get_webview_window(OVERLAY_LABEL)
         .and_then(|w| w.is_visible().ok())
         .unwrap_or(false)
+}
+
+// ── Sub-prompt 4.6: strip / expanded mode helpers ───────────────────
+
+fn set_strip_mode<R: Runtime>(window: &tauri::WebviewWindow<R>) -> tauri::Result<()> {
+    window.set_size(LogicalSize::new(STRIP_WIDTH, STRIP_HEIGHT))?;
+    Ok(())
+}
+
+fn set_expanded_mode<R: Runtime>(window: &tauri::WebviewWindow<R>) -> tauri::Result<()> {
+    window.set_size(LogicalSize::new(EXPANDED_WIDTH, EXPANDED_HEIGHT))?;
+    Ok(())
+}
+
+/// Grow the overlay to expanded mode (~600×520). Idempotent — calling
+/// twice is harmless. Position stays put (no re-center) so the user's
+/// drag is preserved.
+pub fn expand_overlay<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
+    let window = match app.get_webview_window(OVERLAY_LABEL) {
+        Some(w) => w,
+        None => {
+            log::warn!("[Copilot] expand_overlay: window not found");
+            return Ok(());
+        }
+    };
+    set_expanded_mode(&window)?;
+    log::debug!("[Copilot] overlay expanded to {}x{}", EXPANDED_WIDTH, EXPANDED_HEIGHT);
+    Ok(())
+}
+
+/// Shrink the overlay back to strip mode (~600×44). Idempotent.
+pub fn collapse_overlay<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
+    let window = match app.get_webview_window(OVERLAY_LABEL) {
+        Some(w) => w,
+        None => {
+            log::warn!("[Copilot] collapse_overlay: window not found");
+            return Ok(());
+        }
+    };
+    set_strip_mode(&window)?;
+    log::debug!("[Copilot] overlay collapsed to {}x{}", STRIP_WIDTH, STRIP_HEIGHT);
+    Ok(())
+}
+
+/// Sub-prompt 4.6 — Ctrl+Arrow accessibility repositioning. Moves the
+/// overlay window by `dx`/`dy` physical pixels. Bounds-checked against
+/// the primary monitor so the user can't accidentally drag it off
+/// screen.
+pub fn nudge_overlay<R: Runtime>(app: &AppHandle<R>, dx: i32, dy: i32) -> tauri::Result<()> {
+    let window = match app.get_webview_window(OVERLAY_LABEL) {
+        Some(w) => w,
+        None => return Ok(()),
+    };
+    let pos = window.outer_position()?;
+    let size = window.outer_size()?;
+    let mut new_x = pos.x + dx;
+    let mut new_y = pos.y + dy;
+
+    // Clamp to monitor bounds — leave at least 20px of the window
+    // on screen so the user always has a drag handle.
+    if let Ok(Some(monitor)) = window.current_monitor() {
+        let m = monitor.size();
+        let min_visible: i32 = 20;
+        new_x = new_x
+            .max(min_visible - size.width as i32)
+            .min(m.width as i32 - min_visible);
+        new_y = new_y
+            .max(0)
+            .min(m.height as i32 - min_visible);
+    }
+
+    window.set_position(PhysicalPosition { x: new_x, y: new_y })?;
+    Ok(())
 }
