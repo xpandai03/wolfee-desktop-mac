@@ -153,6 +153,18 @@ pub struct QuickActionRequest {
     /// backend ask.md prompt branches on this field's presence.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_question: Option<String>,
+    /// Sub-prompt 4.7 — prior messages from the active chat thread
+    /// (oldest → newest). Backend caps + truncates; we just forward.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub chat_history: Vec<ChatHistoryEntry>,
+}
+
+/// Sub-prompt 4.7 — single message in a chat thread, in the wire
+/// shape the backend's chat_history validation expects.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatHistoryEntry {
+    pub role: String, // "user" | "assistant"
+    pub content: String,
 }
 
 /// Parsed SSE event from the /suggest stream.
@@ -167,11 +179,21 @@ pub enum SuggestSseEvent {
     },
     Complete {
         payload: SuggestPayload,
+        /// Sub-prompt 4.7 — populated for fact-check verdicts; empty
+        /// for other actions. Forwarded as-is to the desktop event.
+        sources: Vec<FactCheckSource>,
     },
     Error {
         reason: String,
     },
     Done,
+}
+
+/// Sub-prompt 4.7 — citation chip from a fact-check response.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FactCheckSource {
+    pub title: String,
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -399,7 +421,19 @@ fn parse_sse_event(
                 .ok_or_else(|| IntelligenceApiError::Decode("complete missing payload".into()))?;
             let payload: SuggestPayload = serde_json::from_value(payload_v.clone())
                 .map_err(|e| IntelligenceApiError::Decode(format!("complete payload: {e}")))?;
-            Ok(SuggestSseEvent::Complete { payload })
+            // Sub-prompt 4.7 — sources alongside the payload (fact-check
+            // path only; absent for other actions). Tolerate missing /
+            // wrong-shaped — fall back to empty.
+            let sources: Vec<FactCheckSource> = parsed
+                .get("sources")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|s| serde_json::from_value::<FactCheckSource>(s.clone()).ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(SuggestSseEvent::Complete { payload, sources })
         }
         "error" => {
             let reason = parsed

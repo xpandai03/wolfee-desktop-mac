@@ -524,6 +524,30 @@ fn handle_structured_action(
                 Err(_) => None,
             };
 
+            // Sub-prompt 4.7 — forward thread history for memory.
+            let chat_history: Vec<copilot::intelligence::api::ChatHistoryEntry> =
+                payload
+                    .get("chat_history")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|entry| {
+                                let role = entry.get("role")?.as_str()?;
+                                let content = entry.get("content")?.as_str()?;
+                                if role != "user" && role != "assistant" {
+                                    return None;
+                                }
+                                Some(
+                                    copilot::intelligence::api::ChatHistoryEntry {
+                                        role: role.to_string(),
+                                        content: content.to_string(),
+                                    },
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
             let api = std::sync::Arc::new(
                 copilot::intelligence::api::IntelligenceApi::new(
                     backend_url.to_string(),
@@ -537,9 +561,31 @@ fn handle_structured_action(
                 api,
                 ai_response_id,
                 question,
+                chat_history,
                 window_text,
                 rolling_summary,
             );
+        }
+
+        // ─────────────────────────────────────────
+        // Sub-prompt 4.7 — open an external URL (fact-check sources).
+        // ─────────────────────────────────────────
+        "open-external-url" => {
+            let url = match payload.get("url").and_then(|v| v.as_str()) {
+                Some(u) if !u.is_empty() => u,
+                _ => {
+                    log::warn!("[Copilot] open-external-url: missing/empty url");
+                    return;
+                }
+            };
+            // Only allow http(s) — defense in depth against javascript: /
+            // file: URLs sneaking in from a malformed annotation.
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                log::warn!("[Copilot] open-external-url: rejected non-http URL: {}", url);
+                return;
+            }
+            log::info!("[Copilot] Opening external URL: {}", url);
+            open_url(url);
         }
 
         other => {

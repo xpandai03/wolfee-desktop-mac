@@ -25,8 +25,8 @@ use tauri::{AppHandle, Emitter, Manager, Runtime};
 use uuid::Uuid;
 
 use super::api::{
-    IntelligenceApi, QuickActionRequest, QuickActionType, SuggestPayload, SuggestRequest,
-    SuggestSseEvent,
+    ChatHistoryEntry, FactCheckSource, IntelligenceApi, QuickActionRequest, QuickActionType,
+    SuggestPayload, SuggestRequest, SuggestSseEvent,
 };
 use super::state::{ActiveSuggestion, ActiveSuggestionMutex, TriggerSource};
 
@@ -270,6 +270,7 @@ async fn run_stream<R: Runtime>(
                 transcript_window,
                 rolling_summary,
                 user_question: None,
+                chat_history: Vec::new(),
             };
             api.post_quick_action_sse(&session_id, req)
                 .await
@@ -357,14 +358,15 @@ async fn run_stream<R: Runtime>(
                     },
                 );
             }
-            SuggestSseEvent::Complete { payload } => {
+            SuggestSseEvent::Complete { payload, sources } => {
                 log::info!(
-                    "[Copilot/intel/suggest] complete id={} confidence={:.2} primary='{}'",
+                    "[Copilot/intel/suggest] complete id={} confidence={:.2} sources={} primary='{}'",
                     short(&payload.suggestion_id),
                     payload.confidence,
+                    sources.len(),
                     truncate(&payload.primary, 80)
                 );
-                emit_complete(&app, &session_id, payload);
+                emit_complete(&app, &session_id, payload, sources);
                 // Don't release active immediately — wait for Sub-prompt 4
                 // to send a `copilot-suggestion-dismissed` action OR the
                 // 30s TTL elapses (handled by the next concurrency check).
@@ -420,7 +422,12 @@ async fn run_stream<R: Runtime>(
     }
 }
 
-fn emit_complete<R: Runtime>(app: &AppHandle<R>, session_id: &str, payload: SuggestPayload) {
+fn emit_complete<R: Runtime>(
+    app: &AppHandle<R>,
+    session_id: &str,
+    payload: SuggestPayload,
+    sources: Vec<FactCheckSource>,
+) {
     // Sub-prompt 4 verification 2026-05-04 round 7 — earlier this
     // struct had #[serde(flatten)] on the payload field. That
     // emitted a FLAT JSON object ({session_id, suggestion_id, primary, ...})
@@ -432,16 +439,23 @@ fn emit_complete<R: Runtime>(app: &AppHandle<R>, session_id: &str, payload: Sugg
     // "black screen the moment generation finished."
     //
     // Fix: emit the NESTED shape that the JS code already expects.
+    //
+    // Sub-prompt 4.7 — sources is a sibling of payload (NOT nested
+    // inside it) so the JS SuggestionCompletePayload reads it as
+    // action.payload.sources. Empty array elided via Vec::is_empty.
     #[derive(Serialize)]
     struct CompletePayload {
         session_id: String,
         payload: SuggestPayload,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        sources: Vec<FactCheckSource>,
     }
     let _ = app.emit(
         "copilot-suggestion",
         &CompletePayload {
             session_id: session_id.to_string(),
             payload,
+            sources,
         },
     );
 }
@@ -517,6 +531,7 @@ pub fn spawn_for_chat_question<R: Runtime>(
     api: Arc<IntelligenceApi>,
     ai_response_id: String,
     user_question: String,
+    chat_history: Vec<ChatHistoryEntry>,
     transcript_window: String,
     rolling_summary: Option<String>,
 ) {
@@ -526,6 +541,7 @@ pub fn spawn_for_chat_question<R: Runtime>(
             transcript_window,
             rolling_summary,
             user_question: Some(user_question),
+            chat_history,
         };
 
         let stream = match api.post_quick_action_sse(&session_id, req).await {
@@ -609,7 +625,10 @@ pub fn spawn_for_chat_question<R: Runtime>(
                         },
                     );
                 }
-                SuggestSseEvent::Complete { payload } => {
+                SuggestSseEvent::Complete { payload, sources: _ } => {
+                    // Sub-prompt 4.7 — chat-question path doesn't surface
+                    // sources today (it routes through ask, not fact_check).
+                    // Drop the sources array silently if any sneak through.
                     log::info!(
                         "[Copilot/intel/chat] complete id={} primary='{}'",
                         short(&ai_response_id),
