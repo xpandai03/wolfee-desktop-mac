@@ -22,11 +22,27 @@ use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Listener, Manager, WindowEvent};
 use tauri_plugin_store::StoreExt;
 
-/// Sub-prompt 5.0 — store file holding user-flag persistence
-/// (currently just `wolfee_welcome_shown_v1`). Lives next to the
-/// other auth/config files in the app's data dir.
+/// Sub-prompt 5.0 — store file holding user-flag persistence. Lives
+/// next to the other auth/config files in the app's data dir.
+///
+/// Sub-prompt 5.2 — welcome key is now scoped by paired user_id so
+/// shared Macs (different wolfee.io accounts on same machine) don't
+/// suppress each other's onboarding. Unpaired callers still get a
+/// stable key so they see welcome exactly once before pairing. One-
+/// time migration cost from 5.0 → 5.2: every paired user will see
+/// welcome once after upgrading because the new per-user key starts
+/// unset.
 const FLAGS_STORE_PATH: &str = "flags.json";
-const WELCOME_SHOWN_KEY: &str = "wolfee_welcome_shown_v1";
+const WELCOME_KEY_PREFIX: &str = "wolfee_welcome_shown_v1";
+
+fn welcome_key_for(user_id: Option<&str>) -> String {
+    match user_id {
+        Some(uid) if !uid.is_empty() => {
+            format!("{}_{}", WELCOME_KEY_PREFIX, uid)
+        }
+        _ => format!("{}_unpaired", WELCOME_KEY_PREFIX),
+    }
+}
 
 fn open_url(url: &str) {
     log::info!("[App] Opening URL: {}", url);
@@ -970,9 +986,20 @@ fn handle_structured_action(
         // writes true. Failures emit shown=false (never block onboarding).
         // ─────────────────────────────────────────
         "request-welcome-flag" => {
+            // Sub-prompt 5.2 — scope the flag key by paired user_id so
+            // a different wolfee.io account on the same machine still
+            // sees the welcome card. Falls back to `_unpaired` when
+            // no auth token is present yet.
+            let user_id = handle
+                .state::<AppState>()
+                .user_id
+                .lock()
+                .ok()
+                .and_then(|g| g.clone());
+            let key = welcome_key_for(user_id.as_deref());
             let shown = match handle.store(FLAGS_STORE_PATH) {
                 Ok(store) => store
-                    .get(WELCOME_SHOWN_KEY)
+                    .get(&key)
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false),
                 Err(e) => {
@@ -980,6 +1007,10 @@ fn handle_structured_action(
                     false
                 }
             };
+            log::info!(
+                "[Copilot] welcome flag loaded (key={}, shown={})",
+                key, shown
+            );
             let _ = handle.emit(
                 "welcome-flag-loaded",
                 serde_json::json!({ "shown": shown }),
@@ -987,12 +1018,16 @@ fn handle_structured_action(
         }
 
         "mark-welcome-shown" => {
+            let user_id = handle
+                .state::<AppState>()
+                .user_id
+                .lock()
+                .ok()
+                .and_then(|g| g.clone());
+            let key = welcome_key_for(user_id.as_deref());
             match handle.store(FLAGS_STORE_PATH) {
                 Ok(store) => {
-                    store.set(
-                        WELCOME_SHOWN_KEY.to_string(),
-                        serde_json::Value::Bool(true),
-                    );
+                    store.set(key.clone(), serde_json::Value::Bool(true));
                     if let Err(e) = store.save() {
                         log::warn!(
                             "[Copilot] welcome-flag save failed: {}",
@@ -1001,7 +1036,7 @@ fn handle_structured_action(
                     } else {
                         log::info!(
                             "[Copilot] welcome flag persisted ({}=true)",
-                            WELCOME_SHOWN_KEY
+                            key
                         );
                     }
                 }
