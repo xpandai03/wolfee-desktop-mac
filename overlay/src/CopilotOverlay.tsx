@@ -61,6 +61,11 @@ function toChatHistoryWire(
  * strip mode.
  */
 
+// Sub-prompt 4.8 — wolfee.io web base. Hardcoded here for V1 since
+// the desktop ships against a single backend. Sub-prompt 6 settings
+// can override per-deploy if needed.
+const WOLFEE_WEB_BASE = "https://wolfee.io";
+
 type PermissionKind = "Microphone" | "ScreenRecording";
 
 interface PermissionNeededPayload {
@@ -79,7 +84,11 @@ export default function CopilotOverlay() {
     initialOverlayState,
   );
   const [isPaused, setIsPaused] = useState(false);
+  const [hasFinalizedSession, setHasFinalizedSession] = useState(false);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  // Sub-prompt 4.8 — most recently finalized session id (drives the
+  // View on Web link target). Ref so the click handler stays stable.
+  const lastFinalizedSessionId = useRef<string | null>(null);
 
   // Refs mirroring state for stable global listeners.
   const permissionNeededRef = useRef(permissionNeeded);
@@ -156,6 +165,7 @@ export default function CopilotOverlay() {
     let chatFailedUnlisten: UnlistenFn | undefined;
     let pauseStateUnlisten: UnlistenFn | undefined;
     let newThreadUnlisten: UnlistenFn | undefined;
+    let finalizedUnlisten: UnlistenFn | undefined;
 
     void (async () => {
       permUnlisten = await listen<PermissionNeededPayload>(
@@ -287,6 +297,18 @@ export default function CopilotOverlay() {
         },
       );
 
+      // Sub-prompt 4.8 — Rust signals after a session was successfully
+      // finalized + pushed. Track the id so the "View on Web" link
+      // can deep-link to the recap. Auto-open browser is handled
+      // Rust-side based on user preferences.
+      finalizedUnlisten = await listen<{
+        session_id: string;
+        share_slug: string | null;
+      }>("copilot-session-finalized", (event) => {
+        lastFinalizedSessionId.current = event.payload.session_id;
+        setHasFinalizedSession(true);
+      });
+
       // Sub-prompt 4.7 — ⌘⇧N hotkey from Rust dispatches NEW_THREAD
       // and expands the panel so the user lands on the fresh chat.
       newThreadUnlisten = await listen("copilot-new-thread", () => {
@@ -318,6 +340,7 @@ export default function CopilotOverlay() {
       chatFailedUnlisten?.();
       pauseStateUnlisten?.();
       newThreadUnlisten?.();
+      finalizedUnlisten?.();
     };
   }, []);
 
@@ -326,6 +349,43 @@ export default function CopilotOverlay() {
     void emit("wolfee-action", "toggle-copilot-pause");
   };
   const handleStop = () => {
+    // Sub-prompt 4.8 — push transcript + chat threads + auto-suggestions
+    // to backend BEFORE the session-end teardown so the post-session
+    // web view has all the artifacts. mode_used_id is tracked Rust-side
+    // (set on context-window submit). Auto-open browser flow is also
+    // handled inside the Rust handler based on user preferences.
+    const flatChatThreads = overlayState.chatThreads.map((t) => ({
+      id: t.id,
+      name: t.name,
+      messages: t.messages,
+      createdAt: t.createdAt,
+    }));
+    const flatAutoSuggestions = overlayState.autoSuggestionStream.map((m) => {
+      if (m.type === "auto-suggestion") {
+        return {
+          id: m.id,
+          trigger: m.trigger,
+          text: m.text,
+          secondary: m.secondary,
+          reasoning: m.reasoning,
+          timestamp: m.timestamp,
+        };
+      }
+      return null;
+    }).filter((x) => x !== null);
+    const flatTranscript = overlayState.fullTranscript.map((u) => ({
+      speaker: u.channel,
+      text: u.text,
+      timestamp: u.startedAtMs,
+      isFinal: u.isFinal,
+    }));
+    void emit("wolfee-action", {
+      type: "finalize-and-push-session",
+      transcript: flatTranscript,
+      chat_threads: flatChatThreads,
+      auto_suggestions: flatAutoSuggestions,
+    });
+    // Then the existing teardown — keeps the session-end path intact.
     void emit("wolfee-action", "end-copilot-session");
   };
   const handleToggleExpand = () => {
@@ -335,9 +395,25 @@ export default function CopilotOverlay() {
     );
   };
   const handleAppsClick = () => {
-    // Sub-prompt 4.7 (Modes) will wire this. Stub for now so users
-    // get a console hint instead of a silent click.
-    console.log("[Copilot] Modes (Sub-prompt 4.7) — coming soon");
+    // Sub-prompt 4.8 — open the wolfee.io Modes management page in
+    // the user's default browser. The web UI is the canonical CRUD
+    // surface; the desktop's ContextWindow dropdown handles the
+    // in-the-moment selection at session start.
+    void emit("wolfee-action", {
+      type: "open-external-url",
+      url: WOLFEE_WEB_BASE + "/copilot/modes",
+    });
+  };
+  const handleViewOnWeb = () => {
+    // Sub-prompt 4.8 — opens the user's session list. If we just
+    // finalized a session, point straight at it; otherwise the list.
+    const target = lastFinalizedSessionId.current
+      ? `${WOLFEE_WEB_BASE}/copilot/sessions/${lastFinalizedSessionId.current}`
+      : `${WOLFEE_WEB_BASE}/copilot/sessions`;
+    void emit("wolfee-action", {
+      type: "open-external-url",
+      url: target,
+    });
   };
   const handleClose = () => {
     void getCurrentWebviewWindow().hide();
@@ -443,6 +519,8 @@ export default function CopilotOverlay() {
             onNewThread={handleNewThread}
             onSwitchThread={handleSwitchThread}
             onDeleteThread={handleDeleteThread}
+            showViewOnWeb={hasFinalizedSession}
+            onViewOnWeb={handleViewOnWeb}
             inputRef={inputRef}
             bodyOverride={
               showPermissionModal ? (

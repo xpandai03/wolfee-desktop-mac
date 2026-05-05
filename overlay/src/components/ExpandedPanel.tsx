@@ -49,6 +49,9 @@ interface Props {
   fullTranscript: Utterance[];
   inputDraft: string;
   isAiStreaming: boolean;
+  /** Sub-prompt 4.8 — show "View on Web" link once a session has been finalized. */
+  showViewOnWeb?: boolean;
+  onViewOnWeb?: () => void;
   /**
    * Sub-prompt 4.7 — when truthy, briefly highlights the Chat tab
    * (subtle ring) to signal that new content arrived while the user
@@ -88,6 +91,8 @@ export function ExpandedPanel({
   onNewThread,
   onSwitchThread,
   onDeleteThread,
+  showViewOnWeb,
+  onViewOnWeb,
   inputRef,
   bodyOverride,
 }: Props) {
@@ -110,6 +115,8 @@ export function ExpandedPanel({
             activeTab={activeTab}
             onTabChange={onTabChange}
             chatTabPulseAt={chatTabPulseAt}
+            showViewOnWeb={showViewOnWeb}
+            onViewOnWeb={onViewOnWeb}
           />
 
           {activeTab === "chat" && (
@@ -153,26 +160,59 @@ interface TabBarProps {
   activeTab: ExpandedTab;
   onTabChange: (tab: ExpandedTab) => void;
   chatTabPulseAt: number | null;
+  showViewOnWeb?: boolean;
+  onViewOnWeb?: () => void;
 }
 
-function TabBar({ activeTab, onTabChange, chatTabPulseAt }: TabBarProps) {
+function TabBar({
+  activeTab,
+  onTabChange,
+  chatTabPulseAt,
+  showViewOnWeb,
+  onViewOnWeb,
+}: TabBarProps) {
   return (
     <div
       role="tablist"
       aria-label="Panel content"
-      className="flex items-center gap-1 px-3 pt-2 border-b border-white/5 shrink-0"
+      className="flex items-center justify-between px-3 pt-2 border-b border-white/5 shrink-0"
     >
-      <Tab
-        active={activeTab === "chat"}
-        onClick={() => onTabChange("chat")}
-        label="Chat"
-        pulse={chatTabPulseAt !== null && activeTab !== "chat"}
-      />
-      <Tab
-        active={activeTab === "transcript"}
-        onClick={() => onTabChange("transcript")}
-        label="Transcript"
-      />
+      <div className="flex items-center gap-1">
+        <Tab
+          active={activeTab === "chat"}
+          onClick={() => onTabChange("chat")}
+          label="Chat"
+          pulse={chatTabPulseAt !== null && activeTab !== "chat"}
+        />
+        <Tab
+          active={activeTab === "transcript"}
+          onClick={() => onTabChange("transcript")}
+          label="Transcript"
+        />
+      </div>
+      {showViewOnWeb && onViewOnWeb && (
+        <button
+          type="button"
+          onClick={onViewOnWeb}
+          title="View this session on wolfee.io"
+          className="inline-flex items-center gap-1 px-2 py-1 mb-1 rounded-md text-[11px] font-medium text-zinc-400 hover:text-copilot-accent hover:bg-white/5 transition-colors cursor-pointer"
+        >
+          View on web
+          <svg
+            className="w-3 h-3"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            viewBox="0 0 24 24"
+          >
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              d="M14 5l7 7m0 0l-7 7m7-7H3"
+            />
+          </svg>
+        </button>
+      )}
     </div>
   );
 }
