@@ -5,6 +5,8 @@ import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import { Strip } from "@/components/Strip";
 import { ExpandedPanel } from "@/components/ExpandedPanel";
+import { WelcomeCard } from "@/components/WelcomeCard";
+import { SessionCompleteCard } from "@/components/SessionCompleteCard";
 import {
   activeThreadMessages,
   initialOverlayState,
@@ -104,6 +106,18 @@ export default function CopilotOverlay() {
     modeRef.current = overlayState.mode;
   }, [overlayState.mode]);
 
+  // Sub-prompt 5.0 — refs for welcome flag + welcomeOpen so the apps-
+  // grid handler stays stable across the lifetime of this component
+  // and doesn't need to be recreated whenever the flag flips.
+  const welcomeShownRef = useRef(overlayState.welcomeShown);
+  useEffect(() => {
+    welcomeShownRef.current = overlayState.welcomeShown;
+  }, [overlayState.welcomeShown]);
+  const welcomeOpenRef = useRef(overlayState.welcomeOpen);
+  useEffect(() => {
+    welcomeOpenRef.current = overlayState.welcomeOpen;
+  }, [overlayState.welcomeOpen]);
+
   // Tick — drives existing 2s reasoning fallback + 30s TTL.
   useEffect(() => {
     const id = window.setInterval(() => {
@@ -144,6 +158,14 @@ export default function CopilotOverlay() {
         setPermissionNeeded(null);
         return;
       }
+      // Sub-prompt 5.0 — Esc dismisses welcome / session-complete
+      // cards in preference to collapsing the panel, so the rep
+      // can quickly clear the takeover without losing the strip.
+      if (welcomeOpenRef.current) {
+        dispatch({ type: "DISMISS_WELCOME" });
+        void emit("wolfee-action", { type: "mark-welcome-shown" });
+        return;
+      }
       // Esc collapses the panel if expanded; otherwise hides the strip.
       if (modeRef.current === "expanded") {
         void emit("wolfee-action", "collapse-overlay");
@@ -170,6 +192,7 @@ export default function CopilotOverlay() {
     let newThreadUnlisten: UnlistenFn | undefined;
     let finalizedUnlisten: UnlistenFn | undefined;
     let sessionFailedUnlisten: UnlistenFn | undefined;
+    let welcomeFlagUnlisten: UnlistenFn | undefined;
 
     void (async () => {
       permUnlisten = await listen<PermissionNeededPayload>(
@@ -305,13 +328,55 @@ export default function CopilotOverlay() {
       // finalized + pushed. Track the id so the "View on Web" link
       // can deep-link to the recap. Auto-open browser is handled
       // Rust-side based on user preferences.
+      // Sub-prompt 5.0 — payload now also carries duration_ms +
+      // mode_used_name for the post-session takeover card. We
+      // dispatch SESSION_FINALIZED to open the card; the reducer
+      // owns the 8s auto-dismiss.
       finalizedUnlisten = await listen<{
         session_id: string;
         share_slug: string | null;
+        duration_ms?: number | null;
+        mode_used_name?: string | null;
       }>("copilot-session-finalized", (event) => {
         lastFinalizedSessionId.current = event.payload.session_id;
         setHasFinalizedSession(true);
+        dispatch({
+          type: "SESSION_FINALIZED",
+          sessionId: event.payload.session_id,
+          shareSlug: event.payload.share_slug ?? null,
+          durationMs: event.payload.duration_ms ?? null,
+          modeName: event.payload.mode_used_name ?? null,
+        });
+        // Auto-expand so the takeover is visible. If user happens to
+        // be in strip mode we promote them; otherwise no-op.
+        if (modeRef.current !== "expanded") {
+          void emit("wolfee-action", "expand-overlay");
+        }
       });
+
+      // Sub-prompt 5.0 — Rust replies with the persisted welcome flag
+      // on boot (we ask via `request-welcome-flag` immediately after
+      // the listener is wired). The reducer flips welcomeShown +
+      // shows the card if it has never been seen.
+      welcomeFlagUnlisten = await listen<{ shown: boolean }>(
+        "welcome-flag-loaded",
+        (event) => {
+          dispatch({ type: "LOAD_WELCOME_FLAG", shown: event.payload.shown });
+          if (!event.payload.shown) {
+            // First launch — show the card and expand the panel so
+            // it's actually visible. Without this the user would be
+            // stuck staring at the strip with no idea what to do.
+            dispatch({ type: "SHOW_WELCOME" });
+            if (modeRef.current !== "expanded") {
+              void emit("wolfee-action", "expand-overlay");
+            }
+          }
+        },
+      );
+
+      // Kick off the welcome-flag round-trip now that the listener
+      // is in place. Rust replies on `welcome-flag-loaded` above.
+      void emit("wolfee-action", { type: "request-welcome-flag" });
 
       // Sub-prompt 4.9 — finalize failure surfacing. Rust emits this
       // when the /finalize POST returns non-2xx or networks out. Show
@@ -358,6 +423,7 @@ export default function CopilotOverlay() {
       newThreadUnlisten?.();
       finalizedUnlisten?.();
       sessionFailedUnlisten?.();
+      welcomeFlagUnlisten?.();
     };
   }, []);
 
@@ -421,14 +487,53 @@ export default function CopilotOverlay() {
     );
   };
   const handleAppsClick = () => {
-    // Sub-prompt 4.8 — open the wolfee.io Modes management page in
-    // the user's default browser. The web UI is the canonical CRUD
-    // surface; the desktop's ContextWindow dropdown handles the
-    // in-the-moment selection at session start.
+    // Sub-prompt 5.0 — dual behavior:
+    //   - First-launch (welcome never shown) → replay welcome card.
+    //     This catches the case where the user dismissed welcome
+    //     accidentally before reading; the icon is the recovery path.
+    //   - Otherwise → open wolfee.io/copilot/modes (Sub-prompt 4.8
+    //     behavior), the canonical CRUD surface for modes.
+    if (welcomeShownRef.current === false) {
+      dispatch({ type: "SHOW_WELCOME" });
+      if (modeRef.current !== "expanded") {
+        void emit("wolfee-action", "expand-overlay");
+      }
+      return;
+    }
     void emit("wolfee-action", {
       type: "open-external-url",
       url: WOLFEE_WEB_BASE + "/copilot/modes",
     });
+  };
+
+  // Sub-prompt 5.0 — welcome dismiss: optimistically flip the reducer
+  // flag (so the card disappears immediately) and fire-and-forget
+  // persist via Rust. Worst case (Rust write fails), the card replays
+  // on next boot — strictly worse UX, but never lost data.
+  const handleDismissWelcome = () => {
+    dispatch({ type: "DISMISS_WELCOME" });
+    void emit("wolfee-action", { type: "mark-welcome-shown" });
+  };
+
+  // Sub-prompt 5.0 — SessionCompleteCard CTAs.
+  const handleViewRecap = () => {
+    const sid =
+      overlayState.lastFinalizedSession?.sessionId ??
+      lastFinalizedSessionId.current;
+    if (sid) {
+      void emit("wolfee-action", {
+        type: "open-external-url",
+        url: `${WOLFEE_WEB_BASE}/copilot/sessions/${sid}`,
+      });
+    }
+    dispatch({ type: "DISMISS_SESSION_COMPLETE" });
+  };
+  const handleStartNewSession = () => {
+    dispatch({ type: "DISMISS_SESSION_COMPLETE" });
+    void emit("wolfee-action", "start-copilot-session");
+  };
+  const handleDismissSessionComplete = () => {
+    dispatch({ type: "DISMISS_SESSION_COMPLETE" });
   };
   const handleViewOnWeb = () => {
     // Sub-prompt 4.8 — opens the user's session list. If we just
@@ -505,6 +610,27 @@ export default function CopilotOverlay() {
   const hasActiveSession = overlayState.fullTranscript.length > 0;
   const isAiStreaming = overlayState.streamingAiResponseId !== null;
   const showPermissionModal = permissionNeeded !== null;
+  // Sub-prompt 5.0 — bodyOverride precedence: Permission (Phase 6
+  // sacred) → SessionComplete → Welcome. Permission is highest because
+  // a missing-mic mid-session blocker must override even the recap.
+  const showSessionComplete = overlayState.lastFinalizedSession !== null;
+  const showWelcome = overlayState.welcomeOpen;
+  const expandedPanelBodyOverride = showPermissionModal ? (
+    <PermissionModal
+      payload={permissionNeeded!}
+      onDismiss={() => setPermissionNeeded(null)}
+    />
+  ) : showSessionComplete ? (
+    <SessionCompleteCard
+      durationMs={overlayState.lastFinalizedSession?.durationMs ?? null}
+      modeName={overlayState.lastFinalizedSession?.modeName ?? null}
+      onViewRecap={handleViewRecap}
+      onStartNew={handleStartNewSession}
+      onDismiss={handleDismissSessionComplete}
+    />
+  ) : showWelcome ? (
+    <WelcomeCard onDismiss={handleDismissWelcome} />
+  ) : undefined;
 
   return (
     // Sub-prompt 4.7 — the outer wrapper is now transparent so the
@@ -559,14 +685,7 @@ export default function CopilotOverlay() {
             showViewOnWeb={hasFinalizedSession}
             onViewOnWeb={handleViewOnWeb}
             inputRef={inputRef}
-            bodyOverride={
-              showPermissionModal ? (
-                <PermissionModal
-                  payload={permissionNeeded!}
-                  onDismiss={() => setPermissionNeeded(null)}
-                />
-              ) : undefined
-            }
+            bodyOverride={expandedPanelBodyOverride}
           />
         )}
       </AnimatePresence>

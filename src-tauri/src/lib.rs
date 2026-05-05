@@ -20,6 +20,13 @@ use recorder::Recorder;
 use state::{AppState, LinkingStatus, RecordingState, UploadStatus};
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Listener, Manager, WindowEvent};
+use tauri_plugin_store::StoreExt;
+
+/// Sub-prompt 5.0 — store file holding user-flag persistence
+/// (currently just `wolfee_welcome_shown_v1`). Lives next to the
+/// other auth/config files in the app's data dir.
+const FLAGS_STORE_PATH: &str = "flags.json";
+const WELCOME_SHOWN_KEY: &str = "wolfee_welcome_shown_v1";
 
 fn open_url(url: &str) {
     log::info!("[App] Opening URL: {}", url);
@@ -63,10 +70,19 @@ struct IntelligenceWorkersMutex(tokio::sync::Mutex<Option<IntelligenceWorkers>>)
 /// alive for the duration of the session so the finalize POST can
 /// attribute the session to the right Mode template. Set when the
 /// user clicks Submit on ContextWindow; cleared on session end.
-struct ActiveModeIdMutex(std::sync::Mutex<Option<String>>);
+///
+/// Sub-prompt 5.0 — also tracks the human-readable mode name so the
+/// post-session takeover card can show "Discovery mode" subtext
+/// without an extra round-trip to the modes API.
+#[derive(Default, Clone)]
+struct ActiveMode {
+    id: Option<String>,
+    name: Option<String>,
+}
+struct ActiveModeIdMutex(std::sync::Mutex<ActiveMode>);
 impl Default for ActiveModeIdMutex {
     fn default() -> Self {
-        Self(std::sync::Mutex::new(None))
+        Self(std::sync::Mutex::new(ActiveMode::default()))
     }
 }
 
@@ -348,12 +364,21 @@ fn handle_structured_action(
             // Sub-prompt 4.8 — capture mode_used_id from the
             // submit payload so the finalize POST can attribute the
             // session to the right Mode template.
+            // Sub-prompt 5.0 — also capture mode_used_name so the
+            // post-session takeover can show it without re-querying.
             let mode_used_id = payload
                 .get("mode_used_id")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
+            let mode_used_name = payload
+                .get("mode_used_name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             if let Ok(mut g) = handle.state::<ActiveModeIdMutex>().0.lock() {
-                *g = mode_used_id;
+                *g = ActiveMode {
+                    id: mode_used_id,
+                    name: mode_used_name,
+                };
             }
 
             let session_id = uuid::Uuid::new_v4().to_string();
@@ -778,13 +803,23 @@ fn handle_structured_action(
         // Stop button click handler with its reducer state attached.
         // ─────────────────────────────────────────
         "finalize-and-push-session" => {
-            let session_id = {
+            // Sub-prompt 5.0 — capture session_id AND started_at while
+            // we hold the state lock so we can compute duration for the
+            // post-session takeover card. started_at only lives on the
+            // Listening variant; Reconnecting/EndingSession lose it but
+            // those paths still finalize fine (duration falls back to
+            // None and the card just shows "Recording complete").
+            let (session_id, started_at_opt) = {
                 let copilot_mutex = handle.state::<CopilotStateMutex>();
                 let cur = copilot_mutex.0.lock().unwrap().clone();
                 match cur {
-                    CopilotState::Listening { session_id, .. }
-                    | CopilotState::Reconnecting { session_id, .. }
-                    | CopilotState::EndingSession { session_id, .. } => session_id,
+                    CopilotState::Listening { session_id, started_at } => {
+                        (session_id, Some(started_at))
+                    }
+                    CopilotState::Reconnecting { session_id, .. }
+                    | CopilotState::EndingSession { session_id, .. } => {
+                        (session_id, None)
+                    }
                     other => {
                         log::debug!(
                             "[Copilot] finalize-and-push-session ignored — state: {}",
@@ -794,6 +829,7 @@ fn handle_structured_action(
                     }
                 }
             };
+            let duration_ms = started_at_opt.map(|t| t.elapsed().as_millis() as u64);
 
             let device_token = match handle
                 .state::<AppState>()
@@ -811,12 +847,15 @@ fn handle_structured_action(
                 }
             };
 
-            let mode_used_id = handle
+            let active_mode = handle
                 .state::<ActiveModeIdMutex>()
                 .0
                 .lock()
                 .ok()
-                .and_then(|g| g.clone());
+                .map(|g| g.clone())
+                .unwrap_or_default();
+            let mode_used_id = active_mode.id.clone();
+            let mode_used_name = active_mode.name.clone();
 
             // Frontend supplies the transcript (its `fullTranscript`
             // state — last 200 utterances) since the Rust buffer is a
@@ -861,11 +900,16 @@ fn handle_structured_action(
                             resp.share_slug
                         );
                         // Emit so the frontend can show "View on web".
+                        // Sub-prompt 5.0 — also include duration_ms +
+                        // mode_used_name so the post-session takeover
+                        // card has its subtext data immediately.
                         let _ = handle_clone.emit(
                             "copilot-session-finalized",
                             serde_json::json!({
                                 "session_id": resp.session_id,
                                 "share_slug": resp.share_slug,
+                                "duration_ms": duration_ms,
+                                "mode_used_name": mode_used_name,
                             }),
                         );
 
@@ -915,7 +959,58 @@ fn handle_structured_action(
 
             // Clear active mode id once the finalize is in flight.
             if let Ok(mut g) = handle.state::<ActiveModeIdMutex>().0.lock() {
-                *g = None;
+                *g = ActiveMode::default();
+            }
+        }
+
+        // ─────────────────────────────────────────
+        // Sub-prompt 5.0 — welcome-flag persistence.
+        // Frontend emits `request-welcome-flag` on boot; we read the
+        // store and emit `welcome-flag-loaded` back. `mark-welcome-shown`
+        // writes true. Failures emit shown=false (never block onboarding).
+        // ─────────────────────────────────────────
+        "request-welcome-flag" => {
+            let shown = match handle.store(FLAGS_STORE_PATH) {
+                Ok(store) => store
+                    .get(WELCOME_SHOWN_KEY)
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                Err(e) => {
+                    log::warn!("[Copilot] welcome-flag store load failed: {}", e);
+                    false
+                }
+            };
+            let _ = handle.emit(
+                "welcome-flag-loaded",
+                serde_json::json!({ "shown": shown }),
+            );
+        }
+
+        "mark-welcome-shown" => {
+            match handle.store(FLAGS_STORE_PATH) {
+                Ok(store) => {
+                    store.set(
+                        WELCOME_SHOWN_KEY.to_string(),
+                        serde_json::Value::Bool(true),
+                    );
+                    if let Err(e) = store.save() {
+                        log::warn!(
+                            "[Copilot] welcome-flag save failed: {}",
+                            e
+                        );
+                    } else {
+                        log::info!(
+                            "[Copilot] welcome flag persisted ({}=true)",
+                            WELCOME_SHOWN_KEY
+                        );
+                    }
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[Copilot] welcome-flag store open failed: {}",
+                        e
+                    );
+                }
             }
         }
 

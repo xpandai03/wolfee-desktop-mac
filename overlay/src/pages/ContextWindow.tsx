@@ -175,12 +175,20 @@ export function ContextWindow() {
     setIsSubmitting(true);
     setErrorMsg(null);
     try {
+      // Sub-prompt 5.0 — pass the chosen mode's name alongside its
+      // id so the Rust side can echo it back in the post-session
+      // SessionCompleteCard ("Discovery mode" subtext). Modes API
+      // already supplies the name; cheap to forward.
+      const selectedModeForSubmit = selectedModeId
+        ? modes.find((m) => m.id === selectedModeId) ?? null
+        : null;
       await emit("wolfee-action", {
         type: "submit-copilot-context",
         about_user: fields.about_user.trim() || null,
         about_call: fields.about_call.trim() || null,
         objections: fields.objections.trim() || null,
         mode_used_id: selectedModeId,
+        mode_used_name: selectedModeForSubmit?.name ?? null,
       });
     } catch (err) {
       setErrorMsg(typeof err === "string" ? err : "Failed to start session");

@@ -33,6 +33,7 @@ const SHOWING_TTL_MS = 30_000;
 const COPY_FLASH_MS = 1_200;
 const FAILURE_TOAST_MS = 1_200;
 const PULSE_DURATION_MS = 2_500;
+const SESSION_COMPLETE_AUTO_DISMISS_MS = 8_000;
 
 // Sub-prompt 4.6 — quick-action triggers that should emit a
 // chat-thread message instead of a transient suggestion card.
@@ -453,6 +454,44 @@ export function overlayReducer(
       };
     }
 
+    // ── Sub-prompt 5.0 — onboarding + post-session takeover ───────
+
+    case "LOAD_WELCOME_FLAG": {
+      // Rust replied with the persisted flag. If the user has never
+      // seen welcome before, surface it on the next expand cycle —
+      // CopilotOverlay's effect drives that side, this just records.
+      return { ...state, welcomeShown: action.shown };
+    }
+
+    case "SHOW_WELCOME":
+      return { ...state, welcomeOpen: true };
+
+    case "DISMISS_WELCOME":
+      // Marking shown=true here is optimistic; Rust persistence is
+      // fire-and-forget alongside the dispatch (CopilotOverlay emits
+      // mark-welcome-shown on the same click).
+      return { ...state, welcomeOpen: false, welcomeShown: true };
+
+    case "SESSION_FINALIZED":
+      return {
+        ...state,
+        lastFinalizedSession: {
+          sessionId: action.sessionId,
+          shareSlug: action.shareSlug,
+          durationMs: action.durationMs,
+          modeName: action.modeName,
+          finalizedAtMs: Date.now(),
+        },
+        sessionCompleteOpenedAtMs: Date.now(),
+      };
+
+    case "DISMISS_SESSION_COMPLETE":
+      return {
+        ...state,
+        lastFinalizedSession: null,
+        sessionCompleteOpenedAtMs: null,
+      };
+
     case "TICK": {
       // Driven by a 250ms interval in CopilotOverlay. Handles
       // time-based transitions: 2s reasoning fallback, 30s TTL,
@@ -507,6 +546,21 @@ export function overlayReducer(
         action.nowMs - next.chatTabPulseAt >= PULSE_DURATION_MS
       ) {
         next = { ...next, chatTabPulseAt: null };
+      }
+
+      // Sub-prompt 5.0 — SessionCompleteCard auto-dismiss after 8s.
+      // Driven by TICK so the timer survives panel collapse/re-expand
+      // cleanly and there's no setTimeout to leak across remounts.
+      if (
+        next.sessionCompleteOpenedAtMs !== null &&
+        action.nowMs - next.sessionCompleteOpenedAtMs >=
+          SESSION_COMPLETE_AUTO_DISMISS_MS
+      ) {
+        next = {
+          ...next,
+          lastFinalizedSession: null,
+          sessionCompleteOpenedAtMs: null,
+        };
       }
 
       // Failure toast uses its own action because the duration

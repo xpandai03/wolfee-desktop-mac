@@ -231,10 +231,42 @@ export interface ActiveSuggestion {
   expanded: boolean;
 }
 
+/**
+ * Sub-prompt 5.0 — most-recently-finalized session, used to drive the
+ * post-session takeover card. `null` outside the takeover window.
+ */
+export interface FinalizedSessionInfo {
+  sessionId: string;
+  shareSlug: string | null;
+  durationMs: number | null;
+  modeName: string | null;
+  finalizedAtMs: number;
+}
+
 export interface OverlayState {
   uiPhase: UiPhase;
   /** Sub-prompt 4.6 — Cluely strip vs expanded panel. */
   mode: OverlayMode;
+  /**
+   * Sub-prompt 5.0 — first-launch welcome flag.
+   *  - `null`  → not yet loaded from store (initial boot, before
+   *               the welcome-flag-loaded event arrives).
+   *  - `false` → never seen welcome → show it on first expand.
+   *  - `true`  → already shown → skip.
+   * Apps-grid icon respects this: if false, replay welcome; if true,
+   * open wolfee.io/copilot/modes.
+   */
+  welcomeShown: boolean | null;
+  /** Sub-prompt 5.0 — currently rendering the welcome card via panel
+   * bodyOverride. Independent of welcomeShown so the user can replay
+   * after dismiss. */
+  welcomeOpen: boolean;
+  /** Sub-prompt 5.0 — most recently finalized session metadata, drives
+   * the SessionCompleteCard takeover. Null = no card visible. */
+  lastFinalizedSession: FinalizedSessionInfo | null;
+  /** Sub-prompt 5.0 — wall-clock when SessionCompleteCard was opened.
+   * TICK auto-dismisses 8s later. Null when card not visible. */
+  sessionCompleteOpenedAtMs: number | null;
   /** Sub-prompt 4.6 — which tab is active in expanded mode. */
   activeTab: ExpandedTab;
   /**
@@ -319,11 +351,27 @@ export type Action =
   | { type: "NEW_THREAD"; threadId: string }
   | { type: "SWITCH_THREAD"; threadId: string }
   | { type: "RENAME_THREAD"; threadId: string; name: string }
-  | { type: "DELETE_THREAD"; threadId: string };
+  | { type: "DELETE_THREAD"; threadId: string }
+  // Sub-prompt 5.0 — onboarding + post-session takeover
+  | { type: "LOAD_WELCOME_FLAG"; shown: boolean }
+  | { type: "SHOW_WELCOME" }
+  | { type: "DISMISS_WELCOME" }
+  | {
+      type: "SESSION_FINALIZED";
+      sessionId: string;
+      shareSlug: string | null;
+      durationMs: number | null;
+      modeName: string | null;
+    }
+  | { type: "DISMISS_SESSION_COMPLETE" };
 
 export const initialOverlayState: OverlayState = {
   uiPhase: "Idle",
   mode: "strip",
+  welcomeShown: null,
+  welcomeOpen: false,
+  lastFinalizedSession: null,
+  sessionCompleteOpenedAtMs: null,
   activeTab: "chat",
   fullTranscript: [],
   chatThreads: [],
