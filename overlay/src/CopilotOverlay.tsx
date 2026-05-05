@@ -3,18 +3,12 @@ import { AnimatePresence } from "framer-motion";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 
-import { TopBar } from "@/components/TopBar";
-import { TranscriptZone } from "@/components/TranscriptZone";
-import { SuggestionCard } from "@/components/SuggestionCard";
-import { ActionButtonsRow } from "@/components/ActionButtonsRow";
-import { FooterHint } from "@/components/FooterHint";
-import { cn } from "@/lib/utils";
+import { Strip } from "@/components/Strip";
+import { ExpandedPanel } from "@/components/ExpandedPanel";
 import {
   initialOverlayState,
-  isInTtlFadeWindow,
   overlayReducer,
 } from "@/state/overlayReducer";
-import { copyToClipboard } from "@/lib/copyToClipboard";
 import type {
   TranscriptChunkPayload,
   SummaryUpdatedPayload,
@@ -24,7 +18,25 @@ import type {
   SuggestionCompletePayload,
   SuggestionFailedPayload,
   QuickActionType,
+  ExpandedTab,
 } from "@/state/types";
+
+/**
+ * Sub-prompt 4.6 (Cluely 1:1) — root overlay component. Two visual
+ * modes managed by the reducer's `mode` field:
+ *
+ *   "strip"    → 600×44 thin bar with status + 5 controls
+ *   "expanded" → 600×520 with tabs + chat thread + input bar
+ *
+ * Window resize is driven by Rust (wolfee-action: expand-overlay /
+ * collapse-overlay). The reducer's mode mirrors the Rust window state
+ * so React renders match.
+ *
+ * Phase 6 permission modal (sacred) renders inside ExpandedPanel via
+ * bodyOverride when permissionNeeded is non-null. Auto-expands the
+ * panel so the user actually sees the modal even if they were in
+ * strip mode.
+ */
 
 type PermissionKind = "Microphone" | "ScreenRecording";
 
@@ -43,23 +55,21 @@ export default function CopilotOverlay() {
     overlayReducer,
     initialOverlayState,
   );
+  const [isPaused, setIsPaused] = useState(false);
+  const inputRef = useRef<HTMLTextAreaElement | null>(null);
 
-  // Mirror the latest value into a ref so the focus/key listeners — which
-  // are registered once at mount — can read the current state without
-  // re-registering.
+  // Refs mirroring state for stable global listeners.
   const permissionNeededRef = useRef(permissionNeeded);
   useEffect(() => {
     permissionNeededRef.current = permissionNeeded;
   }, [permissionNeeded]);
 
-  // Same pattern for the active-suggestion uiPhase: the Esc handler
-  // is registered once at mount, so it reads via ref.
-  const uiPhaseRef = useRef(overlayState.uiPhase);
+  const modeRef = useRef(overlayState.mode);
   useEffect(() => {
-    uiPhaseRef.current = overlayState.uiPhase;
-  }, [overlayState.uiPhase]);
+    modeRef.current = overlayState.mode;
+  }, [overlayState.mode]);
 
-  // ── Tick interval — drives 2s reasoning fallback + 30s TTL ─────
+  // Tick — drives existing 2s reasoning fallback + 30s TTL.
   useEffect(() => {
     const id = window.setInterval(() => {
       dispatch({ type: "TICK", nowMs: Date.now() });
@@ -67,9 +77,7 @@ export default function CopilotOverlay() {
     return () => window.clearInterval(id);
   }, []);
 
-  // ── Dev-mode mock event generator (Ctrl+Shift+M) ───────────────
-  // Only registered when import.meta.env.DEV is true. Tree-shaken
-  // out of production builds.
+  // Dev mock generator (Ctrl+Shift+M / 2-5).
   useEffect(() => {
     if (!import.meta.env.DEV) return;
     let cleanup: (() => void) | undefined;
@@ -81,7 +89,7 @@ export default function CopilotOverlay() {
     };
   }, []);
 
-  // ── Failure toast auto-clear (1.2s) ────────────────────────────
+  // Failure toast auto-clear.
   useEffect(() => {
     if (!overlayState.failureToast) return;
     const t = window.setTimeout(() => {
@@ -90,52 +98,25 @@ export default function CopilotOverlay() {
     return () => window.clearTimeout(t);
   }, [overlayState.failureToast]);
 
-  // ── Window-level keydown + focus + Tauri event listeners ───────
+  // Window-level keydown + Tauri event listeners.
   useEffect(() => {
     const win = getCurrentWebviewWindow();
 
     const handleKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
-      // Phase 6 Esc precedence (sacred): if the modal is up, dismiss it.
+      // Phase 6 Esc precedence: dismiss the modal first.
       if (permissionNeededRef.current) {
         setPermissionNeeded(null);
         return;
       }
-      // Sub-prompt 4: Esc dismisses an active suggestion before
-      // hiding the window. Pressing Esc with no suggestion still
-      // hides (Sub-prompt 1 behavior preserved).
-      const phase = uiPhaseRef.current;
-      if (phase === "Reasoning" || phase === "Streaming" || phase === "Showing") {
-        dispatch({ type: "DISMISS_SUGGESTION", via: "esc" });
-        // Tell Rust to release ActiveSuggestionMutex (V1 string payload).
-        void emit("wolfee-action", "copilot-suggestion-dismissed");
+      // Esc collapses the panel if expanded; otherwise hides the strip.
+      if (modeRef.current === "expanded") {
+        void emit("wolfee-action", "collapse-overlay");
         return;
       }
       void win.hide();
     };
     window.addEventListener("keydown", handleKey);
-
-    // 2026-05-04: removed the auto-hide-on-focus-loss handler. With
-    // Accessory activation policy, the overlay rarely takes focus
-    // anyway — and the prior listener was firing the moment Chrome
-    // (or any other fullscreen app) reclaimed focus, which made the
-    // overlay flicker visible-then-gone the instant a suggestion
-    // appeared. Surfaced by PO 2026-05-04 as "blacked out."
-    //
-    // New dismiss model:
-    //   - ⌘⌥W toggles the overlay window
-    //   - X button in TopBar hides it
-    //   - Esc dismisses an active suggestion (if any) or hides the
-    //     window otherwise (only effective when overlay has focus)
-    //
-    // Keep the focusUnlistenPromise variable (typed) because the
-    // permission-modal Esc path was the last legitimate consumer.
-    // We still register a listener — but it's a no-op for window
-    // hiding now, retained as a hook for Sub-prompt 6 if PO wants
-    // a different behavior (e.g., "auto-hide if user goes idle").
-    const focusUnlistenPromise = win.onFocusChanged(({ payload: _focused }) => {
-      // intentional no-op
-    });
 
     let permUnlisten: UnlistenFn | undefined;
     let transcriptUnlisten: UnlistenFn | undefined;
@@ -145,6 +126,12 @@ export default function CopilotOverlay() {
     let suggestionUnlisten: UnlistenFn | undefined;
     let suggestionStreamingUnlisten: UnlistenFn | undefined;
     let suggestionFailedUnlisten: UnlistenFn | undefined;
+    let panelStateUnlisten: UnlistenFn | undefined;
+    let focusInputUnlisten: UnlistenFn | undefined;
+    let chatStreamingUnlisten: UnlistenFn | undefined;
+    let chatCompleteUnlisten: UnlistenFn | undefined;
+    let chatFailedUnlisten: UnlistenFn | undefined;
+    let pauseStateUnlisten: UnlistenFn | undefined;
 
     void (async () => {
       permUnlisten = await listen<PermissionNeededPayload>(
@@ -152,6 +139,8 @@ export default function CopilotOverlay() {
         (event) => {
           console.log("[Copilot] permission needed:", event.payload);
           setPermissionNeeded(event.payload);
+          // Auto-expand so the user actually sees the modal.
+          void emit("wolfee-action", "expand-overlay");
         },
       );
 
@@ -176,8 +165,6 @@ export default function CopilotOverlay() {
         },
       );
 
-      // Sub-prompt 4 N3 — emitted instantly on ⌘⌥G or moment fire.
-      // Eliminates 200-800ms dead air before the first streaming delta.
       pendingUnlisten = await listen<SuggestionPendingPayload>(
         "copilot-suggestion-pending",
         (event) => {
@@ -196,6 +183,11 @@ export default function CopilotOverlay() {
         "copilot-suggestion",
         (event) => {
           dispatch({ type: "SUGGESTION_COMPLETE", payload: event.payload });
+          // Auto-expand on completion so the rep sees Wolfee's
+          // suggestion in the chat thread without having to click.
+          if (modeRef.current !== "expanded") {
+            void emit("wolfee-action", "expand-overlay");
+          }
         },
       );
 
@@ -205,11 +197,75 @@ export default function CopilotOverlay() {
           dispatch({ type: "SUGGESTION_FAILED", payload: event.payload });
         },
       );
+
+      // Sub-prompt 4.6 — Rust mirror of mode change so the React side
+      // stays in sync with the actual window size.
+      panelStateUnlisten = await listen<{ mode: "strip" | "expanded" }>(
+        "copilot-panel-state",
+        (event) => {
+          dispatch({ type: "SET_MODE", mode: event.payload.mode });
+        },
+      );
+
+      // Sub-prompt 4.6 — Cmd+Enter from anywhere focuses the input.
+      focusInputUnlisten = await listen("copilot-focus-input", () => {
+        // If we're in strip mode, the panel needs to expand first.
+        if (modeRef.current !== "expanded") {
+          void emit("wolfee-action", "expand-overlay");
+        }
+        // Defer focus until after re-render flushes (panel may be
+        // mid-resize / mid-mount).
+        window.setTimeout(() => {
+          inputRef.current?.focus();
+        }, 80);
+      });
+
+      // Sub-prompt 4.6 — chat streaming events (separate from the
+      // suggestion streaming events so the chat thread doesn't fight
+      // with the auto-suggestion state machine).
+      chatStreamingUnlisten = await listen<{
+        ai_response_id: string;
+        text: string;
+      }>("copilot-chat-streaming", (event) => {
+        dispatch({
+          type: "AI_RESPONSE_DELTA",
+          aiResponseId: event.payload.ai_response_id,
+          text: event.payload.text,
+        });
+      });
+
+      chatCompleteUnlisten = await listen<{
+        ai_response_id: string;
+        text: string;
+      }>("copilot-chat-complete", (event) => {
+        dispatch({
+          type: "AI_RESPONSE_COMPLETE",
+          aiResponseId: event.payload.ai_response_id,
+          text: event.payload.text,
+        });
+      });
+
+      chatFailedUnlisten = await listen<{
+        ai_response_id: string;
+        reason: string;
+      }>("copilot-chat-failed", (event) => {
+        dispatch({
+          type: "AI_RESPONSE_FAILED",
+          aiResponseId: event.payload.ai_response_id,
+          reason: event.payload.reason,
+        });
+      });
+
+      pauseStateUnlisten = await listen<{ paused: boolean }>(
+        "copilot-pause-state",
+        (event) => {
+          setIsPaused(event.payload.paused);
+        },
+      );
     })();
 
     return () => {
       window.removeEventListener("keydown", handleKey);
-      void focusUnlistenPromise.then((fn) => fn());
       permUnlisten?.();
       transcriptUnlisten?.();
       summaryUnlisten?.();
@@ -218,116 +274,117 @@ export default function CopilotOverlay() {
       suggestionUnlisten?.();
       suggestionStreamingUnlisten?.();
       suggestionFailedUnlisten?.();
+      panelStateUnlisten?.();
+      focusInputUnlisten?.();
+      chatStreamingUnlisten?.();
+      chatCompleteUnlisten?.();
+      chatFailedUnlisten?.();
+      pauseStateUnlisten?.();
     };
   }, []);
 
-  // ── Phase 6 sacred path — modal short-circuits everything else ─
-  if (permissionNeeded) {
-    return (
-      <PermissionModal
-        payload={permissionNeeded}
-        onDismiss={() => setPermissionNeeded(null)}
-      />
+  // ── Strip control handlers ─────────────────────────────────────
+  const handlePauseToggle = () => {
+    void emit("wolfee-action", "toggle-copilot-pause");
+  };
+  const handleStop = () => {
+    void emit("wolfee-action", "end-copilot-session");
+  };
+  const handleToggleExpand = () => {
+    void emit(
+      "wolfee-action",
+      overlayState.mode === "expanded" ? "collapse-overlay" : "expand-overlay",
     );
-  }
-
-  // ── Sub-prompt 4 — main overlay layout ─────────────────────────
-  const { uiPhase, transcript, active, copiedFlashAt, failureToast } =
-    overlayState;
-  const hasActiveSession = transcript.length > 0;
-  const isFading = isInTtlFadeWindow(overlayState, Date.now());
-  const isExpanded = active?.expanded === true;
-
-  const handleDismiss = () => {
-    dispatch({ type: "DISMISS_SUGGESTION", via: "click" });
-    void emit("wolfee-action", "copilot-suggestion-dismissed");
+  };
+  const handleAppsClick = () => {
+    // Sub-prompt 4.7 (Modes) will wire this. Stub for now so users
+    // get a console hint instead of a silent click.
+    console.log("[Copilot] Modes (Sub-prompt 4.7) — coming soon");
+  };
+  const handleClose = () => {
+    void getCurrentWebviewWindow().hide();
   };
 
-  const handleToggleExpanded = () => {
-    dispatch({ type: "TOGGLE_EXPANDED" });
+  // ── ExpandedPanel handlers ─────────────────────────────────────
+  const handleTabChange = (tab: ExpandedTab) => {
+    dispatch({ type: "SET_ACTIVE_TAB", tab });
   };
-
-  const handleCopy = async () => {
-    if (!active?.finalPrimary) return;
-    const ok = await copyToClipboard(active.finalPrimary);
-    if (ok) dispatch({ type: "COPY_FLASH" });
+  const handleDraftChange = (value: string) => {
+    dispatch({ type: "UPDATE_INPUT_DRAFT", value });
   };
-
-  // Sub-prompt 4.5 — fire a quick-action via the Rust JSON dispatch.
-  // The handler aborts any in-flight auto-suggestion (Decision N1).
   const handleQuickAction = (action: QuickActionType) => {
     void emit("wolfee-action", {
       type: "trigger-copilot-quick-action",
       action,
     });
   };
+  const handleSubmitQuestion = (question: string) => {
+    const questionId = `q-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const aiResponseId = `r-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    dispatch({
+      type: "SUBMIT_USER_QUESTION",
+      question,
+      questionId,
+      aiResponseId,
+    });
+    void emit("wolfee-action", {
+      type: "submit-chat-question",
+      question,
+      ai_response_id: aiResponseId,
+    });
+  };
 
-  // Idle = "no suggestion in flight, no expanded card" → show 2x2 grid
-  // of action buttons in the full 130px suggestion zone.
-  // Active = anything else → show 28px icon strip above the card.
-  const buttonsMode: "idle" | "active" =
-    !active && uiPhase === "Idle" ? "idle" : "active";
+  const hasActiveSession = overlayState.fullTranscript.length > 0;
+  const isAiStreaming = overlayState.streamingAiResponseId !== null;
+  const showPermissionModal = permissionNeeded !== null;
 
   return (
-    <div className="w-full h-full flex flex-col bg-zinc-950 text-zinc-100 select-none">
-      <TopBar uiPhase={uiPhase} hasActiveSession={hasActiveSession} />
+    <div className="w-screen h-screen flex flex-col bg-zinc-950 text-zinc-100 select-none overflow-hidden">
+      <Strip
+        mode={overlayState.mode}
+        uiPhase={overlayState.uiPhase}
+        hasActiveSession={hasActiveSession}
+        isPaused={isPaused}
+        onPauseToggle={handlePauseToggle}
+        onStop={handleStop}
+        onToggleExpand={handleToggleExpand}
+        onAppsClick={handleAppsClick}
+        onClose={handleClose}
+      />
 
-      {/*
-        When a suggestion is expanded, hide the transcript zone so the
-        suggestion card has the whole content area to breathe (per PO
-        2026-05-04 — "make it bigger" / "side view"). When collapsed,
-        the original two-zone layout is restored: transcript top,
-        suggestion bottom.
-      */}
-      {!isExpanded && <TranscriptZone utterances={transcript} />}
-
-      {/* Sub-prompt 4.5 action buttons: 2x2 grid when idle, compact
-          strip above the suggestion when active. AnimatePresence
-          inside ActionButtonsRow handles the cross-fade. */}
-      {!isExpanded && (
-        <ActionButtonsRow
-          mode={buttonsMode}
-          onAction={handleQuickAction}
-          disabled={uiPhase === "Reasoning" || uiPhase === "Streaming"}
-        />
-      )}
-
-      {/* Suggestion card area — only rendered when there's an active
-          suggestion OR we're expanded (so a previously-expanded card
-          stays visible). Idle state is fully owned by ActionButtonsRow. */}
-      {(active || isExpanded) && (
-        <div
-          className={cn(
-            "flex items-center justify-center",
-            isExpanded ? "flex-1" : "h-[102px]",
-          )}
-        >
-          <AnimatePresence mode="wait">
-            {active ? (
-              <div key="card" className="w-full">
-                <SuggestionCard
-                  uiPhase={uiPhase}
-                  active={active}
-                  isFading={isFading && !isExpanded}
-                  copiedFlashAt={copiedFlashAt}
-                  onDismiss={handleDismiss}
-                  onToggleExpanded={handleToggleExpanded}
-                  onCopy={handleCopy}
+      <AnimatePresence initial={false}>
+        {overlayState.mode === "expanded" && (
+          <ExpandedPanel
+            key="panel"
+            activeTab={overlayState.activeTab}
+            chatThread={overlayState.chatThread}
+            fullTranscript={overlayState.fullTranscript}
+            inputDraft={overlayState.inputDraft}
+            isAiStreaming={isAiStreaming}
+            onTabChange={handleTabChange}
+            onDraftChange={handleDraftChange}
+            onQuickAction={handleQuickAction}
+            onSubmitQuestion={handleSubmitQuestion}
+            inputRef={inputRef}
+            bodyOverride={
+              showPermissionModal ? (
+                <PermissionModal
+                  payload={permissionNeeded!}
+                  onDismiss={() => setPermissionNeeded(null)}
                 />
-              </div>
-            ) : null}
-          </AnimatePresence>
-        </div>
-      )}
-
-      {!isExpanded && <FooterHint failureToast={failureToast} />}
+              ) : undefined
+            }
+          />
+        )}
+      </AnimatePresence>
     </div>
   );
 }
 
 // ──────────────────────────────────────────────────────────────────
 // Phase 6 PermissionModal — SACRED, preserved verbatim from
-// Sub-prompt 2 commit b8a19fb. Do not modify in Sub-prompt 4.
+// Sub-prompt 2 commit b8a19fb. Only the wrapper (inline-in-overlay
+// vs panel-bodyOverride) is allowed to change in Sub-prompt 4.6.
 // ──────────────────────────────────────────────────────────────────
 
 function PermissionModal({

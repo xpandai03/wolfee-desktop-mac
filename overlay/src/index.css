@@ -19,3 +19,21 @@ body,
 ::-webkit-scrollbar {
   display: none;
 }
+
+/* Sub-prompt 4.6 — show a thin custom scrollbar inside the chat /
+ * transcript scrollers so the user has a visual hint that more
+ * content lives off-viewport. */
+.chat-scroll::-webkit-scrollbar {
+  display: block;
+  width: 6px;
+}
+.chat-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.chat-scroll::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 9999px;
+}
+.chat-scroll::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.12);
+}

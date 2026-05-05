@@ -101,6 +101,55 @@ export type TriggerSource = "moment" | "hotkey";
 // Sub-prompt 4.5 — the 4 user-clickable action buttons.
 export type QuickActionType = "ask" | "follow_up" | "fact_check" | "recap";
 
+// ── Sub-prompt 4.6 (Cluely 1:1 redesign) ────────────────────────────
+
+/** Strip = thin always-visible bar; Expanded = panel with Chat+Transcript. */
+export type OverlayMode = "strip" | "expanded";
+
+/** Tab inside the expanded panel. */
+export type ExpandedTab = "chat" | "transcript";
+
+/**
+ * Persistent chat thread inside the expanded panel. Auto-suggestions,
+ * quick-action results, and user questions all flow into the same
+ * scrollable history so the rep has a single source of truth for
+ * what Wolfee has surfaced this call.
+ */
+export type ChatMessage =
+  | {
+      id: string;
+      type: "auto-suggestion";
+      trigger: TriggerType;
+      text: string;
+      secondary: string | null;
+      reasoning: string | null;
+      timestamp: number;
+    }
+  | {
+      id: string;
+      type: "quick-action-result";
+      action: QuickActionType;
+      text: string;
+      secondary: string | null;
+      reasoning: string | null;
+      timestamp: number;
+    }
+  | {
+      id: string;
+      type: "user-question";
+      question: string;
+      timestamp: number;
+    }
+  | {
+      id: string;
+      /** Linked to the user-question id immediately above it in the thread. */
+      questionId: string;
+      type: "ai-response";
+      text: string;
+      timestamp: number;
+      streaming: boolean;
+    };
+
 // ── Reducer state ────────────────────────────────────────────────
 
 export type UiPhase =
@@ -147,6 +196,27 @@ export interface ActiveSuggestion {
 
 export interface OverlayState {
   uiPhase: UiPhase;
+  /** Sub-prompt 4.6 — Cluely strip vs expanded panel. */
+  mode: OverlayMode;
+  /** Sub-prompt 4.6 — which tab is active in expanded mode. */
+  activeTab: ExpandedTab;
+  /**
+   * Sub-prompt 4.6 — full transcript history for the Transcript tab.
+   * The 2-utterance `transcript` array is for the legacy strip preview;
+   * fullTranscript is the complete in-memory list for the panel view.
+   * Capped at MAX_FULL_TRANSCRIPT to keep the React list manageable.
+   */
+  fullTranscript: Utterance[];
+  /**
+   * Sub-prompt 4.6 — chat thread shown in the Chat tab. Auto-suggestions,
+   * quick-action results, user questions, and AI responses all stream
+   * into this single ordered list.
+   */
+  chatThread: ChatMessage[];
+  /** Sub-prompt 4.6 — draft text in the input box. */
+  inputDraft: string;
+  /** Sub-prompt 4.6 — id of the in-flight AI streaming response, or null. */
+  streamingAiResponseId: string | null;
   /** Last 2 utterances (older drop off). */
   transcript: Utterance[];
   /** Latest rolling summary text (hidden in V1 but kept for Sub-prompt 5+). */
@@ -177,10 +247,25 @@ export type Action =
   | { type: "TOGGLE_EXPANDED" }
   | { type: "COPY_FLASH" }
   | { type: "CLEAR_FAILURE_TOAST" }
-  | { type: "TICK"; nowMs: number };
+  | { type: "TICK"; nowMs: number }
+  // Sub-prompt 4.6 (Cluely 1:1)
+  | { type: "SET_MODE"; mode: OverlayMode }
+  | { type: "SET_ACTIVE_TAB"; tab: ExpandedTab }
+  | { type: "UPDATE_INPUT_DRAFT"; value: string }
+  | { type: "SUBMIT_USER_QUESTION"; question: string; questionId: string; aiResponseId: string }
+  | { type: "AI_RESPONSE_DELTA"; aiResponseId: string; text: string }
+  | { type: "AI_RESPONSE_COMPLETE"; aiResponseId: string; text: string }
+  | { type: "AI_RESPONSE_FAILED"; aiResponseId: string; reason: string }
+  | { type: "CLEAR_CHAT_THREAD" };
 
 export const initialOverlayState: OverlayState = {
   uiPhase: "Idle",
+  mode: "strip",
+  activeTab: "chat",
+  fullTranscript: [],
+  chatThread: [],
+  inputDraft: "",
+  streamingAiResponseId: null,
   transcript: [],
   summary: null,
   active: null,

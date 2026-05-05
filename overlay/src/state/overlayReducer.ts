@@ -18,15 +18,27 @@ import type {
   OverlayState,
   Utterance,
   ActiveSuggestion,
+  ChatMessage,
   TriggerType,
+  QuickActionType,
 } from "./types";
 import { initialOverlayState } from "./types";
 
 const MAX_VISIBLE_UTTERANCES = 2;
+const MAX_FULL_TRANSCRIPT = 200;
+const MAX_CHAT_THREAD = 100;
 const REASONING_FALLBACK_MS = 2_000;
 const SHOWING_TTL_MS = 30_000;
 const COPY_FLASH_MS = 1_200;
 const FAILURE_TOAST_MS = 1_200;
+
+// Sub-prompt 4.6 — quick-action triggers that should emit a
+// chat-thread message instead of a transient suggestion card.
+const QUICK_ACTION_TRIGGERS: ReadonlySet<string> = new Set([
+  "follow_up",
+  "fact_check",
+  "recap",
+]);
 
 export { initialOverlayState };
 
@@ -57,7 +69,23 @@ export function overlayReducer(
       } else {
         next = [...state.transcript, incoming].slice(-MAX_VISIBLE_UTTERANCES);
       }
-      return { ...state, transcript: next };
+
+      // Sub-prompt 4.6 — also maintain the full history for the
+      // Transcript tab. Same key-substitution model.
+      const fullExistingIdx = state.fullTranscript.findIndex(
+        (u) => u.key === key,
+      );
+      let fullNext: Utterance[];
+      if (fullExistingIdx >= 0) {
+        fullNext = state.fullTranscript.map((u, i) =>
+          i === fullExistingIdx ? incoming : u,
+        );
+      } else {
+        fullNext = [...state.fullTranscript, incoming].slice(
+          -MAX_FULL_TRANSCRIPT,
+        );
+      }
+      return { ...state, transcript: next, fullTranscript: fullNext };
     }
 
     case "SUMMARY_UPDATED":
@@ -124,6 +152,36 @@ export function overlayReducer(
       if (state.active.expanded && state.uiPhase === "Showing") {
         return state;
       }
+
+      // Sub-prompt 4.6 — also append to the chat thread so the
+      // expanded Chat tab has a persistent history. Auto-fired
+      // moments => "auto-suggestion"; user-clicked quick-actions
+      // (follow_up / fact_check / recap) => "quick-action-result".
+      // The "ask" hotkey path counts as auto-suggestion (it's the
+      // tactical-suggestion shape).
+      const isQuickActionResult =
+        state.active.triggerSource === "hotkey" &&
+        QUICK_ACTION_TRIGGERS.has(payload.moment_type);
+      const chatMessage: ChatMessage = isQuickActionResult
+        ? {
+            id: payload.suggestion_id,
+            type: "quick-action-result",
+            action: payload.moment_type as QuickActionType,
+            text: payload.primary,
+            secondary: payload.secondary,
+            reasoning: payload.reasoning,
+            timestamp: Date.now(),
+          }
+        : {
+            id: payload.suggestion_id,
+            type: "auto-suggestion",
+            trigger: (payload.moment_type ?? "general") as TriggerType,
+            text: payload.primary,
+            secondary: payload.secondary,
+            reasoning: payload.reasoning,
+            timestamp: Date.now(),
+          };
+
       return {
         ...state,
         uiPhase: "Showing",
@@ -139,6 +197,7 @@ export function overlayReducer(
           streamingPrimary: payload.primary,
           expanded: false,
         },
+        chatThread: appendChatMessage(state.chatThread, chatMessage),
         reasoningStartedAtMs: null,
         showingStartedAtMs: Date.now(),
       };
@@ -187,6 +246,96 @@ export function overlayReducer(
 
     case "CLEAR_FAILURE_TOAST":
       return { ...state, failureToast: null };
+
+    // ── Sub-prompt 4.6 (Cluely 1:1) ────────────────────────────
+
+    case "SET_MODE":
+      return { ...state, mode: action.mode };
+
+    case "SET_ACTIVE_TAB":
+      return { ...state, activeTab: action.tab };
+
+    case "UPDATE_INPUT_DRAFT":
+      return { ...state, inputDraft: action.value };
+
+    case "SUBMIT_USER_QUESTION": {
+      const { question, questionId, aiResponseId } = action;
+      const userMsg: ChatMessage = {
+        id: questionId,
+        type: "user-question",
+        question,
+        timestamp: Date.now(),
+      };
+      // Pre-create the AI response slot in streaming state so the
+      // delta handler can append text without an empty-frame flicker.
+      const aiSkeleton: ChatMessage = {
+        id: aiResponseId,
+        questionId,
+        type: "ai-response",
+        text: "",
+        timestamp: Date.now(),
+        streaming: true,
+      };
+      return {
+        ...state,
+        chatThread: appendChatMessage(
+          appendChatMessage(state.chatThread, userMsg),
+          aiSkeleton,
+        ),
+        inputDraft: "",
+        streamingAiResponseId: aiResponseId,
+        // Force the user into the Chat tab so they see their own
+        // question render — UX surprise to land in Transcript here.
+        activeTab: "chat",
+      };
+    }
+
+    case "AI_RESPONSE_DELTA": {
+      const { aiResponseId, text } = action;
+      return {
+        ...state,
+        chatThread: state.chatThread.map((m) =>
+          m.id === aiResponseId && m.type === "ai-response"
+            ? { ...m, text: m.text + text }
+            : m,
+        ),
+      };
+    }
+
+    case "AI_RESPONSE_COMPLETE": {
+      const { aiResponseId, text } = action;
+      return {
+        ...state,
+        streamingAiResponseId:
+          state.streamingAiResponseId === aiResponseId
+            ? null
+            : state.streamingAiResponseId,
+        chatThread: state.chatThread.map((m) =>
+          m.id === aiResponseId && m.type === "ai-response"
+            ? { ...m, text, streaming: false }
+            : m,
+        ),
+      };
+    }
+
+    case "AI_RESPONSE_FAILED": {
+      const { aiResponseId, reason } = action;
+      return {
+        ...state,
+        streamingAiResponseId:
+          state.streamingAiResponseId === aiResponseId
+            ? null
+            : state.streamingAiResponseId,
+        chatThread: state.chatThread.map((m) =>
+          m.id === aiResponseId && m.type === "ai-response"
+            ? { ...m, text: `(error: ${reason})`, streaming: false }
+            : m,
+        ),
+      };
+    }
+
+    case "CLEAR_CHAT_THREAD":
+      return { ...state, chatThread: [], streamingAiResponseId: null };
 
     case "TICK": {
       // Driven by a 250ms interval in CopilotOverlay. Handles
@@ -317,6 +466,17 @@ function applyStreaming(
 
   // kind === "complete" — handled by SUGGESTION_COMPLETE action.
   return state;
+}
+
+/**
+ * Append a chat message + drop the oldest if we'd exceed MAX_CHAT_THREAD.
+ * Last-N-wins so a long call doesn't unbounded-grow the React list.
+ */
+function appendChatMessage(
+  thread: ChatMessage[],
+  msg: ChatMessage,
+): ChatMessage[] {
+  return [...thread, msg].slice(-MAX_CHAT_THREAD);
 }
 
 /**
