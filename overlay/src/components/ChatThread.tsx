@@ -1,9 +1,14 @@
 import React, { useEffect, useRef, useState } from "react";
-import { Copy, Check } from "lucide-react";
+import { Copy, Check, ExternalLink } from "lucide-react";
+import { emit } from "@tauri-apps/api/event";
 import { cn } from "@/lib/utils";
 import { copyToClipboard } from "@/lib/copyToClipboard";
 import { labelFor } from "@/lib/triggerLabels";
-import type { ChatMessage, QuickActionType } from "@/state/types";
+import type {
+  ChatMessage,
+  FactCheckSource,
+  QuickActionType,
+} from "@/state/types";
 
 /**
  * Sub-prompt 4.6 (Cluely 1:1) — chat thread inside the expanded panel's
@@ -17,9 +22,21 @@ import type { ChatMessage, QuickActionType } from "@/state/types";
 
 interface Props {
   messages: ChatMessage[];
+  /** Sub-prompt 4.7 — auto-fired moment suggestions surface in a
+   * separate dimmed ribbon at the top so they don't pollute the
+   * user's conversation. */
+  autoSuggestionStream?: ChatMessage[];
+  /** Sub-prompt 4.7 — when false, the user has no active thread.
+   * Empty state shows the "start a chat" CTA instead of just a
+   * blank panel. */
+  hasActiveThread?: boolean;
 }
 
-export function ChatThread({ messages }: Props) {
+export function ChatThread({
+  messages,
+  autoSuggestionStream = [],
+  hasActiveThread = true,
+}: Props) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
 
@@ -42,30 +59,91 @@ export function ChatThread({ messages }: Props) {
     if (el) el.scrollTop = el.scrollHeight;
   }, [messages]);
 
-  if (messages.length === 0) {
-    return (
-      <div className="flex-1 flex items-center justify-center px-6 py-8">
-        <div className="text-center max-w-sm">
-          <p className="text-sm text-zinc-300 leading-relaxed">
-            Wolfee surfaces tactical suggestions during your call.
-          </p>
-          <p className="text-xs text-zinc-500 leading-relaxed mt-2">
-            Use the quick actions below or type your own question — Wolfee
-            answers using the live transcript and your call context.
-          </p>
-        </div>
-      </div>
-    );
-  }
+  const showEmpty = messages.length === 0;
+  const showAutoRibbon = autoSuggestionStream.length > 0;
 
   return (
-    <div
-      ref={scrollRef}
-      className="flex-1 overflow-y-auto py-2 space-y-1 chat-scroll"
-    >
-      {messages.map((m) => (
-        <ChatMessageView key={m.id} message={m} />
-      ))}
+    <div className="flex-1 flex flex-col min-h-0">
+      {showAutoRibbon && (
+        <AutoSuggestionRibbon stream={autoSuggestionStream} />
+      )}
+
+      {showEmpty ? (
+        <div className="flex-1 flex items-center justify-center px-6 py-8">
+          <div className="text-center max-w-sm">
+            {hasActiveThread ? (
+              <>
+                <p className="text-sm text-zinc-300 leading-relaxed">
+                  This chat is empty.
+                </p>
+                <p className="text-xs text-zinc-500 leading-relaxed mt-2">
+                  Use the quick actions below or type a question — your
+                  follow-ups stay in this thread.
+                </p>
+              </>
+            ) : (
+              <>
+                <p className="text-sm text-zinc-300 leading-relaxed">
+                  Start a chat.
+                </p>
+                <p className="text-xs text-zinc-500 leading-relaxed mt-2">
+                  Click <span className="text-copilot-accent">+ New chat</span>
+                  {" "}above, or just type a question — your conversation will
+                  build up so follow-ups stay in context.
+                </p>
+              </>
+            )}
+          </div>
+        </div>
+      ) : (
+        <div
+          ref={scrollRef}
+          className="flex-1 overflow-y-auto py-2 space-y-1 chat-scroll min-h-0"
+        >
+          {messages.map((m) => (
+            <ChatMessageView key={m.id} message={m} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Sub-prompt 4.7 — auto-fired suggestions in a small dimmed ribbon
+ * above the user's active thread. Visually distinct so the rep
+ * recognizes "this is Wolfee surfacing something on its own" vs
+ * "this is the chat I'm in." Only shows the most recent 1-2.
+ */
+function AutoSuggestionRibbon({ stream }: { stream: ChatMessage[] }) {
+  const recent = stream.slice(-2);
+  return (
+    <div className="px-3 py-1.5 bg-amber-500/5 border-b border-amber-500/15 shrink-0">
+      <div className="text-[10px] uppercase tracking-wider text-amber-300/80 mb-0.5">
+        Auto-suggestions
+      </div>
+      <div className="space-y-1">
+        {recent.map((m) => {
+          if (m.type === "auto-suggestion") {
+            return (
+              <div key={m.id} className="text-xs text-zinc-200 leading-snug">
+                <span className="text-amber-300/80 font-semibold mr-1.5">
+                  ⚠
+                </span>
+                {m.text}
+              </div>
+            );
+          }
+          if (m.type === "quick-action-result") {
+            return (
+              <div key={m.id} className="text-xs text-zinc-200 leading-snug">
+                {m.text}
+              </div>
+            );
+          }
+          return null;
+        })}
+      </div>
     </div>
   );
 }
@@ -91,6 +169,7 @@ function ChatMessageView({ message }: { message: ChatMessage }) {
         secondary={message.secondary}
         reasoning={message.reasoning}
         timestamp={message.timestamp}
+        sources={message.sources}
       />
     );
   }
@@ -159,14 +238,17 @@ function SuggestionBubble({
   secondary,
   reasoning,
   timestamp,
+  sources,
 }: {
   badge: string;
   text: string;
   secondary: string | null;
   reasoning: string | null;
   timestamp: number;
+  sources?: FactCheckSource[];
 }) {
   const [open, setOpen] = useState(false);
+  const hasSources = sources && sources.length > 0;
   return (
     <div className="px-3 py-1.5 group">
       <button
@@ -202,9 +284,60 @@ function SuggestionBubble({
           </p>
         )}
       </button>
+      {/* Sub-prompt 4.7 — fact-check source chips. Always rendered
+          when present (no need to expand the card). Click opens in
+          system browser via Rust open_url. */}
+      {hasSources && <SourcesRow sources={sources!} />}
       <CopyAffordance text={text} />
     </div>
   );
+}
+
+/**
+ * Sub-prompt 4.7 — small clickable chip-row of fact-check citations.
+ * Click → emit wolfee-action open-external-url → Rust opens in
+ * system default browser via the existing open_url helper.
+ */
+function SourcesRow({ sources }: { sources: FactCheckSource[] }) {
+  const handleOpen = (url: string) => {
+    void emit("wolfee-action", { type: "open-external-url", url });
+  };
+  return (
+    <div className="flex flex-wrap items-center gap-1.5 mt-1.5 px-1">
+      <span className="text-[10px] uppercase tracking-wider text-zinc-500">
+        Sources
+      </span>
+      {sources.map((s, i) => {
+        const host = hostnameOf(s.url);
+        return (
+          <button
+            key={`${s.url}-${i}`}
+            type="button"
+            onClick={() => handleOpen(s.url)}
+            title={s.url}
+            className={cn(
+              "inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md shrink-0",
+              "text-[10px] border border-white/10 bg-zinc-900/40",
+              "text-zinc-300 hover:text-copilot-accent hover:border-copilot-accent/40",
+              "transition-colors cursor-pointer",
+              "focus:outline-none focus-visible:ring-1 focus-visible:ring-copilot-accent/60",
+            )}
+          >
+            <ExternalLink className="w-2.5 h-2.5" />
+            <span className="truncate max-w-[140px]">{s.title || host}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function hostnameOf(url: string): string {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return url;
+  }
 }
 
 function CopyAffordance({ text }: { text: string }) {

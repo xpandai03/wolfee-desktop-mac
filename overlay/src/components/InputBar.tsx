@@ -1,5 +1,5 @@
 import React, { useEffect, useRef } from "react";
-import { Send, Sparkles, MessageCircleQuestion, ShieldCheck, RotateCw } from "lucide-react";
+import { Send, Sparkles, MessageCircleQuestion, ShieldCheck, RotateCw, Plus } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { QuickActionType } from "@/state/types";
 
@@ -30,6 +30,8 @@ interface Props {
   onDraftChange: (value: string) => void;
   onQuickAction: (action: QuickActionType) => void;
   onSubmitQuestion: (question: string) => void;
+  /** Sub-prompt 4.7 — also accessible via ⌘+⇧+N global hotkey. */
+  onNewThread?: () => void;
   /** Forwarded ref so the global Cmd+Enter handler can focus the input. */
   inputRef?: React.RefObject<HTMLTextAreaElement | null>;
 }
@@ -51,6 +53,7 @@ export function InputBar({
   onDraftChange,
   onQuickAction,
   onSubmitQuestion,
+  onNewThread,
   inputRef,
 }: Props) {
   const localRef = useRef<HTMLTextAreaElement | null>(null);
@@ -107,14 +110,29 @@ export function InputBar({
         ))}
       </div>
 
-      {/* Input + send */}
+      {/* Input + send + new chat */}
       <div
         className={cn(
-          "flex items-end gap-2 rounded-lg border border-white/10 bg-zinc-900",
+          "flex items-end gap-2 rounded-lg border border-white/10 bg-zinc-900/80",
           "focus-within:border-copilot-accent/40",
           "transition-colors",
         )}
       >
+        {onNewThread && (
+          <button
+            type="button"
+            onClick={onNewThread}
+            aria-label="New chat"
+            title="New chat (⌘⇧N)"
+            className={cn(
+              "m-1.5 p-1.5 rounded-md cursor-pointer transition-colors",
+              "text-zinc-500 hover:text-copilot-accent hover:bg-white/5",
+              "focus:outline-none focus-visible:ring-1 focus-visible:ring-copilot-accent/60",
+            )}
+          >
+            <Plus className="w-3.5 h-3.5" />
+          </button>
+        )}
         <textarea
           ref={ref as React.RefObject<HTMLTextAreaElement>}
           rows={1}
@@ -124,7 +142,7 @@ export function InputBar({
           placeholder="Ask about your screen or conversation, or ⌘ ⏎ for Assist"
           disabled={isAiStreaming}
           className={cn(
-            "flex-1 px-3 py-2 bg-transparent resize-none",
+            "flex-1 px-1 py-2 bg-transparent resize-none",
             "text-sm text-zinc-100 placeholder:text-zinc-600",
             "focus:outline-none",
             "disabled:opacity-50",

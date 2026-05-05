@@ -71,6 +71,17 @@ export interface SuggestionCompletePayload {
     reasoning: string;
     ttl_seconds: number;
   };
+  /**
+   * Sub-prompt 4.7 — populated for fact_check responses (search-
+   * preview model). Backend extracts `annotations.url_citation`
+   * entries and forwards them; frontend renders as clickable chips.
+   */
+  sources?: FactCheckSource[];
+}
+
+export interface FactCheckSource {
+  title: string;
+  url: string;
 }
 
 export interface SuggestionFailedPayload {
@@ -100,6 +111,30 @@ export type TriggerSource = "moment" | "hotkey";
 
 // Sub-prompt 4.5 — the 4 user-clickable action buttons.
 export type QuickActionType = "ask" | "follow_up" | "fact_check" | "recap";
+
+/**
+ * Sub-prompt 4.7 — chat threads. Each thread is an independent
+ * conversation with its own message history; the active thread's
+ * messages are included as `chat_history` on every backend
+ * /quick-action call so the LLM has conversational memory.
+ *
+ * "Auto-fired suggestions" do NOT live in threads — they go into a
+ * separate stream so they don't pollute the user's conversation.
+ */
+export interface ChatThreadMeta {
+  id: string;
+  /** Default = `Chat 1`, `Chat 2`, ...; user-renamable via long-press. */
+  name: string;
+  createdAt: number;
+  /** Snapshot of when this thread was started — Sub-prompt 4.8 may
+   * use this for "what transcript was the rep looking at when they
+   * asked this question." V1 just records it. */
+  transcriptSnapshotAt: number;
+}
+
+export interface ChatThread extends ChatThreadMeta {
+  messages: ChatMessage[];
+}
 
 // ── Sub-prompt 4.6 (Cluely 1:1 redesign) ────────────────────────────
 
@@ -133,6 +168,8 @@ export type ChatMessage =
       secondary: string | null;
       reasoning: string | null;
       timestamp: number;
+      /** Sub-prompt 4.7 — fact-check messages carry their search sources. */
+      sources?: FactCheckSource[];
     }
   | {
       id: string;
@@ -208,15 +245,36 @@ export interface OverlayState {
    */
   fullTranscript: Utterance[];
   /**
-   * Sub-prompt 4.6 — chat thread shown in the Chat tab. Auto-suggestions,
-   * quick-action results, user questions, and AI responses all stream
-   * into this single ordered list.
+   * Sub-prompt 4.7 — multiple independent chat threads. The active
+   * thread's messages are sent to the backend as chat_history so
+   * the LLM has conversational memory. Replaces the single
+   * chatThread field from Sub-prompt 4.6.
    */
+  chatThreads: ChatThread[];
+  /** Sub-prompt 4.7 — id of currently-displayed thread, or null
+   * (initial state — empty Chat tab shows "start a chat" CTA). */
+  activeThreadId: string | null;
+  /**
+   * Sub-prompt 4.7 — auto-fired moment suggestions live OUTSIDE
+   * threads so they don't pollute user conversation history. Shown
+   * as a small ribbon at the top of the Chat tab.
+   */
+  autoSuggestionStream: ChatMessage[];
+
+  /** @deprecated Sub-prompt 4.7 — renamed to chatThreads. Kept until
+   * all consumers migrate. Reducers no longer write to this field. */
   chatThread: ChatMessage[];
   /** Sub-prompt 4.6 — draft text in the input box. */
   inputDraft: string;
   /** Sub-prompt 4.6 — id of the in-flight AI streaming response, or null. */
   streamingAiResponseId: string | null;
+  /**
+   * Sub-prompt 4.7 — wall-clock when new content was appended to the
+   * Chat tab while the user wasn't looking at it. Drives the brief
+   * pulse animation on the tab label. Cleared by SET_ACTIVE_TAB:chat
+   * or after PULSE_DURATION_MS via TICK.
+   */
+  chatTabPulseAt: number | null;
   /** Last 2 utterances (older drop off). */
   transcript: Utterance[];
   /** Latest rolling summary text (hidden in V1 but kept for Sub-prompt 5+). */
@@ -256,16 +314,25 @@ export type Action =
   | { type: "AI_RESPONSE_DELTA"; aiResponseId: string; text: string }
   | { type: "AI_RESPONSE_COMPLETE"; aiResponseId: string; text: string }
   | { type: "AI_RESPONSE_FAILED"; aiResponseId: string; reason: string }
-  | { type: "CLEAR_CHAT_THREAD" };
+  | { type: "CLEAR_CHAT_THREAD" }
+  // Sub-prompt 4.7 — multi-thread chat
+  | { type: "NEW_THREAD"; threadId: string }
+  | { type: "SWITCH_THREAD"; threadId: string }
+  | { type: "RENAME_THREAD"; threadId: string; name: string }
+  | { type: "DELETE_THREAD"; threadId: string };
 
 export const initialOverlayState: OverlayState = {
   uiPhase: "Idle",
   mode: "strip",
   activeTab: "chat",
   fullTranscript: [],
+  chatThreads: [],
+  activeThreadId: null,
+  autoSuggestionStream: [],
   chatThread: [],
   inputDraft: "",
   streamingAiResponseId: null,
+  chatTabPulseAt: null,
   transcript: [],
   summary: null,
   active: null,

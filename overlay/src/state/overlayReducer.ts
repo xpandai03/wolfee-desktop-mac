@@ -19,6 +19,7 @@ import type {
   Utterance,
   ActiveSuggestion,
   ChatMessage,
+  ChatThread,
   TriggerType,
   QuickActionType,
 } from "./types";
@@ -31,6 +32,7 @@ const REASONING_FALLBACK_MS = 2_000;
 const SHOWING_TTL_MS = 30_000;
 const COPY_FLASH_MS = 1_200;
 const FAILURE_TOAST_MS = 1_200;
+const PULSE_DURATION_MS = 2_500;
 
 // Sub-prompt 4.6 — quick-action triggers that should emit a
 // chat-thread message instead of a transient suggestion card.
@@ -143,7 +145,7 @@ export function overlayReducer(
     }
 
     case "SUGGESTION_COMPLETE": {
-      const { payload } = action.payload;
+      const { payload, sources } = action.payload;
       if (state.active === null) return state;
       // If a previous suggestion is currently expanded, the user has
       // explicitly "kept" it — don't blow it away with a new auto-fire.
@@ -153,15 +155,15 @@ export function overlayReducer(
         return state;
       }
 
-      // Sub-prompt 4.6 — also append to the chat thread so the
-      // expanded Chat tab has a persistent history. Auto-fired
-      // moments => "auto-suggestion"; user-clicked quick-actions
-      // (follow_up / fact_check / recap) => "quick-action-result".
-      // The "ask" hotkey path counts as auto-suggestion (it's the
-      // tactical-suggestion shape).
+      // Sub-prompt 4.7 routing:
+      //   - Auto-fired moments (triggerSource = "moment") → autoSuggestionStream
+      //   - User-clicked quick-actions (triggerSource = "hotkey") → active thread
+      //     (creating one if no thread is active yet)
       const isQuickActionResult =
         state.active.triggerSource === "hotkey" &&
         QUICK_ACTION_TRIGGERS.has(payload.moment_type);
+      const isAutoMoment = state.active.triggerSource === "moment";
+
       const chatMessage: ChatMessage = isQuickActionResult
         ? {
             id: payload.suggestion_id,
@@ -171,6 +173,8 @@ export function overlayReducer(
             secondary: payload.secondary,
             reasoning: payload.reasoning,
             timestamp: Date.now(),
+            // Sub-prompt 4.7 — sources accompany fact-check verdicts.
+            sources: sources && sources.length > 0 ? sources : undefined,
           }
         : {
             id: payload.suggestion_id,
@@ -181,6 +185,31 @@ export function overlayReducer(
             reasoning: payload.reasoning,
             timestamp: Date.now(),
           };
+
+      let nextThreads = state.chatThreads;
+      let nextActiveId = state.activeThreadId;
+      let nextAutoStream = state.autoSuggestionStream;
+
+      if (isAutoMoment) {
+        // Auto-fired moment + ask-hotkey-without-typing both land
+        // here. They go to the auto-suggestion stream, NOT a thread.
+        nextAutoStream = appendChatMessage(state.autoSuggestionStream, chatMessage);
+      } else {
+        // User-clicked quick-action result. Land in the active
+        // thread or create one if none exists.
+        let threadId = state.activeThreadId;
+        if (threadId === null) {
+          const created = createNewThread(state.chatThreads.length);
+          nextThreads = [...state.chatThreads, created];
+          threadId = created.id;
+          nextActiveId = threadId;
+        }
+        nextThreads = nextThreads.map((t) =>
+          t.id === threadId
+            ? { ...t, messages: appendChatMessage(t.messages, chatMessage) }
+            : t,
+        );
+      }
 
       return {
         ...state,
@@ -197,7 +226,11 @@ export function overlayReducer(
           streamingPrimary: payload.primary,
           expanded: false,
         },
-        chatThread: appendChatMessage(state.chatThread, chatMessage),
+        chatThreads: nextThreads,
+        activeThreadId: nextActiveId,
+        autoSuggestionStream: nextAutoStream,
+        chatTabPulseAt:
+          state.activeTab === "chat" ? state.chatTabPulseAt : Date.now(),
         reasoningStartedAtMs: null,
         showingStartedAtMs: Date.now(),
       };
@@ -253,7 +286,12 @@ export function overlayReducer(
       return { ...state, mode: action.mode };
 
     case "SET_ACTIVE_TAB":
-      return { ...state, activeTab: action.tab };
+      // Sub-prompt 4.7 — switching to Chat tab clears its pulse hint.
+      return {
+        ...state,
+        activeTab: action.tab,
+        chatTabPulseAt: action.tab === "chat" ? null : state.chatTabPulseAt,
+      };
 
     case "UPDATE_INPUT_DRAFT":
       return { ...state, inputDraft: action.value };
@@ -266,8 +304,6 @@ export function overlayReducer(
         question,
         timestamp: Date.now(),
       };
-      // Pre-create the AI response slot in streaming state so the
-      // delta handler can append text without an empty-frame flicker.
       const aiSkeleton: ChatMessage = {
         id: aiResponseId,
         questionId,
@@ -276,16 +312,33 @@ export function overlayReducer(
         timestamp: Date.now(),
         streaming: true,
       };
+
+      // Sub-prompt 4.7 — route to active thread; auto-create if none.
+      let nextThreads = state.chatThreads;
+      let activeId = state.activeThreadId;
+      if (activeId === null) {
+        const created = createNewThread(state.chatThreads.length);
+        nextThreads = [...state.chatThreads, created];
+        activeId = created.id;
+      }
+      nextThreads = nextThreads.map((t) =>
+        t.id === activeId
+          ? {
+              ...t,
+              messages: appendChatMessage(
+                appendChatMessage(t.messages, userMsg),
+                aiSkeleton,
+              ),
+            }
+          : t,
+      );
+
       return {
         ...state,
-        chatThread: appendChatMessage(
-          appendChatMessage(state.chatThread, userMsg),
-          aiSkeleton,
-        ),
+        chatThreads: nextThreads,
+        activeThreadId: activeId,
         inputDraft: "",
         streamingAiResponseId: aiResponseId,
-        // Force the user into the Chat tab so they see their own
-        // question render — UX surprise to land in Transcript here.
         activeTab: "chat",
       };
     }
@@ -294,7 +347,7 @@ export function overlayReducer(
       const { aiResponseId, text } = action;
       return {
         ...state,
-        chatThread: state.chatThread.map((m) =>
+        chatThreads: mapAcrossAllThreads(state.chatThreads, (m) =>
           m.id === aiResponseId && m.type === "ai-response"
             ? { ...m, text: m.text + text }
             : m,
@@ -310,11 +363,13 @@ export function overlayReducer(
           state.streamingAiResponseId === aiResponseId
             ? null
             : state.streamingAiResponseId,
-        chatThread: state.chatThread.map((m) =>
+        chatThreads: mapAcrossAllThreads(state.chatThreads, (m) =>
           m.id === aiResponseId && m.type === "ai-response"
             ? { ...m, text, streaming: false }
             : m,
         ),
+        chatTabPulseAt:
+          state.activeTab === "chat" ? state.chatTabPulseAt : Date.now(),
       };
     }
 
@@ -326,7 +381,7 @@ export function overlayReducer(
           state.streamingAiResponseId === aiResponseId
             ? null
             : state.streamingAiResponseId,
-        chatThread: state.chatThread.map((m) =>
+        chatThreads: mapAcrossAllThreads(state.chatThreads, (m) =>
           m.id === aiResponseId && m.type === "ai-response"
             ? { ...m, text: `(error: ${reason})`, streaming: false }
             : m,
@@ -335,7 +390,68 @@ export function overlayReducer(
     }
 
     case "CLEAR_CHAT_THREAD":
-      return { ...state, chatThread: [], streamingAiResponseId: null };
+      // Sub-prompt 4.7 — clears the active thread's messages (NOT
+      // the thread itself). Use DELETE_THREAD if you want to remove
+      // a whole thread.
+      return {
+        ...state,
+        chatThreads: state.chatThreads.map((t) =>
+          t.id === state.activeThreadId ? { ...t, messages: [] } : t,
+        ),
+        streamingAiResponseId: null,
+      };
+
+    // Sub-prompt 4.7 — multi-thread management.
+    case "NEW_THREAD": {
+      const created: ChatThread = {
+        id: action.threadId,
+        name: defaultThreadName(state.chatThreads.length),
+        createdAt: Date.now(),
+        transcriptSnapshotAt: Date.now(),
+        messages: [],
+      };
+      return {
+        ...state,
+        chatThreads: [...state.chatThreads, created],
+        activeThreadId: created.id,
+        activeTab: "chat",
+      };
+    }
+
+    case "SWITCH_THREAD": {
+      if (!state.chatThreads.some((t) => t.id === action.threadId)) {
+        return state;
+      }
+      return {
+        ...state,
+        activeThreadId: action.threadId,
+        activeTab: "chat",
+      };
+    }
+
+    case "RENAME_THREAD": {
+      return {
+        ...state,
+        chatThreads: state.chatThreads.map((t) =>
+          t.id === action.threadId ? { ...t, name: action.name } : t,
+        ),
+      };
+    }
+
+    case "DELETE_THREAD": {
+      const remaining = state.chatThreads.filter(
+        (t) => t.id !== action.threadId,
+      );
+      const nextActive =
+        state.activeThreadId === action.threadId
+          ? remaining[remaining.length - 1]?.id ?? null
+          : state.activeThreadId;
+      return {
+        ...state,
+        chatThreads: remaining,
+        activeThreadId: nextActive,
+      };
+    }
 
     case "TICK": {
       // Driven by a 250ms interval in CopilotOverlay. Handles
@@ -382,6 +498,15 @@ export function overlayReducer(
         action.nowMs - next.copiedFlashAt >= COPY_FLASH_MS
       ) {
         next = { ...next, copiedFlashAt: null };
+      }
+
+      // Sub-prompt 4.7 — auto-clear the Chat tab pulse so the
+      // animation only runs once per new content event.
+      if (
+        next.chatTabPulseAt !== null &&
+        action.nowMs - next.chatTabPulseAt >= PULSE_DURATION_MS
+      ) {
+        next = { ...next, chatTabPulseAt: null };
       }
 
       // Failure toast uses its own action because the duration
@@ -477,6 +602,40 @@ function appendChatMessage(
   msg: ChatMessage,
 ): ChatMessage[] {
   return [...thread, msg].slice(-MAX_CHAT_THREAD);
+}
+
+// Sub-prompt 4.7 helpers —————————————————————————————————————————
+
+function defaultThreadName(existingCount: number): string {
+  return `Chat ${existingCount + 1}`;
+}
+
+function createNewThread(existingCount: number): ChatThread {
+  const now = Date.now();
+  return {
+    id: `thread-${now}-${Math.random().toString(36).slice(2, 8)}`,
+    name: defaultThreadName(existingCount),
+    createdAt: now,
+    transcriptSnapshotAt: now,
+    messages: [],
+  };
+}
+
+/** Apply a per-message map across every thread. Useful for AI
+ * response delta routing where we don't track which thread a
+ * given ai_response_id lives in. */
+function mapAcrossAllThreads(
+  threads: ChatThread[],
+  fn: (m: ChatMessage) => ChatMessage,
+): ChatThread[] {
+  return threads.map((t) => ({ ...t, messages: t.messages.map(fn) }));
+}
+
+/** Selector — messages from the active thread (or [] if no active). */
+export function activeThreadMessages(state: OverlayState): ChatMessage[] {
+  if (state.activeThreadId === null) return [];
+  const t = state.chatThreads.find((x) => x.id === state.activeThreadId);
+  return t?.messages ?? [];
 }
 
 /**

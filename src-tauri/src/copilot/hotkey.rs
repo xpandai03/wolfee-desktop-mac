@@ -83,6 +83,31 @@ pub fn register<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error
     register_nudge(app, Code::ArrowRight, 20, 0)?;
     log::info!("[Copilot] Registered hotkey ⌃+arrows (nudge overlay 20px)");
 
+    // ⌘+⇧+N — Sub-prompt 4.7 — start a new chat thread. Expands the
+    // panel + makes sure the strip is visible + emits a frontend event
+    // that the React reducer hooks into NEW_THREAD.
+    let new_thread_shortcut =
+        Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::KeyN);
+    let app_handle5 = app.clone();
+    app.global_shortcut().on_shortcut(
+        new_thread_shortcut,
+        move |_app, _shortcut, event| {
+            if event.state() == ShortcutState::Pressed {
+                use tauri::Emitter;
+                if !window::is_overlay_visible(&app_handle5) {
+                    if let Err(e) = window::show_overlay(&app_handle5) {
+                        log::warn!("[Copilot] ⌘⇧N show_overlay failed: {}", e);
+                        return;
+                    }
+                }
+                // Frontend listens for "copilot-new-thread" and dispatches
+                // NEW_THREAD with a fresh id. Also auto-expands.
+                let _ = app_handle5.emit("copilot-new-thread", ());
+            }
+        },
+    )?;
+    log::info!("[Copilot] Registered hotkey ⌘+⇧+N (new chat thread)");
+
     Ok(())
 }
 
