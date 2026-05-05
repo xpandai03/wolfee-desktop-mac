@@ -148,6 +148,11 @@ pub struct QuickActionRequest {
     pub transcript_window: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rolling_summary: Option<String>,
+    /// Sub-prompt 4.6 — when present, overrides the auto-tactical
+    /// behavior of action="ask" with a free-form user question. The
+    /// backend ask.md prompt branches on this field's presence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_question: Option<String>,
 }
 
 /// Parsed SSE event from the /suggest stream.

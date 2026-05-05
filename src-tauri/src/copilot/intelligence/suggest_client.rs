@@ -269,6 +269,7 @@ async fn run_stream<R: Runtime>(
                 action: *action,
                 transcript_window,
                 rolling_summary,
+                user_question: None,
             };
             api.post_quick_action_sse(&session_id, req)
                 .await
@@ -481,4 +482,206 @@ fn truncate(s: &str, n: usize) -> String {
     let mut out = s.chars().take(n).collect::<String>();
     out.push('…');
     out
+}
+
+// ── Sub-prompt 4.6 — chat-question dispatch ────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+struct ChatStreamingPayload {
+    ai_response_id: String,
+    text: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ChatCompletePayload {
+    ai_response_id: String,
+    text: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ChatFailedPayload {
+    ai_response_id: String,
+    reason: String,
+}
+
+/// Sub-prompt 4.6 (Cluely 1:1) — user typed a question into the chat
+/// input bar. Hits /quick-action with action=ask + user_question, but
+/// emits to its own Tauri event channel (`copilot-chat-*`) so the
+/// chat-thread reducer is decoupled from the auto-suggestion state
+/// machine. Each chat task is independent — multiple questions can
+/// be in flight simultaneously (V1 we don't gate concurrency for the
+/// chat path; the backend rate limiter does that).
+pub fn spawn_for_chat_question<R: Runtime>(
+    app: AppHandle<R>,
+    session_id: String,
+    api: Arc<IntelligenceApi>,
+    ai_response_id: String,
+    user_question: String,
+    transcript_window: String,
+    rolling_summary: Option<String>,
+) {
+    tauri::async_runtime::spawn(async move {
+        let req = QuickActionRequest {
+            action: QuickActionType::Ask,
+            transcript_window,
+            rolling_summary,
+            user_question: Some(user_question),
+        };
+
+        let stream = match api.post_quick_action_sse(&session_id, req).await {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!(
+                    "[Copilot/intel/chat] open failed: {} session={}",
+                    e,
+                    short(&session_id)
+                );
+                let _ = app.emit(
+                    "copilot-chat-failed",
+                    &ChatFailedPayload {
+                        ai_response_id: ai_response_id.clone(),
+                        reason: format!("open: {}", e),
+                    },
+                );
+                return;
+            }
+        };
+
+        log::info!(
+            "[Copilot/intel/chat] stream open id={} session={}",
+            short(&ai_response_id),
+            short(&session_id)
+        );
+
+        let stream_started = Instant::now();
+        let mut first_token_seen = false;
+        let mut accumulated = String::new();
+        let mut stream = stream;
+
+        while let Some(chunk) = stream.next().await {
+            // TTFT cap.
+            if !first_token_seen && stream_started.elapsed() > TTFT_HARD_CAP {
+                log::warn!(
+                    "[Copilot/intel/chat] TTFT exceeded — aborting id={}",
+                    short(&ai_response_id)
+                );
+                let _ = app.emit(
+                    "copilot-chat-failed",
+                    &ChatFailedPayload {
+                        ai_response_id: ai_response_id.clone(),
+                        reason: "ttft_exceeded".to_string(),
+                    },
+                );
+                return;
+            }
+
+            let event = match chunk {
+                Ok(e) => e,
+                Err(e) => {
+                    log::warn!(
+                        "[Copilot/intel/chat] stream error: {} id={}",
+                        e,
+                        short(&ai_response_id)
+                    );
+                    let _ = app.emit(
+                        "copilot-chat-failed",
+                        &ChatFailedPayload {
+                            ai_response_id: ai_response_id.clone(),
+                            reason: format!("stream: {}", e),
+                        },
+                    );
+                    return;
+                }
+            };
+
+            match event {
+                SuggestSseEvent::Start { .. } => {
+                    first_token_seen = true;
+                }
+                SuggestSseEvent::Delta { text } => {
+                    first_token_seen = true;
+                    accumulated.push_str(&text);
+                    let _ = app.emit(
+                        "copilot-chat-streaming",
+                        &ChatStreamingPayload {
+                            ai_response_id: ai_response_id.clone(),
+                            text,
+                        },
+                    );
+                }
+                SuggestSseEvent::Complete { payload } => {
+                    log::info!(
+                        "[Copilot/intel/chat] complete id={} primary='{}'",
+                        short(&ai_response_id),
+                        truncate(&payload.primary, 80)
+                    );
+                    let _ = app.emit(
+                        "copilot-chat-complete",
+                        &ChatCompletePayload {
+                            ai_response_id: ai_response_id.clone(),
+                            text: payload.primary,
+                        },
+                    );
+                    return;
+                }
+                SuggestSseEvent::Error { reason } => {
+                    log::warn!(
+                        "[Copilot/intel/chat] backend error: {} id={}",
+                        reason,
+                        short(&ai_response_id)
+                    );
+                    let _ = app.emit(
+                        "copilot-chat-failed",
+                        &ChatFailedPayload {
+                            ai_response_id: ai_response_id.clone(),
+                            reason,
+                        },
+                    );
+                    return;
+                }
+                SuggestSseEvent::Done => {
+                    // Backend signalled done before sending Complete — fall back
+                    // to whatever we accumulated so the user isn't left hanging.
+                    if !accumulated.is_empty() {
+                        let _ = app.emit(
+                            "copilot-chat-complete",
+                            &ChatCompletePayload {
+                                ai_response_id: ai_response_id.clone(),
+                                text: accumulated,
+                            },
+                        );
+                    } else {
+                        let _ = app.emit(
+                            "copilot-chat-failed",
+                            &ChatFailedPayload {
+                                ai_response_id: ai_response_id.clone(),
+                                reason: "done_without_complete".to_string(),
+                            },
+                        );
+                    }
+                    return;
+                }
+            }
+        }
+
+        // Stream exhausted without Complete or Done — best-effort
+        // finalize on whatever we have.
+        if !accumulated.is_empty() {
+            let _ = app.emit(
+                "copilot-chat-complete",
+                &ChatCompletePayload {
+                    ai_response_id,
+                    text: accumulated,
+                },
+            );
+        } else {
+            let _ = app.emit(
+                "copilot-chat-failed",
+                &ChatFailedPayload {
+                    ai_response_id,
+                    reason: "stream_closed_no_tokens".to_string(),
+                },
+            );
+        }
+    });
 }

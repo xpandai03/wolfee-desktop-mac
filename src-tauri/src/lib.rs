@@ -440,6 +440,108 @@ fn handle_structured_action(
             );
         }
 
+        // ─────────────────────────────────────────
+        // Sub-prompt 4.6 — chat input dispatch
+        // ─────────────────────────────────────────
+        "submit-chat-question" => {
+            let question = match payload.get("question").and_then(|v| v.as_str()) {
+                Some(q) if !q.is_empty() => q.to_string(),
+                _ => {
+                    log::warn!("[Copilot] submit-chat-question: empty/missing question");
+                    return;
+                }
+            };
+            let ai_response_id = payload
+                .get("ai_response_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if ai_response_id.is_empty() {
+                log::warn!("[Copilot] submit-chat-question: missing ai_response_id");
+                return;
+            }
+
+            let session_id = {
+                let copilot_mutex = handle.state::<CopilotStateMutex>();
+                let cur = copilot_mutex.0.lock().unwrap().clone();
+                match cur {
+                    CopilotState::Listening { session_id, .. }
+                    | CopilotState::Reconnecting { session_id, .. } => session_id,
+                    other => {
+                        log::debug!(
+                            "[Copilot] chat question ignored — state: {}",
+                            other
+                        );
+                        // Tell the frontend to fail the streaming slot
+                        // so the user sees an error rather than a
+                        // forever-spinning bubble.
+                        let _ = handle.emit(
+                            "copilot-chat-failed",
+                            serde_json::json!({
+                                "ai_response_id": ai_response_id,
+                                "reason": "no_active_session",
+                            }),
+                        );
+                        return;
+                    }
+                }
+            };
+
+            let device_token = {
+                let app_state: tauri::State<'_, AppState> = handle.state();
+                let token_opt = app_state.auth_token.lock().unwrap().clone();
+                match token_opt {
+                    Some(t) => t,
+                    None => {
+                        log::warn!("[Copilot] chat question ignored — not authed");
+                        let _ = handle.emit(
+                            "copilot-chat-failed",
+                            serde_json::json!({
+                                "ai_response_id": ai_response_id,
+                                "reason": "not_authed",
+                            }),
+                        );
+                        return;
+                    }
+                }
+            };
+
+            let window_text = {
+                let buf = handle.state::<TranscriptBufferMutex>();
+                let g = match buf.0.lock() {
+                    Ok(g) => g,
+                    Err(_) => return,
+                };
+                let utts = g.last_n_seconds(90);
+                if utts.is_empty() {
+                    "(no transcript yet)".to_string()
+                } else {
+                    copilot::intelligence::format_transcript_window(&utts)
+                }
+            };
+            let rolling_summary = match handle.state::<RollingSummaryMutex>().0.lock() {
+                Ok(g) => g.as_ref().map(|x| x.text.clone()),
+                Err(_) => None,
+            };
+
+            let api = std::sync::Arc::new(
+                copilot::intelligence::api::IntelligenceApi::new(
+                    backend_url.to_string(),
+                    device_token,
+                ),
+            );
+
+            copilot::intelligence::suggest_client::spawn_for_chat_question(
+                handle.clone(),
+                session_id,
+                api,
+                ai_response_id,
+                question,
+                window_text,
+                rolling_summary,
+            );
+        }
+
         other => {
             log::warn!("[App] Unknown structured action: {}", other);
         }
@@ -1119,6 +1221,44 @@ pub fn run() {
                     "cancel-copilot-context" => {
                         log::info!("[Copilot] Context cancelled — closing window");
                         copilot::context_window::close_context_window(handle_ref);
+                    }
+
+                    // ─────────────────────────────────────────
+                    // Sub-prompt 4.6 (Cluely 1:1) — strip / panel
+                    // ─────────────────────────────────────────
+                    "expand-overlay" => {
+                        if let Err(e) = copilot::window::expand_overlay(handle_ref) {
+                            log::warn!("[Copilot] expand_overlay failed: {}", e);
+                            return;
+                        }
+                        let _ = handle_ref.emit(
+                            "copilot-panel-state",
+                            serde_json::json!({ "mode": "expanded" }),
+                        );
+                    }
+
+                    "collapse-overlay" => {
+                        if let Err(e) = copilot::window::collapse_overlay(handle_ref) {
+                            log::warn!("[Copilot] collapse_overlay failed: {}", e);
+                            return;
+                        }
+                        let _ = handle_ref.emit(
+                            "copilot-panel-state",
+                            serde_json::json!({ "mode": "strip" }),
+                        );
+                    }
+
+                    "toggle-copilot-pause" => {
+                        // Sub-prompt 4.6 — pause/resume audio capture without
+                        // ending the session. V1: just toggle a flag and emit
+                        // state for the strip to render. Actual mic-mute /
+                        // audio-pause plumbing lands in Sub-prompt 6 alongside
+                        // the settings panel.
+                        log::info!("[Copilot] Pause toggle clicked (Sub-prompt 6 wires audio pause)");
+                        let _ = handle_ref.emit(
+                            "copilot-pause-state",
+                            serde_json::json!({ "paused": false }),
+                        );
                     }
 
                     "end-copilot-session" => {
