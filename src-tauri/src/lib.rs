@@ -59,6 +59,17 @@ where
 /// IntelligenceWorkers::stop() is async (await across the guard).
 struct IntelligenceWorkersMutex(tokio::sync::Mutex<Option<IntelligenceWorkers>>);
 
+/// Sub-prompt 4.8 — mode_used_id from the ContextWindow submit, kept
+/// alive for the duration of the session so the finalize POST can
+/// attribute the session to the right Mode template. Set when the
+/// user clicks Submit on ContextWindow; cleared on session end.
+struct ActiveModeIdMutex(std::sync::Mutex<Option<String>>);
+impl Default for ActiveModeIdMutex {
+    fn default() -> Self {
+        Self(std::sync::Mutex::new(None))
+    }
+}
+
 // Phase 5 had a `spawn_frame_logger` here that just counted AudioFrames
 // every 5s for runtime verification. Phase 3 replaces it with
 // `copilot::transcribe::deepgram::DeepgramClient::spawn`, which owns
@@ -334,6 +345,17 @@ fn handle_structured_action(
             };
 
             let context = CopilotContextFields::from_value(payload);
+            // Sub-prompt 4.8 — capture mode_used_id from the
+            // submit payload so the finalize POST can attribute the
+            // session to the right Mode template.
+            let mode_used_id = payload
+                .get("mode_used_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            if let Ok(mut g) = handle.state::<ActiveModeIdMutex>().0.lock() {
+                *g = mode_used_id;
+            }
+
             let session_id = uuid::Uuid::new_v4().to_string();
             spawn_session_workers(
                 handle.clone(),
@@ -568,6 +590,323 @@ fn handle_structured_action(
         }
 
         // ─────────────────────────────────────────
+        // Sub-prompt 4.8 — Copilot Modes (synced via wolfee.io)
+        // ─────────────────────────────────────────
+        "list-copilot-modes" => {
+            let device_token = {
+                let app_state: tauri::State<'_, AppState> = handle.state();
+                let token = app_state.auth_token.lock().unwrap().clone();
+                match token {
+                    Some(t) => t,
+                    None => {
+                        let _ = handle.emit(
+                            "copilot-modes-loaded",
+                            serde_json::json!({ "modes": [], "error": "not_authed" }),
+                        );
+                        return;
+                    }
+                }
+            };
+            let backend_url_owned = backend_url.to_string();
+            let handle_clone = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                let api = copilot::intelligence::api::IntelligenceApi::new(
+                    backend_url_owned,
+                    device_token,
+                );
+                match api.list_modes().await {
+                    Ok(modes) => {
+                        let _ = handle_clone.emit(
+                            "copilot-modes-loaded",
+                            serde_json::json!({ "modes": modes }),
+                        );
+                    }
+                    Err(e) => {
+                        log::warn!("[Copilot] list_modes failed: {}", e);
+                        let _ = handle_clone.emit(
+                            "copilot-modes-loaded",
+                            serde_json::json!({ "modes": [], "error": e.to_string() }),
+                        );
+                    }
+                }
+            });
+        }
+
+        "save-copilot-mode" => {
+            // Body: { mode_id?: string, name, description?, context_about_user?,
+            //         context_about_call?, context_objections?, is_default? }
+            // Mode_id present → update; absent → create.
+            let device_token = match handle
+                .state::<AppState>()
+                .auth_token
+                .lock()
+                .unwrap()
+                .clone()
+            {
+                Some(t) => t,
+                None => return,
+            };
+
+            let mode_id = payload
+                .get("mode_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let req = copilot::intelligence::api::UpsertModeRequest {
+                name: payload
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                description: payload
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                context_about_user: payload
+                    .get("context_about_user")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                context_about_call: payload
+                    .get("context_about_call")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                context_objections: payload
+                    .get("context_objections")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                is_default: payload.get("is_default").and_then(|v| v.as_bool()),
+            };
+            let backend_url_owned = backend_url.to_string();
+            let handle_clone = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                let api = copilot::intelligence::api::IntelligenceApi::new(
+                    backend_url_owned,
+                    device_token,
+                );
+                let result = match mode_id {
+                    Some(id) => api.update_mode(&id, req).await,
+                    None => api.create_mode(req).await,
+                };
+                match result {
+                    Ok(mode) => {
+                        let _ = handle_clone.emit(
+                            "copilot-mode-saved",
+                            serde_json::json!({ "mode": mode }),
+                        );
+                    }
+                    Err(e) => {
+                        log::warn!("[Copilot] save_mode failed: {}", e);
+                        let _ = handle_clone.emit(
+                            "copilot-mode-saved",
+                            serde_json::json!({ "error": e.to_string() }),
+                        );
+                    }
+                }
+            });
+        }
+
+        "delete-copilot-mode" => {
+            let mode_id = match payload.get("mode_id").and_then(|v| v.as_str()) {
+                Some(id) if !id.is_empty() => id.to_string(),
+                _ => return,
+            };
+            let device_token = match handle
+                .state::<AppState>()
+                .auth_token
+                .lock()
+                .unwrap()
+                .clone()
+            {
+                Some(t) => t,
+                None => return,
+            };
+            let backend_url_owned = backend_url.to_string();
+            let handle_clone = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                let api = copilot::intelligence::api::IntelligenceApi::new(
+                    backend_url_owned,
+                    device_token,
+                );
+                match api.delete_mode(&mode_id).await {
+                    Ok(_) => {
+                        let _ = handle_clone.emit(
+                            "copilot-mode-deleted",
+                            serde_json::json!({ "mode_id": mode_id }),
+                        );
+                    }
+                    Err(e) => log::warn!("[Copilot] delete_mode failed: {}", e),
+                }
+            });
+        }
+
+        "set-default-copilot-mode" => {
+            let mode_id = match payload.get("mode_id").and_then(|v| v.as_str()) {
+                Some(id) if !id.is_empty() => id.to_string(),
+                _ => return,
+            };
+            let device_token = match handle
+                .state::<AppState>()
+                .auth_token
+                .lock()
+                .unwrap()
+                .clone()
+            {
+                Some(t) => t,
+                None => return,
+            };
+            let backend_url_owned = backend_url.to_string();
+            let handle_clone = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                let api = copilot::intelligence::api::IntelligenceApi::new(
+                    backend_url_owned,
+                    device_token,
+                );
+                match api.set_default_mode(&mode_id).await {
+                    Ok(mode) => {
+                        let _ = handle_clone.emit(
+                            "copilot-mode-saved",
+                            serde_json::json!({ "mode": mode }),
+                        );
+                    }
+                    Err(e) => log::warn!("[Copilot] set_default_mode failed: {}", e),
+                }
+            });
+        }
+
+        // ─────────────────────────────────────────
+        // Sub-prompt 4.8 — finalize session: bulk push transcript +
+        // chat_threads + auto_suggestions to backend, generate summary,
+        // optionally auto-open browser. Frontend emits this from the
+        // Stop button click handler with its reducer state attached.
+        // ─────────────────────────────────────────
+        "finalize-and-push-session" => {
+            let session_id = {
+                let copilot_mutex = handle.state::<CopilotStateMutex>();
+                let cur = copilot_mutex.0.lock().unwrap().clone();
+                match cur {
+                    CopilotState::Listening { session_id, .. }
+                    | CopilotState::Reconnecting { session_id, .. }
+                    | CopilotState::EndingSession { session_id, .. } => session_id,
+                    other => {
+                        log::debug!(
+                            "[Copilot] finalize-and-push-session ignored — state: {}",
+                            other
+                        );
+                        return;
+                    }
+                }
+            };
+
+            let device_token = match handle
+                .state::<AppState>()
+                .auth_token
+                .lock()
+                .unwrap()
+                .clone()
+            {
+                Some(t) => t,
+                None => {
+                    log::warn!(
+                        "[Copilot] finalize-and-push-session ignored — not authed"
+                    );
+                    return;
+                }
+            };
+
+            let mode_used_id = handle
+                .state::<ActiveModeIdMutex>()
+                .0
+                .lock()
+                .ok()
+                .and_then(|g| g.clone());
+
+            // Frontend supplies the transcript (its `fullTranscript`
+            // state — last 200 utterances) since the Rust buffer is a
+            // 90s sliding window that doesn't carry the full call.
+            let transcript_full: Vec<serde_json::Value> = payload
+                .get("transcript")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            let chat_threads: Vec<serde_json::Value> = payload
+                .get("chat_threads")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let auto_suggestions: Vec<serde_json::Value> = payload
+                .get("auto_suggestions")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            let req = copilot::intelligence::api::FinalizeSessionRequest {
+                transcript: transcript_full,
+                chat_threads,
+                auto_suggestions,
+                mode_used_id: mode_used_id.clone(),
+            };
+
+            let backend_url_owned = backend_url.to_string();
+            let handle_clone = handle.clone();
+            let session_id_for_log = session_id.clone();
+            tauri::async_runtime::spawn(async move {
+                let api = copilot::intelligence::api::IntelligenceApi::new(
+                    backend_url_owned.clone(),
+                    device_token.clone(),
+                );
+                match api.finalize_session(&session_id_for_log, req).await {
+                    Ok(resp) => {
+                        log::info!(
+                            "[Copilot] session finalized — id={} share_slug={:?}",
+                            &session_id_for_log[..8.min(session_id_for_log.len())],
+                            resp.share_slug
+                        );
+                        // Emit so the frontend can show "View on web".
+                        let _ = handle_clone.emit(
+                            "copilot-session-finalized",
+                            serde_json::json!({
+                                "session_id": resp.session_id,
+                                "share_slug": resp.share_slug,
+                            }),
+                        );
+
+                        // Auto-open browser if user has the toggle on.
+                        match api.get_user_preferences().await {
+                            Ok(prefs) if prefs.copilot_auto_open_browser => {
+                                // Construct the wolfee.io URL. Use the
+                                // backend_url's host as the web origin
+                                // — V1 assumes web app is served from
+                                // the same domain.
+                                let url = format!(
+                                    "{}/copilot/sessions/{}",
+                                    backend_url_owned.trim_end_matches('/'),
+                                    resp.session_id
+                                );
+                                log::info!(
+                                    "[Copilot] auto-open enabled — opening {}",
+                                    url
+                                );
+                                open_url(&url);
+                            }
+                            _ => {}
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "[Copilot] finalize_session failed: {} — session={}",
+                            e,
+                            &session_id_for_log[..8.min(session_id_for_log.len())]
+                        );
+                    }
+                }
+            });
+
+            // Clear active mode id once the finalize is in flight.
+            if let Ok(mut g) = handle.state::<ActiveModeIdMutex>().0.lock() {
+                *g = None;
+            }
+        }
+
+        // ─────────────────────────────────────────
         // Sub-prompt 4.7 — open an external URL (fact-check sources).
         // ─────────────────────────────────────────
         "open-external-url" => {
@@ -674,6 +1013,7 @@ pub fn run() {
         // Storage for the live IntelligenceWorkers handles. tokio::Mutex
         // because we hold the guard across `await` (workers.stop() is async).
         .manage(IntelligenceWorkersMutex(tokio::sync::Mutex::new(None)))
+        .manage(ActiveModeIdMutex::default())
         .on_window_event(|window, _event| {
             // 2026-05-04: removed the WindowEvent::Focused(false) →
             // hide_overlay handler. With the new "overlay stays

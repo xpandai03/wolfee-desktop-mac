@@ -196,6 +196,75 @@ pub struct FactCheckSource {
     pub url: String,
 }
 
+// ── Sub-prompt 4.8 — Copilot Modes + post-session view ────────────
+
+/// Saved mode template (per-user, synced via wolfee.io). Returned
+/// from GET /api/copilot/modes; sent to ContextWindow's dropdown.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CopilotMode {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    #[serde(rename = "contextAboutUser")]
+    pub context_about_user: Option<String>,
+    #[serde(rename = "contextAboutCall")]
+    pub context_about_call: Option<String>,
+    #[serde(rename = "contextObjections")]
+    pub context_objections: Option<String>,
+    #[serde(rename = "isDefault")]
+    pub is_default: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct UpsertModeRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_about_user: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_about_call: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_objections: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_default: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModesListResponse {
+    pub modes: Vec<CopilotMode>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModeResponse {
+    pub mode: CopilotMode,
+}
+
+/// Sub-prompt 4.8 — payload for POST /api/copilot/sessions/:id/finalize.
+/// Backend stores these as JSONB columns + triggers async summary.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct FinalizeSessionRequest {
+    pub transcript: Vec<serde_json::Value>,
+    pub chat_threads: Vec<serde_json::Value>,
+    pub auto_suggestions: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode_used_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FinalizeSessionResponse {
+    pub session_id: String,
+    pub share_slug: Option<String>,
+    pub summary_status: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct UserPreferencesPayload {
+    #[serde(rename = "copilot_auto_open_browser")]
+    pub copilot_auto_open_browser: bool,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SuggestPayload {
     pub suggestion_id: String,
@@ -370,6 +439,148 @@ impl IntelligenceApi {
 
         let events = byte_stream.eventsource().map(parse_sse_event);
         Ok(events)
+    }
+
+    // ── Sub-prompt 4.8 — Modes CRUD + finalize + preferences ─────
+
+    pub async fn list_modes(&self) -> Result<Vec<CopilotMode>, IntelligenceApiError> {
+        let url = format!("{}/api/copilot/modes", self.backend_url);
+        let res = self
+            .client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.device_token))
+            .send()
+            .await
+            .map_err(|e| IntelligenceApiError::Network(e.to_string()))?;
+        translate_status(&res)?;
+        let body: ModesListResponse = res
+            .json()
+            .await
+            .map_err(|e| IntelligenceApiError::Decode(e.to_string()))?;
+        Ok(body.modes)
+    }
+
+    pub async fn create_mode(
+        &self,
+        req: UpsertModeRequest,
+    ) -> Result<CopilotMode, IntelligenceApiError> {
+        let url = format!("{}/api/copilot/modes", self.backend_url);
+        let res = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.device_token))
+            .json(&req)
+            .send()
+            .await
+            .map_err(|e| IntelligenceApiError::Network(e.to_string()))?;
+        translate_status(&res)?;
+        let body: ModeResponse = res
+            .json()
+            .await
+            .map_err(|e| IntelligenceApiError::Decode(e.to_string()))?;
+        Ok(body.mode)
+    }
+
+    pub async fn update_mode(
+        &self,
+        mode_id: &str,
+        req: UpsertModeRequest,
+    ) -> Result<CopilotMode, IntelligenceApiError> {
+        let url = format!("{}/api/copilot/modes/{}", self.backend_url, mode_id);
+        let res = self
+            .client
+            .patch(&url)
+            .header("Authorization", format!("Bearer {}", self.device_token))
+            .json(&req)
+            .send()
+            .await
+            .map_err(|e| IntelligenceApiError::Network(e.to_string()))?;
+        translate_status(&res)?;
+        let body: ModeResponse = res
+            .json()
+            .await
+            .map_err(|e| IntelligenceApiError::Decode(e.to_string()))?;
+        Ok(body.mode)
+    }
+
+    pub async fn delete_mode(&self, mode_id: &str) -> Result<(), IntelligenceApiError> {
+        let url = format!("{}/api/copilot/modes/{}", self.backend_url, mode_id);
+        let res = self
+            .client
+            .delete(&url)
+            .header("Authorization", format!("Bearer {}", self.device_token))
+            .send()
+            .await
+            .map_err(|e| IntelligenceApiError::Network(e.to_string()))?;
+        translate_status(&res)?;
+        Ok(())
+    }
+
+    pub async fn set_default_mode(
+        &self,
+        mode_id: &str,
+    ) -> Result<CopilotMode, IntelligenceApiError> {
+        let url = format!(
+            "{}/api/copilot/modes/{}/set-default",
+            self.backend_url, mode_id
+        );
+        let res = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.device_token))
+            .send()
+            .await
+            .map_err(|e| IntelligenceApiError::Network(e.to_string()))?;
+        translate_status(&res)?;
+        let body: ModeResponse = res
+            .json()
+            .await
+            .map_err(|e| IntelligenceApiError::Decode(e.to_string()))?;
+        Ok(body.mode)
+    }
+
+    pub async fn finalize_session(
+        &self,
+        session_id: &str,
+        req: FinalizeSessionRequest,
+    ) -> Result<FinalizeSessionResponse, IntelligenceApiError> {
+        let url = format!(
+            "{}/api/copilot/sessions/{}/finalize",
+            self.backend_url, session_id
+        );
+        let res = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.device_token))
+            .json(&req)
+            .send()
+            .await
+            .map_err(|e| IntelligenceApiError::Network(e.to_string()))?;
+        translate_status(&res)?;
+        let body: FinalizeSessionResponse = res
+            .json()
+            .await
+            .map_err(|e| IntelligenceApiError::Decode(e.to_string()))?;
+        Ok(body)
+    }
+
+    pub async fn get_user_preferences(
+        &self,
+    ) -> Result<UserPreferencesPayload, IntelligenceApiError> {
+        let url = format!("{}/api/user/preferences", self.backend_url);
+        let res = self
+            .client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.device_token))
+            .send()
+            .await
+            .map_err(|e| IntelligenceApiError::Network(e.to_string()))?;
+        translate_status(&res)?;
+        let body: UserPreferencesPayload = res
+            .json()
+            .await
+            .map_err(|e| IntelligenceApiError::Decode(e.to_string()))?;
+        Ok(body)
     }
 }
 
