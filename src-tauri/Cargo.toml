@@ -1,6 +1,6 @@
 [package]
 name = "wolfee-desktop"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 description = "Wolfee Desktop Recorder"
 
