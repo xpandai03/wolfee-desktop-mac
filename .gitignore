@@ -23,3 +23,10 @@ stripped.app/
 stripped.dmg
 test.app/
 test.zip
+
+# Sub-prompt 6.1 — Tauri updater signing keys live OUTSIDE the repo
+# (~/.tauri/ in PO's home dir), but defensive ignore in case anyone
+# ever drops a key here. NEVER commit private keys.
+.tauri/
+*.key
+*.key.pub
