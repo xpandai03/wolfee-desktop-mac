@@ -217,24 +217,16 @@ fn build_menu<R: Runtime>(
         MenuItem::with_id(app, "copilot_setup", "Set Up Copilot…", true, None::<&str>)?;
     menu.append(&setup_copilot)?;
 
-    // Recorder + Copilot coexistence warning (Decision N6 — soft, allowed).
-    // Surface only when both are simultaneously active so the user knows
-    // they're double-running on shared mic resources.
-    let recorder_active = matches!(state, RecordingState::Recording);
-    let copilot_active_session = matches!(
-        copilot_state,
-        CopilotState::Listening { .. } | CopilotState::Reconnecting { .. }
-    );
-    if recorder_active && copilot_active_session {
-        let warn = MenuItem::with_id(
-            app,
-            "copilot_coexist_warn",
-            "⚠️ Recorder + Copilot both running",
-            false,
-            None::<&str>,
-        )?;
-        menu.append(&warn)?;
-    }
+    // Sub-prompt 6.0 — onboarding tour entry. Always visible so users
+    // can re-open the wizard at any time, even mid-session.
+    let show_tour = MenuItem::with_id(
+        app,
+        "copilot_show_onboarding",
+        "Show Onboarding Tour",
+        true,
+        None::<&str>,
+    )?;
+    menu.append(&show_tour)?;
 
     let section_sep = MenuItem::with_id(app, "section_sep", "———", false, None::<&str>)?;
     menu.append(&section_sep)?;
@@ -350,37 +342,14 @@ fn build_menu<R: Runtime>(
         menu.append(&sep)?;
     }
 
-    match state {
-        RecordingState::Recording => {
-            let status = MenuItem::with_id(app, "status", "● Recording", false, None::<&str>)?;
-            menu.append(&status)?;
-            let stop = MenuItem::with_id(app, "stop", "Stop Recording  ⌘⌥Space", true, None::<&str>)?;
-            menu.append(&stop)?;
-        }
-        RecordingState::Stopping => {
-            let status = MenuItem::with_id(app, "status", "Saving recording...", false, None::<&str>)?;
-            menu.append(&status)?;
-        }
-        RecordingState::Uploading => {
-            let status = MenuItem::with_id(app, "status", "↑ Uploading to Wolfee...", false, None::<&str>)?;
-            menu.append(&status)?;
-        }
-        RecordingState::Complete => {
-            let status = MenuItem::with_id(app, "status", "✓ Uploaded!", false, None::<&str>)?;
-            menu.append(&status)?;
-            let open_meeting = MenuItem::with_id(app, "open_meeting", "Open in Wolfee", true, None::<&str>)?;
-            menu.append(&open_meeting)?;
-        }
-        RecordingState::Idle => {
-            if is_authenticated {
-                let start = MenuItem::with_id(app, "start", "Start Recording  ⌘⌥Space", true, None::<&str>)?;
-                menu.append(&start)?;
-            } else {
-                let start = MenuItem::with_id(app, "start", "Start Recording (no upload — link first)", true, None::<&str>)?;
-                menu.append(&start)?;
-            }
-        }
-    }
+    // Sub-prompt 6.0 — Start/Stop Recording entries removed. The
+    // desktop app is Copilot-only at the user-facing layer; the
+    // recorder.rs module is preserved for future re-wiring but is
+    // no longer surfaced in the tray. RecordingState::Recording etc.
+    // still exist in AppState; they're simply not rendered. The
+    // `state` parameter is now unused in build_menu but kept on the
+    // signature so update_tray_menu's call site stays untouched.
+    let _ = state;
 
     let sep1 = MenuItem::with_id(app, "sep1", "—", false, None::<&str>)?;
     menu.append(&sep1)?;
@@ -424,6 +393,11 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, id: &str) {
             log::info!("[Tray] Generate Suggestion clicked");
             let _ = app.emit("wolfee-action", "trigger-copilot-suggestion");
         }
+        // Sub-prompt 6.0
+        "copilot_show_onboarding" => {
+            log::info!("[Tray] Show Onboarding Tour clicked");
+            let _ = app.emit("wolfee-action", "show-onboarding");
+        }
 
         // ─── Linking / upload status row clicks ───
         "linking_failed_retry" => {
@@ -454,15 +428,10 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, id: &str) {
             let _ = app.emit("wolfee-action", "clear-upload-status");
         }
 
-        // ─── Existing recorder / nav items (unchanged) ───
-        "start" => {
-            log::info!("[Tray] Start Recording clicked");
-            let _ = app.emit("wolfee-action", "start-recording");
-        }
-        "stop" => {
-            log::info!("[Tray] Stop Recording clicked");
-            let _ = app.emit("wolfee-action", "stop-recording");
-        }
+        // ─── Nav items ───
+        // Sub-prompt 6.0 — `start` and `stop` recorder click handlers
+        // removed. Tray UI no longer surfaces them; recorder.rs
+        // remains intact for future re-wiring.
         "open" => {
             log::info!("[Tray] Open Wolfee clicked");
             let _ = app.emit("wolfee-action", "open-wolfee");
