@@ -1756,6 +1756,22 @@ pub fn run() {
                     // Sub-prompt 4.6 (Cluely 1:1) — strip / panel
                     // ─────────────────────────────────────────
                     "expand-overlay" => {
+                        // Sub-prompt 5.2 hotfix — always show the window
+                        // before resizing. The Sub-prompt 5.0 boot welcome
+                        // flow emits expand-overlay while the window is
+                        // still hidden; macOS Sequoia + Tauri 2 transparent
+                        // + content-protected leaves WKWebView's surface
+                        // detached when set_size runs before first
+                        // orderFront:, so the window never visually
+                        // renders even after a later show_overlay(). Show
+                        // first → resize on a visible window. Idempotent
+                        // for the 6 callers that already had a visible
+                        // window (suggestion arrival, focus-input,
+                        // new-thread, finalize takeover, permission needed,
+                        // quick-action click).
+                        if let Err(e) = copilot::window::show_overlay(handle_ref) {
+                            log::warn!("[Copilot] expand-overlay show_overlay failed: {}", e);
+                        }
                         if let Err(e) = copilot::window::expand_overlay(handle_ref) {
                             log::warn!("[Copilot] expand_overlay failed: {}", e);
                             return;
