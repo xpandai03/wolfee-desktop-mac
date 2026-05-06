@@ -5,7 +5,7 @@ import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import { Strip } from "@/components/Strip";
 import { ExpandedPanel } from "@/components/ExpandedPanel";
-import { WelcomeCard } from "@/components/WelcomeCard";
+import { OnboardingWizard } from "@/components/onboarding/OnboardingWizard";
 import { SessionCompleteCard } from "@/components/SessionCompleteCard";
 import {
   activeThreadMessages,
@@ -106,17 +106,17 @@ export default function CopilotOverlay() {
     modeRef.current = overlayState.mode;
   }, [overlayState.mode]);
 
-  // Sub-prompt 5.0 — refs for welcome flag + welcomeOpen so the apps-
-  // grid handler stays stable across the lifetime of this component
-  // and doesn't need to be recreated whenever the flag flips.
-  const welcomeShownRef = useRef(overlayState.welcomeShown);
+  // Sub-prompt 6.0 — refs for the onboarding wizard state so the
+  // tray-driven SHOW_ONBOARDING handler + Esc precedence stay stable
+  // across renders.
+  const onboardingOpenRef = useRef(overlayState.onboardingOpen);
   useEffect(() => {
-    welcomeShownRef.current = overlayState.welcomeShown;
-  }, [overlayState.welcomeShown]);
-  const welcomeOpenRef = useRef(overlayState.welcomeOpen);
+    onboardingOpenRef.current = overlayState.onboardingOpen;
+  }, [overlayState.onboardingOpen]);
+  const onboardingCompletedRef = useRef(overlayState.onboardingCompleted);
   useEffect(() => {
-    welcomeOpenRef.current = overlayState.welcomeOpen;
-  }, [overlayState.welcomeOpen]);
+    onboardingCompletedRef.current = overlayState.onboardingCompleted;
+  }, [overlayState.onboardingCompleted]);
 
   // Tick — drives existing 2s reasoning fallback + 30s TTL.
   useEffect(() => {
@@ -158,12 +158,11 @@ export default function CopilotOverlay() {
         setPermissionNeeded(null);
         return;
       }
-      // Sub-prompt 5.0 — Esc dismisses welcome / session-complete
-      // cards in preference to collapsing the panel, so the rep
-      // can quickly clear the takeover without losing the strip.
-      if (welcomeOpenRef.current) {
-        dispatch({ type: "DISMISS_WELCOME" });
-        void emit("wolfee-action", { type: "mark-welcome-shown" });
+      // Sub-prompt 6.0 — Esc on the wizard skips it (marks completed).
+      // Same precedence as the SP5.0 welcome dismiss it replaced.
+      if (onboardingOpenRef.current) {
+        dispatch({ type: "SKIP_TOUR" });
+        void emit("wolfee-action", { type: "mark-onboarding-completed" });
         return;
       }
       // Esc collapses the panel if expanded; otherwise hides the strip.
@@ -192,7 +191,10 @@ export default function CopilotOverlay() {
     let newThreadUnlisten: UnlistenFn | undefined;
     let finalizedUnlisten: UnlistenFn | undefined;
     let sessionFailedUnlisten: UnlistenFn | undefined;
-    let welcomeFlagUnlisten: UnlistenFn | undefined;
+    let onboardingFlagUnlisten: UnlistenFn | undefined;
+    let onboardingShowUnlisten: UnlistenFn | undefined;
+    let authStatusUnlisten: UnlistenFn | undefined;
+    let permissionStatusUnlisten: UnlistenFn | undefined;
 
     void (async () => {
       permUnlisten = await listen<PermissionNeededPayload>(
@@ -354,29 +356,68 @@ export default function CopilotOverlay() {
         }
       });
 
-      // Sub-prompt 5.0 — Rust replies with the persisted welcome flag
-      // on boot (we ask via `request-welcome-flag` immediately after
-      // the listener is wired). The reducer flips welcomeShown +
-      // shows the card if it has never been seen.
-      welcomeFlagUnlisten = await listen<{ shown: boolean }>(
-        "welcome-flag-loaded",
-        (event) => {
-          dispatch({ type: "LOAD_WELCOME_FLAG", shown: event.payload.shown });
-          if (!event.payload.shown) {
-            // First launch — show the card and expand the panel so
-            // it's actually visible. Without this the user would be
-            // stuck staring at the strip with no idea what to do.
-            dispatch({ type: "SHOW_WELCOME" });
-            if (modeRef.current !== "expanded") {
-              void emit("wolfee-action", "expand-overlay");
-            }
+      // Sub-prompt 6.0 — onboarding wizard boot flow (replaces SP5.0
+      // welcome). Rust replies with `onboarding-flag-loaded` carrying
+      // {completed, last_step}. If completed=false on a fresh user,
+      // we open the wizard (SHOW_ONBOARDING) AND fire expand-overlay
+      // so the (still-hidden) overlay window becomes visible — the
+      // SP5.2 hotfix in expand-overlay's Rust handler now calls
+      // show_overlay first so the WKWebView surface attaches cleanly.
+      onboardingFlagUnlisten = await listen<{
+        completed: boolean;
+        last_step: number;
+      }>("onboarding-flag-loaded", (event) => {
+        dispatch({
+          type: "LOAD_ONBOARDING_FLAG",
+          completed: event.payload.completed,
+          lastStep: event.payload.last_step,
+        });
+        if (!event.payload.completed) {
+          dispatch({ type: "SHOW_ONBOARDING" });
+          if (modeRef.current !== "expanded") {
+            void emit("wolfee-action", "expand-overlay");
           }
-        },
-      );
+        }
+      });
 
-      // Kick off the welcome-flag round-trip now that the listener
-      // is in place. Rust replies on `welcome-flag-loaded` above.
-      void emit("wolfee-action", { type: "request-welcome-flag" });
+      // Sub-prompt 6.0 — tray "Show Onboarding Tour" emits
+      // copilot-show-onboarding. Re-opening always starts at the
+      // user's last persisted step (or 1 if they never started).
+      onboardingShowUnlisten = await listen("copilot-show-onboarding", () => {
+        dispatch({ type: "SHOW_ONBOARDING" });
+        if (modeRef.current !== "expanded") {
+          void emit("wolfee-action", "expand-overlay");
+        }
+      });
+
+      // Sub-prompt 6.0 — Step 3 polling reads this. Step 4 reads
+      // permission-status-loaded below.
+      authStatusUnlisten = await listen<{
+        paired: boolean;
+        user_id: string | null;
+      }>("auth-status-loaded", (_event) => {
+        // Step3Pairing component owns its own listener for this event
+        // since it has step-scoped state (linkClicked, timedOut). We
+        // don't need to dispatch anything from here — the listener is
+        // declared as a no-op so the component-level listen() call
+        // remains the source of truth. Keeping this top-level listener
+        // declared so the unlisten cleanup mirrors other events.
+        void _event;
+      });
+
+      permissionStatusUnlisten = await listen<{
+        mic: "granted" | "denied" | "undetermined";
+        screen: "granted" | "denied" | "undetermined";
+      }>("permission-status-loaded", (event) => {
+        dispatch({
+          type: "SET_PERMISSION_STATUS",
+          payload: { mic: event.payload.mic, screen: event.payload.screen },
+        });
+      });
+
+      // Kick off the onboarding-flag round-trip now that the listener
+      // is in place. Rust replies on `onboarding-flag-loaded` above.
+      void emit("wolfee-action", { type: "request-onboarding-flag" });
 
       // Sub-prompt 4.9 — finalize failure surfacing. Rust emits this
       // when the /finalize POST returns non-2xx or networks out. Show
@@ -423,7 +464,10 @@ export default function CopilotOverlay() {
       newThreadUnlisten?.();
       finalizedUnlisten?.();
       sessionFailedUnlisten?.();
-      welcomeFlagUnlisten?.();
+      onboardingFlagUnlisten?.();
+      onboardingShowUnlisten?.();
+      authStatusUnlisten?.();
+      permissionStatusUnlisten?.();
     };
   }, []);
 
@@ -487,32 +531,24 @@ export default function CopilotOverlay() {
     );
   };
   const handleAppsClick = () => {
-    // Sub-prompt 5.0 — dual behavior:
-    //   - First-launch (welcome never shown) → replay welcome card.
-    //     This catches the case where the user dismissed welcome
-    //     accidentally before reading; the icon is the recovery path.
-    //   - Otherwise → open wolfee.io/copilot/modes (Sub-prompt 4.8
-    //     behavior), the canonical CRUD surface for modes.
-    if (welcomeShownRef.current === false) {
-      dispatch({ type: "SHOW_WELCOME" });
-      if (modeRef.current !== "expanded") {
-        void emit("wolfee-action", "expand-overlay");
-      }
-      return;
-    }
+    // Sub-prompt 6.0 — apps-grid icon now opens the modes page
+    // unconditionally. Onboarding has its own re-open path via the
+    // tray menu ("Show Onboarding Tour"); the apps-grid is for
+    // mode CRUD which is what users actually want here. The SP5.0
+    // dual behavior was a workaround for the welcome-card-only
+    // recovery path — the wizard's tray entry supersedes it.
     void emit("wolfee-action", {
       type: "open-external-url",
       url: WOLFEE_WEB_BASE + "/copilot/modes",
     });
   };
 
-  // Sub-prompt 5.0 — welcome dismiss: optimistically flip the reducer
-  // flag (so the card disappears immediately) and fire-and-forget
-  // persist via Rust. Worst case (Rust write fails), the card replays
-  // on next boot — strictly worse UX, but never lost data.
-  const handleDismissWelcome = () => {
-    dispatch({ type: "DISMISS_WELCOME" });
-    void emit("wolfee-action", { type: "mark-welcome-shown" });
+  // Sub-prompt 6.0 — wizard handlers. The wizard component itself
+  // owns NEXT/PREV/SKIP/COMPLETE dispatches; these refs let
+  // CopilotOverlay pass a stable emit closure into the wizard so it
+  // doesn't re-import Tauri APIs.
+  const handleWizardEmit = (action: string | object) => {
+    void emit("wolfee-action", action);
   };
 
   // Sub-prompt 5.0 — SessionCompleteCard CTAs.
@@ -614,7 +650,9 @@ export default function CopilotOverlay() {
   // sacred) → SessionComplete → Welcome. Permission is highest because
   // a missing-mic mid-session blocker must override even the recap.
   const showSessionComplete = overlayState.lastFinalizedSession !== null;
-  const showWelcome = overlayState.welcomeOpen;
+  // Sub-prompt 6.0 — onboarding wizard supersedes legacy welcome.
+  // Precedence: Permission (Phase 6 sacred) > SessionComplete > Onboarding.
+  const showOnboarding = overlayState.onboardingOpen;
   const expandedPanelBodyOverride = showPermissionModal ? (
     <PermissionModal
       payload={permissionNeeded!}
@@ -628,8 +666,12 @@ export default function CopilotOverlay() {
       onStartNew={handleStartNewSession}
       onDismiss={handleDismissSessionComplete}
     />
-  ) : showWelcome ? (
-    <WelcomeCard onDismiss={handleDismissWelcome} />
+  ) : showOnboarding ? (
+    <OnboardingWizard
+      state={overlayState}
+      dispatch={dispatch}
+      onEmitAction={handleWizardEmit}
+    />
   ) : undefined;
 
   return (
