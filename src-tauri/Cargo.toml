@@ -1,6 +1,6 @@
 [package]
 name = "wolfee-desktop"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "Wolfee Desktop Recorder"
 
@@ -13,6 +13,7 @@ tauri-plugin-notification = "2"
 tauri-plugin-clipboard-manager = "2"
 tauri-plugin-deep-link = "2"
 tauri-plugin-store = "2"
+tauri-plugin-updater = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", features = ["multipart", "json", "stream"] }
