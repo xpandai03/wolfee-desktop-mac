@@ -1305,6 +1305,13 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_store::Builder::new().build())
+        // Sub-prompt 6.1 — auto-update. The plugin reads endpoints +
+        // pubkey from tauri.conf.json's `plugins.updater` section.
+        // Frontend calls @tauri-apps/plugin-updater check() +
+        // downloadAndInstall() on launch (silent, fire-and-forget).
+        // Signature verification happens against the embedded pubkey;
+        // a tampered .app.tar.gz fails verification and never installs.
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(app_state)
         .manage(CopilotStateMutex::default())
         .manage(CopilotAudioCaptureMutex::default())

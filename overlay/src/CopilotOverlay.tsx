@@ -7,6 +7,7 @@ import { Strip } from "@/components/Strip";
 import { ExpandedPanel } from "@/components/ExpandedPanel";
 import { OnboardingWizard } from "@/components/onboarding/OnboardingWizard";
 import { SessionCompleteCard } from "@/components/SessionCompleteCard";
+import { checkForUpdatesSilently } from "@/updater";
 import {
   activeThreadMessages,
   initialOverlayState,
@@ -124,6 +125,16 @@ export default function CopilotOverlay() {
       dispatch({ type: "TICK", nowMs: Date.now() });
     }, TICK_INTERVAL_MS);
     return () => window.clearInterval(id);
+  }, []);
+
+  // Sub-prompt 6.1 — auto-update. Fires once on mount in production
+  // builds; dev runs skip to avoid hitting the prod manifest with a
+  // dev-build version that may not match. Fire-and-forget — the
+  // updater swallows its own errors so the UI never blocks or shows
+  // a popup. Update applies on the NEXT process launch.
+  useEffect(() => {
+    if (import.meta.env.DEV) return;
+    void checkForUpdatesSilently();
   }, []);
 
   // Dev mock generator (Ctrl+Shift+M / 2-5).
