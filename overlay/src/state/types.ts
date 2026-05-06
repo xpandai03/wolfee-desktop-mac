@@ -232,6 +232,21 @@ export interface ActiveSuggestion {
 }
 
 /**
+ * Sub-prompt 6.0 — onboarding wizard. The wizard sits in
+ * ExpandedPanel via bodyOverride and walks new users through 6 steps:
+ * 1) what wolfee does, 2) the listen→suggest→recap loop,
+ * 3) link account, 4) grant permissions, 5) pick a mode,
+ * 6) you're ready. State persists per-user via tauri-plugin-store
+ * so the wizard auto-resumes mid-tour after a quit.
+ */
+export type PermissionStatus = "granted" | "denied" | "undetermined";
+
+export interface OnboardingPermissionStatus {
+  mic: PermissionStatus | null;
+  screen: PermissionStatus | null;
+}
+
+/**
  * Sub-prompt 5.0 — most-recently-finalized session, used to drive the
  * post-session takeover card. `null` outside the takeover window.
  */
@@ -267,6 +282,21 @@ export interface OverlayState {
   /** Sub-prompt 5.0 — wall-clock when SessionCompleteCard was opened.
    * TICK auto-dismisses 8s later. Null when card not visible. */
   sessionCompleteOpenedAtMs: number | null;
+  // ── Sub-prompt 6.0 — onboarding wizard ─────────────────────────
+  /** True while the wizard is rendering (bodyOverride in expanded panel). */
+  onboardingOpen: boolean;
+  /** Current step 1..6. Persists between sessions so quit-mid-tour resumes. */
+  onboardingStep: number;
+  /**
+   * - `null`  → not yet loaded from store
+   * - `false` → never completed → wizard auto-shows on first launch
+   * - `true`  → completed/skipped → only shows on tray "Show Onboarding Tour"
+   */
+  onboardingCompleted: boolean | null;
+  /** True while Step 3 is polling for the auth-status flip. */
+  pairingPolling: boolean;
+  /** Step 4 — silent permission preflight results. */
+  onboardingPermissionStatus: OnboardingPermissionStatus;
   /** Sub-prompt 4.6 — which tab is active in expanded mode. */
   activeTab: ExpandedTab;
   /**
@@ -363,7 +393,22 @@ export type Action =
       durationMs: number | null;
       modeName: string | null;
     }
-  | { type: "DISMISS_SESSION_COMPLETE" };
+  | { type: "DISMISS_SESSION_COMPLETE" }
+  // Sub-prompt 6.0 — onboarding wizard
+  | {
+      type: "LOAD_ONBOARDING_FLAG";
+      completed: boolean;
+      lastStep: number;
+    }
+  | { type: "SHOW_ONBOARDING" }
+  | { type: "ADVANCE_STEP" }
+  | { type: "PREV_STEP" }
+  | { type: "JUMP_TO_STEP"; step: number }
+  | { type: "SKIP_TOUR" }
+  | { type: "COMPLETE_ONBOARDING" }
+  | { type: "SET_PAIRING_POLLING"; polling: boolean }
+  | { type: "PAIRING_COMPLETE" }
+  | { type: "SET_PERMISSION_STATUS"; payload: OnboardingPermissionStatus };
 
 export const initialOverlayState: OverlayState = {
   uiPhase: "Idle",
@@ -372,6 +417,11 @@ export const initialOverlayState: OverlayState = {
   welcomeOpen: false,
   lastFinalizedSession: null,
   sessionCompleteOpenedAtMs: null,
+  onboardingOpen: false,
+  onboardingStep: 1,
+  onboardingCompleted: null,
+  pairingPolling: false,
+  onboardingPermissionStatus: { mic: null, screen: null },
   activeTab: "chat",
   fullTranscript: [],
   chatThreads: [],

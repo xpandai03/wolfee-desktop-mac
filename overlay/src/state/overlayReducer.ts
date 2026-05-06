@@ -492,6 +492,81 @@ export function overlayReducer(
         sessionCompleteOpenedAtMs: null,
       };
 
+    // ── Sub-prompt 6.0 — onboarding wizard ─────────────────────────
+
+    case "LOAD_ONBOARDING_FLAG":
+      // Boot read of persisted flag. lastStep is clamped to 1..6 so a
+      // corrupted store value can't deadlock the wizard. If completed,
+      // the wizard stays closed until the user opens it from the tray.
+      return {
+        ...state,
+        onboardingCompleted: action.completed,
+        onboardingStep: Math.min(Math.max(action.lastStep || 1, 1), 6),
+      };
+
+    case "SHOW_ONBOARDING":
+      // Tray-driven re-open or first-launch open. Always start at the
+      // user's last step (or 1 if they never started). Does NOT mutate
+      // onboardingCompleted — re-opening from tray after completion
+      // is intentional (recovery path).
+      return {
+        ...state,
+        onboardingOpen: true,
+      };
+
+    case "ADVANCE_STEP":
+      return {
+        ...state,
+        onboardingStep: Math.min(state.onboardingStep + 1, 6),
+      };
+
+    case "PREV_STEP":
+      return {
+        ...state,
+        onboardingStep: Math.max(state.onboardingStep - 1, 1),
+      };
+
+    case "JUMP_TO_STEP":
+      return {
+        ...state,
+        onboardingStep: Math.min(Math.max(action.step, 1), 6),
+      };
+
+    case "SKIP_TOUR":
+      return {
+        ...state,
+        onboardingOpen: false,
+        onboardingCompleted: true,
+        pairingPolling: false,
+      };
+
+    case "COMPLETE_ONBOARDING":
+      return {
+        ...state,
+        onboardingOpen: false,
+        onboardingCompleted: true,
+        pairingPolling: false,
+      };
+
+    case "SET_PAIRING_POLLING":
+      return { ...state, pairingPolling: action.polling };
+
+    case "PAIRING_COMPLETE":
+      // Idempotent: if already past Step 3, no-op (prevents re-jumping
+      // backward when the user pairs after manually advancing).
+      if (state.onboardingStep > 3) return state;
+      return {
+        ...state,
+        onboardingStep: 4,
+        pairingPolling: false,
+      };
+
+    case "SET_PERMISSION_STATUS":
+      return {
+        ...state,
+        onboardingPermissionStatus: action.payload,
+      };
+
     case "TICK": {
       // Driven by a 250ms interval in CopilotOverlay. Handles
       // time-based transitions: 2s reasoning fallback, 30s TTL,
