@@ -111,3 +111,99 @@ pub async fn ensure_all() -> Result<(), AudioError> {
     ensure_screen_recording().await?;
     Ok(())
 }
+
+// ── Sub-prompt 6.0 — silent permission status probes ─────────────────
+//
+// These probes inspect TCC state WITHOUT triggering a prompt — used by
+// the onboarding wizard's Step 4 to render live status indicators.
+// Distinct from `ensure_*` which actively prompt during session start.
+
+/// Probe result for the wizard's status indicators. Maps cleanly to
+/// the JS `PermissionStatus` union ("granted" | "denied" | "undetermined").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionProbe {
+    Granted,
+    Denied,
+    Undetermined,
+}
+
+impl PermissionProbe {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Granted => "granted",
+            Self::Denied => "denied",
+            Self::Undetermined => "undetermined",
+        }
+    }
+}
+
+/// Silent microphone permission check via AVCaptureDevice
+/// authorizationStatus. macOS-only; non-mac always reports
+/// `Undetermined` so the wizard renders the "open settings" CTA.
+///
+/// AVAuthorizationStatus values (NSInteger):
+///   0 NotDetermined → Undetermined
+///   1 Restricted    → Denied  (parental controls etc.)
+///   2 Denied        → Denied
+///   3 Authorized    → Granted
+#[cfg(target_os = "macos")]
+pub fn probe_microphone() -> PermissionProbe {
+    use objc2::msg_send;
+    use objc2::runtime::AnyClass;
+    use objc2::ffi::NSInteger;
+
+    // SAFETY: AVCaptureDevice + authorizationStatusForMediaType: are
+    // documented public APIs. Returns NSInteger by value. We pass a
+    // C string to NSString helper since we don't link AVMediaType
+    // constants directly.
+    unsafe {
+        let cls = match AnyClass::get(c"AVCaptureDevice") {
+            Some(c) => c,
+            None => {
+                log::warn!(
+                    "[Copilot/perm/probe] AVCaptureDevice class not found — \
+                     AVFoundation not loaded? returning Undetermined"
+                );
+                return PermissionProbe::Undetermined;
+            }
+        };
+        let nsstring_cls = match AnyClass::get(c"NSString") {
+            Some(c) => c,
+            None => return PermissionProbe::Undetermined,
+        };
+        // AVMediaTypeAudio = "soun" (Apple's FourCC literal)
+        let media_type: *mut objc2::runtime::AnyObject =
+            msg_send![nsstring_cls, stringWithUTF8String: c"soun".as_ptr()];
+        let status: NSInteger =
+            msg_send![cls, authorizationStatusForMediaType: media_type];
+        match status {
+            3 => PermissionProbe::Granted,
+            1 | 2 => PermissionProbe::Denied,
+            _ => PermissionProbe::Undetermined,
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn probe_microphone() -> PermissionProbe {
+    PermissionProbe::Undetermined
+}
+
+/// Silent screen-recording permission check via CoreGraphics preflight.
+/// Cannot distinguish Denied vs Undetermined — both surface as
+/// preflight=false. We surface Undetermined for safety so the user
+/// sees a "needs permission" hint rather than a misleading "denied".
+#[cfg(target_os = "macos")]
+pub fn probe_screen_recording() -> PermissionProbe {
+    let access = ScreenCaptureAccess::default();
+    if access.preflight() {
+        PermissionProbe::Granted
+    } else {
+        PermissionProbe::Undetermined
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn probe_screen_recording() -> PermissionProbe {
+    PermissionProbe::Undetermined
+}

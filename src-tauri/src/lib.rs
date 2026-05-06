@@ -35,12 +35,36 @@ use tauri_plugin_store::StoreExt;
 const FLAGS_STORE_PATH: &str = "flags.json";
 const WELCOME_KEY_PREFIX: &str = "wolfee_welcome_shown_v1";
 
+/// Sub-prompt 6.0 — onboarding wizard flag scoped per paired user_id.
+/// `_completed` is the boolean "user finished or skipped the wizard";
+/// `_last_step` is the resume-mid-tour step index (1..6).
+const ONBOARDING_COMPLETED_PREFIX: &str = "wolfee_onboarding_completed_v1";
+const ONBOARDING_LAST_STEP_PREFIX: &str = "wolfee_onboarding_last_step_v1";
+
 fn welcome_key_for(user_id: Option<&str>) -> String {
     match user_id {
         Some(uid) if !uid.is_empty() => {
             format!("{}_{}", WELCOME_KEY_PREFIX, uid)
         }
         _ => format!("{}_unpaired", WELCOME_KEY_PREFIX),
+    }
+}
+
+fn onboarding_completed_key_for(user_id: Option<&str>) -> String {
+    match user_id {
+        Some(uid) if !uid.is_empty() => {
+            format!("{}_{}", ONBOARDING_COMPLETED_PREFIX, uid)
+        }
+        _ => format!("{}_unpaired", ONBOARDING_COMPLETED_PREFIX),
+    }
+}
+
+fn onboarding_last_step_key_for(user_id: Option<&str>) -> String {
+    match user_id {
+        Some(uid) if !uid.is_empty() => {
+            format!("{}_{}", ONBOARDING_LAST_STEP_PREFIX, uid)
+        }
+        _ => format!("{}_unpaired", ONBOARDING_LAST_STEP_PREFIX),
     }
 }
 
@@ -1047,6 +1071,142 @@ fn handle_structured_action(
                     );
                 }
             }
+        }
+
+        // ─────────────────────────────────────────
+        // Sub-prompt 6.0 — onboarding wizard handlers.
+        //
+        // request-onboarding-flag → emits onboarding-flag-loaded
+        //   {completed: bool, last_step: u32}
+        // mark-onboarding-completed → flips _completed key to true
+        // mark-onboarding-step → writes _last_step (1..6) so quit-mid-tour
+        //   resumes correctly. step out of bounds clamped to 1.
+        // request-auth-status → emits auth-status-loaded
+        //   {paired: bool, user_id: Option<String>}
+        // request-permission-status → emits permission-status-loaded
+        //   {mic: PermissionProbe::as_str, screen: same}. Silent — does
+        //   NOT trigger TCC prompts. The wizard's Step 4 polls this
+        //   every 5s while open.
+        // show-onboarding → react-side flips wizard open. Tray menu
+        //   "Show Onboarding Tour" emits this; CopilotOverlay has the
+        //   listener in CopilotOverlay.tsx.
+        // ─────────────────────────────────────────
+        "request-onboarding-flag" => {
+            let user_id = handle
+                .state::<AppState>()
+                .user_id
+                .lock()
+                .ok()
+                .and_then(|g| g.clone());
+            let (completed, last_step) = match handle.store(FLAGS_STORE_PATH) {
+                Ok(store) => {
+                    let c_key = onboarding_completed_key_for(user_id.as_deref());
+                    let s_key = onboarding_last_step_key_for(user_id.as_deref());
+                    let completed = store
+                        .get(&c_key)
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let step = store
+                        .get(&s_key)
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(1) as u32;
+                    (completed, step.clamp(1, 6))
+                }
+                Err(e) => {
+                    log::warn!("[Copilot] onboarding-flag store load failed: {}", e);
+                    (false, 1)
+                }
+            };
+            log::info!(
+                "[Copilot] onboarding flag loaded (completed={}, last_step={})",
+                completed, last_step
+            );
+            let _ = handle.emit(
+                "onboarding-flag-loaded",
+                serde_json::json!({ "completed": completed, "last_step": last_step }),
+            );
+        }
+
+        "mark-onboarding-completed" => {
+            let user_id = handle
+                .state::<AppState>()
+                .user_id
+                .lock()
+                .ok()
+                .and_then(|g| g.clone());
+            let key = onboarding_completed_key_for(user_id.as_deref());
+            match handle.store(FLAGS_STORE_PATH) {
+                Ok(store) => {
+                    store.set(key.clone(), serde_json::Value::Bool(true));
+                    if let Err(e) = store.save() {
+                        log::warn!("[Copilot] onboarding-completed save failed: {}", e);
+                    } else {
+                        log::info!("[Copilot] onboarding completed persisted ({}=true)", key);
+                    }
+                }
+                Err(e) => {
+                    log::warn!("[Copilot] onboarding-completed store open failed: {}", e);
+                }
+            }
+        }
+
+        "mark-onboarding-step" => {
+            let step = payload
+                .get("step")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1)
+                .clamp(1, 6);
+            let user_id = handle
+                .state::<AppState>()
+                .user_id
+                .lock()
+                .ok()
+                .and_then(|g| g.clone());
+            let key = onboarding_last_step_key_for(user_id.as_deref());
+            match handle.store(FLAGS_STORE_PATH) {
+                Ok(store) => {
+                    store.set(key.clone(), serde_json::Value::from(step));
+                    let _ = store.save();
+                }
+                Err(e) => {
+                    log::warn!("[Copilot] onboarding-step store open failed: {}", e);
+                }
+            }
+        }
+
+        "request-auth-status" => {
+            let app_state = handle.state::<AppState>();
+            let token_opt = app_state.auth_token.lock().unwrap().clone();
+            let user_id = app_state.user_id.lock().unwrap().clone();
+            let _ = handle.emit(
+                "auth-status-loaded",
+                serde_json::json!({
+                    "paired": token_opt.is_some(),
+                    "user_id": user_id,
+                }),
+            );
+        }
+
+        "request-permission-status" => {
+            // Silent probes — no TCC prompts. Sub-prompt 6.0 wizard
+            // Step 4 polls every 5s while open.
+            let mic = copilot::audio::permissions::probe_microphone();
+            let screen = copilot::audio::permissions::probe_screen_recording();
+            let _ = handle.emit(
+                "permission-status-loaded",
+                serde_json::json!({
+                    "mic": mic.as_str(),
+                    "screen": screen.as_str(),
+                }),
+            );
+        }
+
+        "show-onboarding" => {
+            // Tray "Show Onboarding Tour" → emit a notification event the
+            // overlay listens for. The overlay then dispatches SHOW_ONBOARDING
+            // and emits expand-overlay so the wizard becomes visible.
+            log::info!("[Copilot] tray: show-onboarding");
+            let _ = handle.emit("copilot-show-onboarding", serde_json::json!({}));
         }
 
         // ─────────────────────────────────────────
