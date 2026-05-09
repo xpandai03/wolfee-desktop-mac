@@ -473,6 +473,9 @@ export function overlayReducer(
       return { ...state, welcomeOpen: false, welcomeShown: true };
 
     case "SESSION_FINALIZED":
+      // Reset in-session UI state so the Strip stops claiming "Listening"
+      // once the session is over. fullTranscript is intentionally preserved
+      // — the Transcript tab still wants the call's history.
       return {
         ...state,
         lastFinalizedSession: {
@@ -483,6 +486,11 @@ export function overlayReducer(
           finalizedAtMs: Date.now(),
         },
         sessionCompleteOpenedAtMs: Date.now(),
+        transcript: [],
+        uiPhase: "Idle",
+        active: null,
+        reasoningStartedAtMs: null,
+        showingStartedAtMs: null,
       };
 
     case "DISMISS_SESSION_COMPLETE":

@@ -491,6 +491,26 @@ export default function CopilotOverlay() {
     return () => window.clearTimeout(t);
   }, [finalizeFailureReason]);
 
+  // Strip-cleanup fix — when the SessionCompleteCard dismisses (manual
+  // ✕, View recap, or 8s auto-dismiss in TICK), hide the whole overlay
+  // window so the now-stale strip doesn't linger after a session ends.
+  // Start-new-session bypasses the hide via suppressHideOnDismissRef
+  // so the user doesn't see a flicker before Rust shows the overlay
+  // again for the new session.
+  const suppressHideOnDismissRef = useRef(false);
+  const prevLastFinalizedSessionRef = useRef(overlayState.lastFinalizedSession);
+  useEffect(() => {
+    const prev = prevLastFinalizedSessionRef.current;
+    prevLastFinalizedSessionRef.current = overlayState.lastFinalizedSession;
+    if (prev !== null && overlayState.lastFinalizedSession === null) {
+      if (suppressHideOnDismissRef.current) {
+        suppressHideOnDismissRef.current = false;
+        return;
+      }
+      void getCurrentWebviewWindow().hide();
+    }
+  }, [overlayState.lastFinalizedSession]);
+
   // ── Strip control handlers ─────────────────────────────────────
   const handlePauseToggle = () => {
     void emit("wolfee-action", "toggle-copilot-pause");
@@ -576,6 +596,11 @@ export default function CopilotOverlay() {
     dispatch({ type: "DISMISS_SESSION_COMPLETE" });
   };
   const handleStartNewSession = () => {
+    // Strip-cleanup fix — Start-new dismisses the card but should NOT
+    // hide the overlay; Rust will reuse the same window for the new
+    // session. Suppress the dismiss-driven hide effect for this one
+    // transition.
+    suppressHideOnDismissRef.current = true;
     dispatch({ type: "DISMISS_SESSION_COMPLETE" });
     void emit("wolfee-action", "start-copilot-session");
   };
@@ -692,17 +717,23 @@ export default function CopilotOverlay() {
     // and the ContextWindow page draw their own bg-zinc-950/70 +
     // backdrop-blur). Wrapper just sizes the layout.
     <div className="w-screen h-screen flex flex-col text-zinc-100 select-none overflow-hidden">
-      <Strip
-        mode={overlayState.mode}
-        uiPhase={overlayState.uiPhase}
-        hasActiveSession={hasActiveSession}
-        isPaused={isPaused}
-        onPauseToggle={handlePauseToggle}
-        onStop={handleStop}
-        onToggleExpand={handleToggleExpand}
-        onAppsClick={handleAppsClick}
-        onClose={handleClose}
-      />
+      {/* Strip-cleanup fix — hide the in-session strip while the
+          post-session takeover card is visible so the two UIs don't
+          fight. The card owns the full window during its lifetime;
+          on dismiss the window itself is hidden by the effect above. */}
+      {!showSessionComplete && (
+        <Strip
+          mode={overlayState.mode}
+          uiPhase={overlayState.uiPhase}
+          hasActiveSession={hasActiveSession}
+          isPaused={isPaused}
+          onPauseToggle={handlePauseToggle}
+          onStop={handleStop}
+          onToggleExpand={handleToggleExpand}
+          onAppsClick={handleAppsClick}
+          onClose={handleClose}
+        />
+      )}
 
       {/* Sub-prompt 4.9 — finalize-failure banner. Pinned just below
           the Strip so it's visible regardless of mode (strip vs
