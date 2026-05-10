@@ -228,6 +228,20 @@ fn build_menu<R: Runtime>(
     )?;
     menu.append(&show_tour)?;
 
+    // Modes RAG (step 13) — quick access to the web Modes page so users
+    // can manage their bring-your-own knowledge without first opening
+    // the overlay. Always visible. Opens wolfee.io/copilot/modes in
+    // the user's default browser via the existing open-external-url
+    // wolfee-action handler in lib.rs.
+    let manage_modes = MenuItem::with_id(
+        app,
+        "copilot_manage_modes",
+        "Manage Modes…",
+        true,
+        None::<&str>,
+    )?;
+    menu.append(&manage_modes)?;
+
     let section_sep = MenuItem::with_id(app, "section_sep", "———", false, None::<&str>)?;
     menu.append(&section_sep)?;
 
@@ -397,6 +411,18 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, id: &str) {
         "copilot_show_onboarding" => {
             log::info!("[Tray] Show Onboarding Tour clicked");
             let _ = app.emit("wolfee-action", "show-onboarding");
+        }
+        // Modes RAG (step 13) — opens wolfee.io/copilot/modes in the
+        // user's browser via the existing open-external-url action.
+        "copilot_manage_modes" => {
+            log::info!("[Tray] Manage Modes clicked");
+            let _ = app.emit(
+                "wolfee-action",
+                serde_json::json!({
+                    "type": "open-external-url",
+                    "url": "https://wolfee.io/copilot/modes"
+                }),
+            );
         }
 
         // ─── Linking / upload status row clicks ───

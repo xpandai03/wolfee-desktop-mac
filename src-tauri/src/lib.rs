@@ -193,11 +193,26 @@ fn spawn_session_workers(
         );
     }
 
+    // Modes RAG — capture active mode id before the async block so we
+    // can pass it to create_session. The id was set by the user via the
+    // ContextWindow dropdown earlier in the start flow. None is fine —
+    // session runs without RAG (existing behavior).
+    let active_mode_id_for_start = handle
+        .state::<ActiveModeIdMutex>()
+        .0
+        .lock()
+        .ok()
+        .and_then(|g| g.id.clone());
+
     tauri::async_runtime::spawn(async move {
         let api = SessionApi::new(backend_url.clone(), device_token.clone());
 
-        // 1. Mint session id backend-side.
-        match api.create_session(&session_id).await {
+        // 1. Mint session id backend-side. Pass mode_used_id so the
+        //    server stores it on copilot_sessions for live retrieval.
+        match api
+            .create_session(&session_id, active_mode_id_for_start.as_deref())
+            .await
+        {
             Ok(resp) => {
                 log::info!(
                     "[Copilot] backend session created — id={}, startedAt={}",

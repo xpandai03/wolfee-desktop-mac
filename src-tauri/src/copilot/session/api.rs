@@ -127,12 +127,20 @@ impl SessionApi {
     /// Returns the canonical sessionId + startedAt the backend
     /// persisted. The endpoint is idempotent on the PK — retry-after-
     /// network-blip with the same sessionId is safe.
+    ///
+    /// Modes RAG — `mode_used_id` is sent at session start so the
+    /// retrieval helper can look up the user's knowledge mid-call.
+    /// `None` is fine — the session runs without RAG (existing behavior).
     pub async fn create_session(
         &self,
         session_id: &str,
+        mode_used_id: Option<&str>,
     ) -> Result<CreateSessionResponse, SessionApiError> {
         let url = format!("{}/api/copilot/sessions", self.backend_url);
-        let body = serde_json::json!({ "sessionId": session_id });
+        let body = serde_json::json!({
+            "sessionId": session_id,
+            "modeUsedId": mode_used_id,
+        });
 
         let res = self
             .client
