@@ -9,6 +9,8 @@ certs/
 *.p12
 *.p8
 .env
+.env.*
+!.env.example
 
 # Tauri build artifacts
 src-tauri/target/
