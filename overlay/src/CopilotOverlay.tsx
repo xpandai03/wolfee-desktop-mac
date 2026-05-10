@@ -5,6 +5,7 @@ import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import { Strip } from "@/components/Strip";
 import { ExpandedPanel } from "@/components/ExpandedPanel";
+import { FooterHint } from "@/components/FooterHint";
 import { OnboardingWizard } from "@/components/onboarding/OnboardingWizard";
 import { SessionCompleteCard } from "@/components/SessionCompleteCard";
 import { checkForUpdatesSilently } from "@/updater";
@@ -157,6 +158,37 @@ export default function CopilotOverlay() {
     }, FAILURE_TOAST_MS);
     return () => window.clearTimeout(t);
   }, [overlayState.failureToast]);
+
+  // 0.7.4 — 8-second client-side watchdog for user-initiated quick-actions.
+  // Rust has its own 2s TTFT cap and 60s outer cap, but the user prompt
+  // mandates a visible "no response" message regardless of root cause.
+  // Fires only when uiPhase enters Reasoning/Streaming via a hotkey-source
+  // pending event (i.e. a quick-action click), not for auto-fired moments.
+  // SUGGESTION_COMPLETE / SUGGESTION_FAILED clear the dependency early.
+  const QUICK_ACTION_WATCHDOG_MS = 8_000;
+  useEffect(() => {
+    if (
+      overlayState.uiPhase !== "Reasoning" &&
+      overlayState.uiPhase !== "Streaming"
+    ) {
+      return;
+    }
+    if (overlayState.active?.triggerSource !== "hotkey") return;
+    const startedAt = overlayState.reasoningStartedAtMs ?? Date.now();
+    const remaining = QUICK_ACTION_WATCHDOG_MS - (Date.now() - startedAt);
+    if (remaining <= 0) return;
+    const t = window.setTimeout(() => {
+      dispatch({
+        type: "SUGGESTION_FAILED",
+        payload: { session_id: "", reason: "no response, try again" },
+      });
+    }, remaining);
+    return () => window.clearTimeout(t);
+  }, [
+    overlayState.uiPhase,
+    overlayState.active?.triggerSource,
+    overlayState.reasoningStartedAtMs,
+  ]);
 
   // Window-level keydown + Tauri event listeners.
   useEffect(() => {
@@ -773,6 +805,15 @@ export default function CopilotOverlay() {
           />
         )}
       </AnimatePresence>
+
+      {/* 0.7.4 — failure toast surfacing. The reducer sets failureToast
+          on SUGGESTION_FAILED (backend errors, ttft_exceeded,
+          stream_closed_no_tokens, or our 8s client watchdog). Without
+          this mount, every quick-action failure was silent. 1.2s
+          auto-clear runs in the existing useEffect above. */}
+      {overlayState.failureToast && (
+        <FooterHint failureToast={overlayState.failureToast} />
+      )}
     </div>
   );
 }

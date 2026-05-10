@@ -37,7 +37,11 @@ const SESSION_COMPLETE_AUTO_DISMISS_MS = 8_000;
 
 // Sub-prompt 4.6 — quick-action triggers that should emit a
 // chat-thread message instead of a transient suggestion card.
+// 0.7.4 — "ask" added so Assist responses route to the active
+// chat thread (badge "Assist") instead of the auto-suggestion
+// ribbon (badge "GENERAL").
 const QUICK_ACTION_TRIGGERS: ReadonlySet<string> = new Set([
+  "ask",
   "follow_up",
   "fact_check",
   "recap",
@@ -251,13 +255,22 @@ export function overlayReducer(
     }
 
     case "SUGGESTION_FAILED": {
+      // 0.7.4 — surface short reason strings ("no response, try again",
+      // "rate_limited", etc.) so the FooterHint reads as concrete
+      // feedback. Long reasons (raw backend errors like "open: 500: ...")
+      // fall through to the generic copy.
+      const reason = action.payload?.reason?.trim();
+      const failureToast =
+        reason && reason.length > 0 && reason.length < 80
+          ? reason
+          : "Couldn't generate suggestion";
       return {
         ...state,
         uiPhase: "Idle",
         active: null,
         reasoningStartedAtMs: null,
         showingStartedAtMs: null,
-        failureToast: "Couldn't generate suggestion",
+        failureToast,
       };
     }
 
