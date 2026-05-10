@@ -87,7 +87,6 @@ export default function CopilotOverlay() {
     overlayReducer,
     initialOverlayState,
   );
-  const [isPaused, setIsPaused] = useState(false);
   const [hasFinalizedSession, setHasFinalizedSession] = useState(false);
   // Sub-prompt 4.9 — surface finalize failures to the user so a missing
   // recap on wolfee.io isn't silently swallowed. Auto-clears 6s after set.
@@ -230,7 +229,6 @@ export default function CopilotOverlay() {
     let chatStreamingUnlisten: UnlistenFn | undefined;
     let chatCompleteUnlisten: UnlistenFn | undefined;
     let chatFailedUnlisten: UnlistenFn | undefined;
-    let pauseStateUnlisten: UnlistenFn | undefined;
     let newThreadUnlisten: UnlistenFn | undefined;
     let finalizedUnlisten: UnlistenFn | undefined;
     let sessionFailedUnlisten: UnlistenFn | undefined;
@@ -361,13 +359,6 @@ export default function CopilotOverlay() {
           reason: event.payload.reason,
         });
       });
-
-      pauseStateUnlisten = await listen<{ paused: boolean }>(
-        "copilot-pause-state",
-        (event) => {
-          setIsPaused(event.payload.paused);
-        },
-      );
 
       // Sub-prompt 4.8 — Rust signals after a session was successfully
       // finalized + pushed. Track the id so the "View on Web" link
@@ -503,7 +494,6 @@ export default function CopilotOverlay() {
       chatStreamingUnlisten?.();
       chatCompleteUnlisten?.();
       chatFailedUnlisten?.();
-      pauseStateUnlisten?.();
       newThreadUnlisten?.();
       finalizedUnlisten?.();
       sessionFailedUnlisten?.();
@@ -544,8 +534,14 @@ export default function CopilotOverlay() {
   }, [overlayState.lastFinalizedSession]);
 
   // ── Strip control handlers ─────────────────────────────────────
-  const handlePauseToggle = () => {
-    void emit("wolfee-action", "toggle-copilot-pause");
+  // 0.7.4 — Strip Play button. Same Tauri action the tray's Start
+  // Copilot Session item emits, so the strip and the tray are
+  // interchangeable session-start surfaces. After context submit,
+  // lib.rs auto-shows the overlay (Workstream B) so the strip stays
+  // visible through the transition for users who started from the
+  // tray with the strip closed.
+  const handleStartSession = () => {
+    void emit("wolfee-action", "start-copilot-session");
   };
   const handleStop = () => {
     // Sub-prompt 4.8 — push transcript + chat threads + auto-suggestions
@@ -758,8 +754,7 @@ export default function CopilotOverlay() {
           mode={overlayState.mode}
           uiPhase={overlayState.uiPhase}
           hasActiveSession={hasActiveSession}
-          isPaused={isPaused}
-          onPauseToggle={handlePauseToggle}
+          onStartSession={handleStartSession}
           onStop={handleStop}
           onToggleExpand={handleToggleExpand}
           onAppsClick={handleAppsClick}

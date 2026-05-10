@@ -89,11 +89,7 @@ fn copilot_status_label(state: &CopilotState) -> &'static str {
     match state {
         CopilotState::Idle => "🟢 Copilot: Idle",
         CopilotState::ShowingOverlay => "🟡 Copilot: Active",
-        CopilotState::Paused => "🔴 Copilot: Paused",
-        // Sub-prompt 2 listening lifecycle. Wired here so the tray
-        // reflects session state even before Sub-prompt 5 lands the
-        // tray-action handlers; the matching menu items themselves
-        // come in Sub-prompt 5.
+        // Workstream B (2026-05-05) — Paused variant removed.
         CopilotState::StartingSession { .. } => "🔄 Copilot: Starting…",
         CopilotState::Listening { .. } => "🟢 Copilot: Listening",
         CopilotState::Reconnecting { .. } => "⚠️ Copilot: Reconnecting…",
@@ -132,8 +128,9 @@ fn build_menu<R: Runtime>(
     menu.append(&open_overlay)?;
 
     // ── Session controls (Sub-prompt 2 Phase 5) ───────────────────
-    // Show Start when nothing is in flight (Idle / ShowingOverlay /
-    // Paused) and End when a session is live or transitioning.
+    // Show Start when nothing is in flight (Idle / ShowingOverlay)
+    // and End when a session is live or transitioning. Workstream B
+    // dropped the Paused variant — no separate "Resume" path needed.
     let session_sep_top = MenuItem::with_id(app, "copilot_session_sep_top", "—", false, None::<&str>)?;
     menu.append(&session_sep_top)?;
 
@@ -202,16 +199,9 @@ fn build_menu<R: Runtime>(
     let session_sep_bottom = MenuItem::with_id(app, "copilot_session_sep_bottom", "—", false, None::<&str>)?;
     menu.append(&session_sep_bottom)?;
 
-    let pause_label = if copilot_state == CopilotState::Paused {
-        "Resume Copilot"
-    } else {
-        "Pause Copilot"
-    };
-    let pause_copilot = MenuItem::with_id(app, "copilot_pause", pause_label, true, None::<&str>)?;
-    menu.append(&pause_copilot)?;
-
-    let copilot_sep = MenuItem::with_id(app, "copilot_sep", "—", false, None::<&str>)?;
-    menu.append(&copilot_sep)?;
+    // Workstream B (2026-05-05) — "Pause Copilot" item removed. It
+    // was a half-implemented placeholder (no audio mute, no UI dim)
+    // that confused users. End Session is the only stop control.
 
     let setup_copilot =
         MenuItem::with_id(app, "copilot_setup", "Set Up Copilot…", true, None::<&str>)?;
@@ -386,10 +376,6 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, id: &str) {
         "copilot_open_overlay" => {
             log::info!("[Tray] Open Copilot Overlay clicked");
             let _ = app.emit("wolfee-action", "open-copilot-overlay");
-        }
-        "copilot_pause" => {
-            log::info!("[Tray] Pause/Resume Copilot clicked");
-            let _ = app.emit("wolfee-action", "toggle-copilot-pause");
         }
         "copilot_setup" => {
             log::info!("[Tray] Set Up Copilot clicked");

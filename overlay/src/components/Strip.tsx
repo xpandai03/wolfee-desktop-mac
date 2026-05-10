@@ -1,12 +1,19 @@
-import { Pause, Square, ChevronDown, ChevronUp, Grid3x3, X } from "lucide-react";
+import { Play, Square, ChevronDown, ChevronUp, Grid3x3, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { OverlayMode, UiPhase } from "@/state/types";
 
 /**
  * Sub-prompt 4.6 (Cluely 1:1 redesign) — always-visible thin strip
  * that sits at the top of the focused monitor. Replaces the old
- * TopBar + body sandwich. Five controls match Cluely's reference:
- *   [status pill]                [pause][stop][expand][apps][close]
+ * TopBar + body sandwich. Controls match the current product surface:
+ *   [status pill]                [play|stop][expand][apps][close]
+ *
+ * 0.7.4 — strip is now a session control surface. When idle, the
+ * left button is Play and clicking it emits start-copilot-session
+ * (same path as the tray's Start Copilot Session item). When live,
+ * the left button is Stop and clicking it runs the existing finalize
+ * push + end-copilot-session flow. The dead Pause button (Workstream B
+ * removal — Rust handlers were already deleted) is gone.
  *
  * Drag region: the entire strip EXCEPT the buttons. Tauri 2 auto-
  * excludes interactive <button> elements from data-tauri-drag-region,
@@ -22,8 +29,7 @@ interface Props {
   mode: OverlayMode;
   uiPhase: UiPhase;
   hasActiveSession: boolean;
-  isPaused: boolean;
-  onPauseToggle: () => void;
+  onStartSession: () => void;
   onStop: () => void;
   onToggleExpand: () => void;
   onAppsClick: () => void;
@@ -34,18 +40,13 @@ export function Strip({
   mode,
   uiPhase,
   hasActiveSession,
-  isPaused,
-  onPauseToggle,
+  onStartSession,
   onStop,
   onToggleExpand,
   onAppsClick,
   onClose,
 }: Props) {
-  const { dotClass, label } = derivePill(uiPhase, hasActiveSession, isPaused);
-
-  // Buttons that drive a session-only action are disabled outside a
-  // live session so the user gets a visual hint Wolfee isn't recording.
-  const sessionButtonsEnabled = hasActiveSession;
+  const { dotClass, label } = derivePill(uiPhase, hasActiveSession);
 
   return (
     <div
@@ -89,22 +90,26 @@ export function Strip({
 
       {/* Controls — right */}
       <div className="flex items-center gap-0.5">
-        <StripButton
-          onClick={onPauseToggle}
-          disabled={!sessionButtonsEnabled}
-          ariaLabel={isPaused ? "Resume" : "Pause"}
-        >
-          <Pause className="w-3.5 h-3.5" />
-        </StripButton>
-
-        <StripButton
-          onClick={onStop}
-          disabled={!sessionButtonsEnabled}
-          ariaLabel="Stop session"
-          danger
-        >
-          <Square className="w-3.5 h-3.5" />
-        </StripButton>
+        {/* 0.7.4 — Play (idle) / Stop (live) toggle. Same Tauri actions
+            the tray menu emits, so the strip and tray are interchangeable
+            entry points. The Pause button was removed alongside the Rust
+            toggle-copilot-pause handlers (Workstream B). */}
+        {hasActiveSession ? (
+          <StripButton
+            onClick={onStop}
+            ariaLabel="Stop session"
+            danger
+          >
+            <Square className="w-3.5 h-3.5" />
+          </StripButton>
+        ) : (
+          <StripButton
+            onClick={onStartSession}
+            ariaLabel="Start session"
+          >
+            <Play className="w-3.5 h-3.5" />
+          </StripButton>
+        )}
 
         {/* Subtle divider before navigation controls */}
         <span className="mx-1 h-4 w-px bg-white/10" data-tauri-drag-region />
@@ -171,14 +176,7 @@ function StripButton({
 function derivePill(
   uiPhase: UiPhase,
   hasActiveSession: boolean,
-  isPaused: boolean,
 ): { dotClass: string; label: string } {
-  if (isPaused) {
-    return {
-      dotClass: "bg-amber-400",
-      label: "Paused",
-    };
-  }
   if (!hasActiveSession) {
     return {
       dotClass: "bg-zinc-600",

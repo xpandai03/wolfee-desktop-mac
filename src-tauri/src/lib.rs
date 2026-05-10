@@ -330,6 +330,15 @@ fn spawn_session_workers(
             app_state.auth_token.lock().unwrap().is_some(),
         );
 
+        // Workstream B (2026-05-05) — auto-show the overlay strip the
+        // moment a session reaches Listening. Previously users had to
+        // separately click "Open Copilot Overlay" or hit ⌘⌥W after
+        // starting a session, which felt redundant. The hotkey still
+        // toggles visibility mid-session for users who want to hide it.
+        if let Err(e) = copilot::window::show_overlay(&handle) {
+            log::error!("[Copilot] auto-show overlay failed after session start: {}", e);
+        }
+
         // 5. Spawn the Deepgram WebSocket client.
         let api_arc = std::sync::Arc::new(api);
         let _dg_handle = DeepgramClient::spawn(
@@ -1734,22 +1743,9 @@ pub fn run() {
                         }
                     }
 
-                    "toggle-copilot-pause" => {
-                        let copilot_mutex = handle_ref.state::<CopilotStateMutex>();
-                        let mut s = copilot_mutex.0.lock().unwrap();
-                        *s = match *s {
-                            CopilotState::Paused => CopilotState::Idle,
-                            _ => CopilotState::Paused,
-                        };
-                        log::info!("[Copilot] State -> {}", *s);
-                        drop(s);
-                        tray::update_tray_menu(
-                            &tray_clone,
-                            handle_ref,
-                            state.current_state(),
-                            state.auth_token.lock().unwrap().is_some(),
-                        );
-                    }
+                    // Workstream B (2026-05-05) — "toggle-copilot-pause"
+                    // handler removed. The Paused state machine variant and
+                    // tray button were retired as half-implemented confusion.
 
                     // Phase 6 — overlay modal "Open System Settings" buttons.
                     // The frontend can't open `x-apple.systempreferences:` URLs
@@ -1975,18 +1971,10 @@ pub fn run() {
                         );
                     }
 
-                    "toggle-copilot-pause" => {
-                        // Sub-prompt 4.6 — pause/resume audio capture without
-                        // ending the session. V1: just toggle a flag and emit
-                        // state for the strip to render. Actual mic-mute /
-                        // audio-pause plumbing lands in Sub-prompt 6 alongside
-                        // the settings panel.
-                        log::info!("[Copilot] Pause toggle clicked (Sub-prompt 6 wires audio pause)");
-                        let _ = handle_ref.emit(
-                            "copilot-pause-state",
-                            serde_json::json!({ "paused": false }),
-                        );
-                    }
+                    // Workstream B (2026-05-05) — second "toggle-copilot-pause"
+                    // handler removed alongside the first. Audio-pause plumbing
+                    // never landed; the user-facing button only emitted a
+                    // hardcoded `paused: false` event that nothing acted on.
 
                     "end-copilot-session" => {
                         log::info!("[Copilot] Tray: End Copilot Session clicked");

@@ -23,19 +23,16 @@ impl SessionEndReason {
 }
 
 /// Top-level Copilot state machine. Sub-prompt 1 shipped Idle /
-/// ShowingOverlay / Paused. Sub-prompt 2 adds the listening lifecycle
-/// variants — they're mutually exclusive with ShowingOverlay/Paused at
-/// runtime (the user can't be in a session AND have the overlay
-/// dismissed; the overlay is the active surface during a session).
+/// ShowingOverlay / Paused. Sub-prompt 2 added the listening lifecycle
+/// variants. Workstream B (2026-05-05) removed the Paused variant —
+/// the tray button it backed was a half-implemented placeholder that
+/// confused users; End Session is now the only stop control.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CopilotState {
     /// No session, overlay hidden, hotkey idle. Default state.
     Idle,
     /// Overlay shown via ⌘⌥W, no session. Sub-prompt 1 surface.
     ShowingOverlay,
-    /// User clicked Pause Copilot from the tray. Hotkey + moment
-    /// detector (Sub-prompt 3) suppressed until resumed. Sub-prompt 1.
-    Paused,
 
     // ── Sub-prompt 2 (Listening) lifecycle ─────────────────────────
     /// Session POST + JWT mint in flight.
@@ -67,7 +64,6 @@ impl std::fmt::Display for CopilotState {
         match self {
             Self::Idle => write!(f, "idle"),
             Self::ShowingOverlay => write!(f, "showing-overlay"),
-            Self::Paused => write!(f, "paused"),
             Self::StartingSession { session_id } => write!(f, "starting-session({})", &session_id[..8.min(session_id.len())]),
             Self::Listening { session_id, .. } => write!(f, "listening({})", &session_id[..8.min(session_id.len())]),
             Self::Reconnecting { session_id, attempt } => write!(f, "reconnecting({}, attempt={attempt})", &session_id[..8.min(session_id.len())]),

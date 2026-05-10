@@ -156,7 +156,7 @@ fn toggle_overlay<R: Runtime>(app: &AppHandle<R>) {
     // during a Listening session — Sub-prompt 4 verification 2026-05-03
     // surfaced the bug.
     match &*state {
-        CopilotState::Idle | CopilotState::Paused => {
+        CopilotState::Idle => {
             log::info!("[Copilot] Hotkey: showing overlay (was {})", *state);
             if let Err(e) = window::show_overlay(app) {
                 log::error!("[Copilot] show_overlay failed: {}", e);
