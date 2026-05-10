@@ -32,6 +32,71 @@ interface CopilotMode {
   contextAboutCall: string | null;
   contextObjections: string | null;
   isDefault: boolean;
+  // Modes RAG — knowledge aggregates for the picker summary line.
+  // Optional so older backends that don't return them deserialize
+  // cleanly (the summary just renders the empty state).
+  inlineContentTokenCount?: number | null;
+  documentsReadyCount?: number;
+  documentsTokenTotal?: number;
+}
+
+const WOLFEE_MODES_URL = "https://wolfee.io/copilot/modes";
+
+// Format a token count like "12k" / "1.2k" / "850" so the summary line
+// stays compact.
+function formatTokens(n: number): string {
+  if (n >= 10000) return `${Math.round(n / 1000)}k`;
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
+  return `${n}`;
+}
+
+/**
+ * Modes RAG — one-line knowledge summary shown under the Mode dropdown
+ * when a Mode is picked. Either:
+ *   - "X documents (Yk tokens), Zk inline notes. Retrieved live during call."
+ *     (with parts elided when one side is empty)
+ *   - "No knowledge attached. Add a playbook at wolfee.io/copilot/modes →"
+ *     (with the URL as a clickable link that opens the user's browser)
+ *
+ * No em-dashes per PO style rule. Uses commas / periods only.
+ */
+function ModeKnowledgeSummary({ mode }: { mode: CopilotMode }) {
+  const docs = mode.documentsReadyCount ?? 0;
+  const docTokens = mode.documentsTokenTotal ?? 0;
+  const inlineTokens = mode.inlineContentTokenCount ?? 0;
+  const hasContent = docs > 0 || inlineTokens > 0;
+
+  if (!hasContent) {
+    return (
+      <p className="text-[11px] text-zinc-500 mt-0.5 px-0.5">
+        No knowledge attached. Add a playbook at{" "}
+        <button
+          type="button"
+          onClick={() =>
+            void emit("wolfee-action", { type: "open-external-url", url: WOLFEE_MODES_URL })
+          }
+          className="underline text-zinc-400 hover:text-copilot-accent transition-colors"
+        >
+          wolfee.io/copilot/modes →
+        </button>
+      </p>
+    );
+  }
+
+  const parts: string[] = [];
+  if (docs > 0) {
+    const docLabel = docs === 1 ? "document" : "documents";
+    parts.push(`${docs} ${docLabel} (${formatTokens(docTokens)} tokens)`);
+  }
+  if (inlineTokens > 0) {
+    parts.push(`${formatTokens(inlineTokens)} inline notes`);
+  }
+  // Comma between parts when both present, period before the qualifier.
+  return (
+    <p className="text-[11px] text-emerald-400/80 mt-0.5 px-0.5">
+      {parts.join(", ")}. Retrieved live during call.
+    </p>
+  );
 }
 
 const FIELDS: FieldConfig[] = [
@@ -258,7 +323,9 @@ export function ContextWindow() {
             className="appearance-none w-full rounded-md border border-white/10 bg-zinc-900 pl-3 pr-9 py-2 text-sm text-zinc-100 focus:border-copilot-accent focus:outline-none disabled:opacity-50"
           >
             <option value="">
-              (No mode — paste manually)
+              {modesLoaded && modes.length === 0
+                ? "(No Modes yet. Create one at wolfee.io/copilot/modes)"
+                : "(No mode, paste manually)"}
             </option>
             {modes.map((m) => (
               <option key={m.id} value={m.id}>
@@ -274,6 +341,25 @@ export function ContextWindow() {
             {selectedMode.description}
           </p>
         )}
+        {/* Modes RAG — Knowledge summary on Mode select. Either a
+            content summary or a "no knowledge attached" empty state
+            with link to the web Modes editor. */}
+        {selectedMode && (
+          <ModeKnowledgeSummary mode={selectedMode} />
+        )}
+        {/* Footer link to web Modes management — always visible. */}
+        <p className="text-[11px] text-zinc-500 mt-0.5 px-0.5">
+          Manage Modes and upload documents at{" "}
+          <button
+            type="button"
+            onClick={() =>
+              void emit("wolfee-action", { type: "open-external-url", url: WOLFEE_MODES_URL })
+            }
+            className="underline text-zinc-400 hover:text-copilot-accent transition-colors"
+          >
+            wolfee.io/copilot/modes →
+          </button>
+        </p>
       </div>
 
       <div className="flex flex-col gap-3 flex-1">

@@ -57,10 +57,16 @@ export const WIZARD_COPY = {
     micDeeplinkAction: "open-system-settings-microphone",
     screenDeeplinkAction: "open-system-settings-screen-recording",
   },
+  // Modes RAG (0.7.3) — Step 5 reframed around the playbook concept.
+  // Wolfee.io now hosts a Knowledge editor (free-text + document upload)
+  // that the copilot retrieves from live during calls. Step 5 is the
+  // first mention to a new user that this exists, so the copy leads
+  // with "Mode = your reusable playbook" rather than the older
+  // "session setup" framing.
   step5: {
-    headline: "Let's start your first session",
-    body: "Click below to open the session setup page on Wolfee. Pick a mode (sales call, interview, support…) and Copilot will be ready when your call begins.",
-    primaryCta: "Open session setup",
+    headline: "Set up your first Mode",
+    body: "On Wolfee.io you'll create a Mode, your reusable playbook. Paste talking points, upload PDFs of your scripts or product docs. Wolfee retrieves from this content during every call you tag with the Mode.",
+    primaryCta: "Open Modes editor",
     secondaryCta: "I'll do it later",
   },
   step6: {

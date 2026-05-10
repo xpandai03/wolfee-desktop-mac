@@ -200,6 +200,11 @@ pub struct FactCheckSource {
 
 /// Saved mode template (per-user, synced via wolfee.io). Returned
 /// from GET /api/copilot/modes; sent to ContextWindow's dropdown.
+///
+/// Modes RAG fields (inline_content_token_count, documents_ready_count,
+/// documents_token_total) drive the desktop's one-line knowledge
+/// summary on Mode select. `default` on each so older backends that
+/// don't return them still deserialize cleanly (treated as no knowledge).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CopilotMode {
     pub id: String,
@@ -213,6 +218,12 @@ pub struct CopilotMode {
     pub context_objections: Option<String>,
     #[serde(rename = "isDefault")]
     pub is_default: bool,
+    #[serde(rename = "inlineContentTokenCount", default)]
+    pub inline_content_token_count: Option<i32>,
+    #[serde(rename = "documentsReadyCount", default)]
+    pub documents_ready_count: i32,
+    #[serde(rename = "documentsTokenTotal", default)]
+    pub documents_token_total: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
