@@ -526,13 +526,19 @@ export function overlayReducer(
       };
 
     case "SHOW_ONBOARDING":
-      // Tray-driven re-open or first-launch open. Always start at the
-      // user's last step (or 1 if they never started). Does NOT mutate
-      // onboardingCompleted — re-opening from tray after completion
+      // Tray-driven re-open or first-launch open. Does NOT mutate
+      // onboardingCompleted, re-opening from tray after completion
       // is intentional (recovery path).
+      //
+      // 0.7.5 — branch on completion. If the user already finished
+      // (or skipped) the tour, re-opening from the tray means they
+      // want to RE-tour, so reset to step 1. If they're still
+      // mid-tour (LOAD_ONBOARDING_FLAG just set step to last_step),
+      // preserve the resume position.
       return {
         ...state,
         onboardingOpen: true,
+        onboardingStep: state.onboardingCompleted ? 1 : state.onboardingStep,
       };
 
     case "ADVANCE_STEP":

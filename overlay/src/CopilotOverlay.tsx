@@ -666,6 +666,15 @@ export default function CopilotOverlay() {
     if (overlayState.mode !== "expanded") {
       void emit("wolfee-action", "expand-overlay");
     }
+    // 0.7.5 — every quick-action click starts a fresh chat thread.
+    // Quick-actions are single-shot, moment-specific (Assist for the
+    // current question, Fact-check for the latest claim, etc.); when
+    // the rep clicks Assist twice in a row for two different prospect
+    // questions, they expect two independent answers, not a follow-up
+    // chain. Typed questions in the InputBar still continue the
+    // active thread via handleSubmitQuestion.
+    const threadId = `thread-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    dispatch({ type: "NEW_THREAD", threadId });
     void emit("wolfee-action", {
       type: "trigger-copilot-quick-action",
       action,

@@ -1226,10 +1226,23 @@ fn handle_structured_action(
         }
 
         "show-onboarding" => {
-            // Tray "Show Onboarding Tour" → emit a notification event the
-            // overlay listens for. The overlay then dispatches SHOW_ONBOARDING
-            // and emits expand-overlay so the wizard becomes visible.
+            // Tray "Show Onboarding Tour" → make sure the overlay is
+            // visible and expanded BEFORE emitting the notification, so
+            // the React listener is guaranteed to be alive and the
+            // wizard panel actually renders. 0.7.4 had this as
+            // emit-only, which silently failed when the overlay window
+            // was hidden at the time of the click.
             log::info!("[Copilot] tray: show-onboarding");
+            if let Err(e) = copilot::window::show_overlay(handle) {
+                log::warn!("[Copilot] show-onboarding: show_overlay failed: {}", e);
+            }
+            if let Err(e) = copilot::window::expand_overlay(handle) {
+                log::warn!("[Copilot] show-onboarding: expand_overlay failed: {}", e);
+            }
+            let _ = handle.emit(
+                "copilot-panel-state",
+                serde_json::json!({ "mode": "expanded" }),
+            );
             let _ = handle.emit("copilot-show-onboarding", serde_json::json!({}));
         }
 
