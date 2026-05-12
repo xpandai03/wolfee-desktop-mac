@@ -5,8 +5,11 @@
  *
  * One-command: build → sign → notarize → staple → upload.
  *
- * Required env vars:
- *   APPLE_API_KEY, APPLE_API_KEY_ID, APPLE_API_ISSUER
+ * Notarization auth — choose ONE (script auto-detects):
+ *   Option A (App Store Connect API key):
+ *     APPLE_API_KEY, APPLE_API_KEY_ID, APPLE_API_ISSUER
+ *   Option B (Apple ID + app-specific password):
+ *     APPLE_ID, APPLE_ID_PASSWORD, APPLE_TEAM_ID
  *
  * Optional (R2 upload — skipped if not set):
  *   R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET
@@ -112,9 +115,40 @@ async function main() {
   // ══════════════════════════════════════════
   console.log(`[1/${TOTAL_STEPS}] Validating environment...`);
 
-  const appleApiKey = requireEnv("APPLE_API_KEY");
-  const appleApiKeyId = requireEnv("APPLE_API_KEY_ID");
-  const appleApiIssuer = requireEnv("APPLE_API_ISSUER");
+  // Notarization auth — auto-detect Option A vs Option B. notarytool accepts
+  // either; .env.release for this project uses Option B (Apple ID + app-
+  // specific password). The auth args are interpolated into the three
+  // notarytool invocations below (submit, info, log).
+  let notarytoolAuthArgs;
+  let authMode;
+  if (
+    process.env.APPLE_API_KEY &&
+    process.env.APPLE_API_KEY_ID &&
+    process.env.APPLE_API_ISSUER
+  ) {
+    notarytoolAuthArgs =
+      `--key "${process.env.APPLE_API_KEY}" ` +
+      `--key-id "${process.env.APPLE_API_KEY_ID}" ` +
+      `--issuer "${process.env.APPLE_API_ISSUER}"`;
+    authMode = "App Store Connect API key";
+  } else if (
+    process.env.APPLE_ID &&
+    process.env.APPLE_ID_PASSWORD &&
+    process.env.APPLE_TEAM_ID
+  ) {
+    notarytoolAuthArgs =
+      `--apple-id "${process.env.APPLE_ID}" ` +
+      `--password "${process.env.APPLE_ID_PASSWORD}" ` +
+      `--team-id "${process.env.APPLE_TEAM_ID}"`;
+    authMode = "Apple ID + app-specific password";
+  } else {
+    console.error(
+      "✗ Missing notarization credentials. Set ONE of:\n" +
+        "    Option A: APPLE_API_KEY, APPLE_API_KEY_ID, APPLE_API_ISSUER\n" +
+        "    Option B: APPLE_ID, APPLE_ID_PASSWORD, APPLE_TEAM_ID"
+    );
+    process.exit(1);
+  }
 
   const hasR2 = !!(process.env.R2_ACCOUNT_ID && process.env.R2_ACCESS_KEY_ID
     && process.env.R2_SECRET_ACCESS_KEY && process.env.R2_BUCKET);
@@ -141,8 +175,7 @@ async function main() {
     console.log("  [R2] Skipped — not configured");
   }
 
-  console.log(`  API Key ID:  ${appleApiKeyId}`);
-  console.log(`  API Issuer:  ${appleApiIssuer}`);
+  console.log(`  Notary auth: ${authMode}`);
   console.log("  OK\n");
 
   // ══════════════════════════════════════════
@@ -220,9 +253,7 @@ async function main() {
   try {
     submitOutput = execSync(
       `xcrun notarytool submit "${dmgFile}" ` +
-      `--key "${appleApiKey}" ` +
-      `--key-id "${appleApiKeyId}" ` +
-      `--issuer "${appleApiIssuer}" ` +
+      `${notarytoolAuthArgs} ` +
       `--output-format json 2>&1`,
       {
         encoding: "utf-8",
@@ -277,9 +308,7 @@ async function main() {
     try {
       infoOutput = execSync(
         `xcrun notarytool info "${submissionId}" ` +
-        `--key "${appleApiKey}" ` +
-        `--key-id "${appleApiKeyId}" ` +
-        `--issuer "${appleApiIssuer}" ` +
+        `${notarytoolAuthArgs} ` +
         `--output-format json 2>&1`,
         {
           encoding: "utf-8",
@@ -314,9 +343,7 @@ async function main() {
       try {
         const logOutput = execSync(
           `xcrun notarytool log "${submissionId}" ` +
-          `--key "${appleApiKey}" ` +
-          `--key-id "${appleApiKeyId}" ` +
-          `--issuer "${appleApiIssuer}" 2>&1`,
+          `${notarytoolAuthArgs} 2>&1`,
           { encoding: "utf-8", cwd: path.resolve(__dirname, ".."), timeout: 60000 }
         );
         console.log(logOutput);
