@@ -1,12 +1,7 @@
 import { AnimatePresence } from "framer-motion";
 import type { Dispatch } from "react";
 
-import {
-  StepLayout,
-  PrimaryButton,
-  SecondaryButton,
-  TextLink,
-} from "./StepLayout";
+import { StepLayout, PrimaryButton, SecondaryButton } from "./StepLayout";
 import {
   Step1Illustration,
   Step2Illustration,
@@ -70,6 +65,14 @@ export function OnboardingWizard({ state, dispatch, onEmitAction }: Props) {
     onEmitAction({ type: "mark-onboarding-completed" });
   };
 
+  // Footer-arrow navigation. Wired into every step's StepLayout. Steps
+  // 3 + 4 forward these via their delegated component props. The arrows
+  // are the consistent escape-hatch nav (especially important on
+  // Step 3 paired state where no body CTA renders). Step 1 has no back
+  // arrow target; Step 6's forward arrow completes the wizard.
+  const onBack = step > 1 ? handlePrev : undefined;
+  const onNext = step < WIZARD_TOTAL_STEPS ? handleAdvance : handleComplete;
+
   return (
     <AnimatePresence mode="wait" initial={false}>
       {step === 1 && (
@@ -84,6 +87,8 @@ export function OnboardingWizard({ state, dispatch, onEmitAction }: Props) {
             <PrimaryButton onClick={handleAdvance}>Continue</PrimaryButton>
           }
           onSkip={handleSkip}
+          onBack={onBack}
+          onNext={onNext}
         />
       )}
 
@@ -118,10 +123,9 @@ export function OnboardingWizard({ state, dispatch, onEmitAction }: Props) {
           primaryCta={
             <PrimaryButton onClick={handleAdvance}>Continue</PrimaryButton>
           }
-          secondaryCta={
-            <TextLink onClick={handlePrev}>← Back</TextLink>
-          }
           onSkip={handleSkip}
+          onBack={onBack}
+          onNext={onNext}
         />
       )}
 
@@ -176,6 +180,8 @@ export function OnboardingWizard({ state, dispatch, onEmitAction }: Props) {
             </SecondaryButton>
           }
           onSkip={handleSkip}
+          onBack={onBack}
+          onNext={onNext}
         />
       )}
 
@@ -209,6 +215,8 @@ export function OnboardingWizard({ state, dispatch, onEmitAction }: Props) {
           }
           hideSkip
           onSkip={handleSkip}
+          onBack={onBack}
+          onNext={onNext}
         />
       )}
     </AnimatePresence>

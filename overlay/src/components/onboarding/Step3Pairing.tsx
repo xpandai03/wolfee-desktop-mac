@@ -1,12 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { Dispatch } from "react";
 
-import {
-  StepLayout,
-  PrimaryButton,
-  SecondaryButton,
-  TextLink,
-} from "./StepLayout";
+import { StepLayout, PrimaryButton, SecondaryButton } from "./StepLayout";
 import { Step3Illustration } from "./illustrations";
 import { WIZARD_COPY, WIZARD_TOTAL_STEPS } from "./wizardCopy";
 import type { Action, OverlayState } from "@/state/types";
@@ -189,7 +184,7 @@ export function Step3Pairing({
         {WIZARD_COPY.step3.secondaryCta}
       </SecondaryButton>
     );
-    secondaryCta = <TextLink onClick={onPrev}>← Back</TextLink>;
+    secondaryCta = null;
   } else {
     body = <p>{WIZARD_COPY.step3.body}</p>;
     primaryCta = (
@@ -214,6 +209,8 @@ export function Step3Pairing({
       primaryCta={primaryCta}
       secondaryCta={secondaryCta}
       onSkip={onSkip}
+      onBack={onPrev}
+      onNext={onAdvance}
     />
   );
 }

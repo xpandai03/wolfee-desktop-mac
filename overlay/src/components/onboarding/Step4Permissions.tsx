@@ -95,14 +95,13 @@ export function Step4Permissions({
         </PrimaryButton>
       }
       secondaryCta={
-        <div className="flex items-center justify-between">
-          <TextLink onClick={onPrev}>← Back</TextLink>
-          <TextLink onClick={onAdvance}>
-            {WIZARD_COPY.step4.secondaryCta}
-          </TextLink>
-        </div>
+        <TextLink onClick={onAdvance}>
+          {WIZARD_COPY.step4.secondaryCta}
+        </TextLink>
       }
       onSkip={onSkip}
+      onBack={onPrev}
+      onNext={onAdvance}
     />
   );
 }

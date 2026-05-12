@@ -36,6 +36,17 @@ export interface StepLayoutProps {
    * where Skip is replaced by Complete). */
   hideSkip?: boolean;
   onSkip: () => void;
+  /** Footer back arrow. Omit on the first step (or any state where
+   * "back" has no destination) — the arrow renders disabled so the
+   * footer layout stays stable. */
+  onBack?: () => void;
+  /** Footer forward arrow. Always-available escape hatch independent
+   * of the big body CTAs. Important on Step 3's "Already linked.
+   * Continuing…" state where the body shows no clickable control
+   * while the 1.5s auto-advance is pending — without this arrow the
+   * user has no way to manually proceed if the auto-advance is slow
+   * or stalls. */
+  onNext?: () => void;
 }
 
 export function StepLayout({
@@ -48,6 +59,8 @@ export function StepLayout({
   secondaryCta,
   hideSkip,
   onSkip,
+  onBack,
+  onNext,
 }: StepLayoutProps) {
   return (
     <motion.div
@@ -76,12 +89,29 @@ export function StepLayout({
         )}
       </div>
 
-      {/* Footer — step counter + Skip-tour */}
+      {/* Footer — step counter + arrow nav + Skip-tour. The arrows
+          flanking the step-dots give every step an always-clickable
+          ←/→ chrome path that's independent of whichever body CTAs a
+          step happens to render. Crucially this means Step 3's
+          paired ("Already linked. Continuing…") state always has a
+          forward escape hatch even before its 1.5s auto-advance fires. */}
       <div className="shrink-0 flex items-center justify-between px-4 py-2.5 border-t border-white/5 text-[11px] text-zinc-500">
         <span aria-label={`Step ${step} of ${totalSteps}`}>
           Step {step} / {totalSteps}
         </span>
-        <StepDots current={step} total={totalSteps} />
+        <div className="flex items-center gap-2">
+          <FooterArrow
+            direction="back"
+            onClick={onBack}
+            ariaLabel="Previous step"
+          />
+          <StepDots current={step} total={totalSteps} />
+          <FooterArrow
+            direction="next"
+            onClick={onNext}
+            ariaLabel="Next step"
+          />
+        </div>
         {!hideSkip ? (
           <button
             type="button"
@@ -95,6 +125,34 @@ export function StepLayout({
         )}
       </div>
     </motion.div>
+  );
+}
+
+function FooterArrow({
+  direction,
+  onClick,
+  ariaLabel,
+}: {
+  direction: "back" | "next";
+  onClick?: () => void;
+  ariaLabel: string;
+}) {
+  const disabled = !onClick;
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      aria-label={ariaLabel}
+      className={cn(
+        "inline-flex items-center justify-center w-5 h-5 rounded text-[13px] leading-none transition-colors",
+        disabled
+          ? "text-zinc-700 cursor-not-allowed"
+          : "text-zinc-400 hover:text-zinc-100 hover:bg-white/5 cursor-pointer",
+      )}
+    >
+      {direction === "back" ? "←" : "→"}
+    </button>
   );
 }
 
