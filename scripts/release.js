@@ -529,6 +529,68 @@ async function main() {
       }
     }
 
+    // Auto-updater artifacts. Tauri's updater plugin downloads the
+    // .app.tar.gz when wolfee.io/api/desktop/latest.json points it
+    // here, and verifies the .sig (Tauri's own signing key, separate
+    // from Apple codesigning) before unpacking. Skipping these would
+    // leave existing installs stranded on the previous version.
+    const TAR_KEY = "downloads/wolfee-desktop-mac.app.tar.gz";
+    const SIG_KEY = "downloads/wolfee-desktop-mac.app.tar.gz.sig";
+    const tarPath = path.resolve(
+      __dirname,
+      "..",
+      `${BUNDLE_DIR}/macos/Wolfee Desktop.app.tar.gz`,
+    );
+    const sigPath = `${tarPath}.sig`;
+
+    if (fs.existsSync(tarPath) && fs.existsSync(sigPath)) {
+      const tarBuf = fs.readFileSync(tarPath);
+      const sigBuf = fs.readFileSync(sigPath);
+      console.log(
+        `  Uploading ${TAR_KEY} (${(tarBuf.length / 1024 / 1024).toFixed(2)} MB)...`,
+      );
+      await s3.send(
+        new PutObjectCommand({
+          Bucket: bucket,
+          Key: TAR_KEY,
+          Body: tarBuf,
+          ContentType: "application/gzip",
+          CacheControl: "no-cache",
+        }),
+      );
+      console.log(`  Uploading ${SIG_KEY} (${sigBuf.length} bytes)...`);
+      await s3.send(
+        new PutObjectCommand({
+          Bucket: bucket,
+          Key: SIG_KEY,
+          Body: sigBuf,
+          ContentType: "text/plain",
+          CacheControl: "no-cache",
+        }),
+      );
+      console.log("  ✓ Updater artifacts uploaded");
+      // Expose the sig contents on stdout so the operator can paste
+      // into WOLFEE-MVP/server/routes.ts (DESKTOP_UPDATE_SIG +
+      // DESKTOP_UPDATE_PUB_DATE) without spelunking the bundle dir.
+      const sigStr = sigBuf.toString("utf-8").trim();
+      const ts = sigStr.match(/timestamp:(\d+)/);
+      console.log("");
+      console.log("  ── WOLFEE-MVP/server/routes.ts manifest values ──");
+      console.log(`    DESKTOP_VERSION       = "${VERSION}"`);
+      if (ts) {
+        const pubDate = new Date(Number(ts[1]) * 1000)
+          .toISOString()
+          .replace(/\.\d{3}Z$/, "Z");
+        console.log(`    DESKTOP_UPDATE_PUB_DATE = "${pubDate}"`);
+      }
+      console.log(`    DESKTOP_UPDATE_SIG    = "${sigStr}"`);
+      console.log("");
+    } else {
+      console.log(
+        `  ⚠ Updater artifacts not found (expected ${tarPath} + .sig). Skipping.`,
+      );
+    }
+
     console.log(`[8/${TOTAL_STEPS}] Uploading update manifest...`);
 
     downloadUrl = `${publicBase}/${R2_KEY}`;
