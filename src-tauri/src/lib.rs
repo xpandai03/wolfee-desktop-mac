@@ -1898,6 +1898,40 @@ pub fn run() {
                         let _ = handle_ref.emit("wolfee-action", "link-account");
                     }
 
+                    // 0.7.6 — Tray "Show Onboarding Tour" path. The tray
+                    // emits a plain-string payload ("show-onboarding")
+                    // which lands here in the legacy match. Until 0.7.6
+                    // the handler lived ONLY in `handle_structured_action`
+                    // (JSON-object branch) so the click was silently
+                    // logged as "Unknown action". Body mirrors the
+                    // structured version: make the overlay visible +
+                    // expanded BEFORE notifying React so the wizard
+                    // listener is guaranteed to be alive and the panel
+                    // actually renders.
+                    "show-onboarding" => {
+                        log::info!("[Copilot] Tray: show-onboarding");
+                        if let Err(e) = copilot::window::show_overlay(handle_ref) {
+                            log::warn!(
+                                "[Copilot] show-onboarding: show_overlay failed: {}",
+                                e
+                            );
+                        }
+                        if let Err(e) = copilot::window::expand_overlay(handle_ref) {
+                            log::warn!(
+                                "[Copilot] show-onboarding: expand_overlay failed: {}",
+                                e
+                            );
+                        }
+                        let _ = handle_ref.emit(
+                            "copilot-panel-state",
+                            serde_json::json!({ "mode": "expanded" }),
+                        );
+                        let _ = handle_ref.emit(
+                            "copilot-show-onboarding",
+                            serde_json::json!({}),
+                        );
+                    }
+
                     // ─────────────────────────────────────────
                     // COPILOT (Sub-prompt 2 Phase 5 — Listening lifecycle)
                     //
