@@ -573,7 +573,12 @@ async function main() {
       // into WOLFEE-MVP/server/routes.ts (DESKTOP_UPDATE_SIG +
       // DESKTOP_UPDATE_PUB_DATE) without spelunking the bundle dir.
       const sigStr = sigBuf.toString("utf-8").trim();
-      const ts = sigStr.match(/timestamp:(\d+)/);
+      // The .sig FILE is base64-encoded; the human-readable trusted
+      // comment (which contains `timestamp:<unix>`) only appears
+      // post-decode. Decode before regex'ing or pub_date will be
+      // silently missing from the printed manifest values.
+      const sigDecoded = Buffer.from(sigStr, "base64").toString("utf-8");
+      const ts = sigDecoded.match(/timestamp:(\d+)/);
       console.log("");
       console.log("  ── WOLFEE-MVP/server/routes.ts manifest values ──");
       console.log(`    DESKTOP_VERSION       = "${VERSION}"`);
