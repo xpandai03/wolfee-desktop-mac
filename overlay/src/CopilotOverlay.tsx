@@ -544,6 +544,19 @@ export default function CopilotOverlay() {
     void emit("wolfee-action", "start-copilot-session");
   };
   const handleStop = () => {
+    // 0.7.6 — grow the strip the instant the user hits Stop. Before
+    // 0.7.6 the panel only expanded once `copilot-session-finalized`
+    // arrived (after the backend finalize round-trip), so users sat
+    // in a 44-px strip for several seconds with no visual feedback
+    // and the eventual SessionCompleteCard ("View recap on web…") was
+    // effectively hidden inside the still-tiny window. Surfacing the
+    // expanded panel synchronously gives an immediate state change;
+    // the SessionCompleteCard then mounts in an already-visible panel
+    // once finalize completes (see `copilot-session-finalized`
+    // listener above).
+    if (modeRef.current !== "expanded") {
+      void emit("wolfee-action", "expand-overlay");
+    }
     // Sub-prompt 4.8 — push transcript + chat threads + auto-suggestions
     // to backend BEFORE the session-end teardown so the post-session
     // web view has all the artifacts. mode_used_id is tracked Rust-side
