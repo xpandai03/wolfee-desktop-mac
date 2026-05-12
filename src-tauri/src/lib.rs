@@ -1885,10 +1885,17 @@ pub fn run() {
                     }
 
                     "open-copilot-settings" => {
-                        // Sub-prompt 1 placeholder. Full Settings window in Sub-prompt 6.
-                        log::info!(
-                            "[Copilot] Set Up Copilot clicked — Settings UI lands in Sub-prompt 6"
-                        );
+                        // 0.7.6 — "Set Up Copilot…" tray item now drives the
+                        // desktop ↔ web pairing flow. Sub-prompt 1 had this
+                        // as a placeholder for a Settings window that never
+                        // shipped (Sub-prompt 6 delivered the Onboarding
+                        // wizard instead). User feedback 2026-05-12: the
+                        // button was a dead click. Re-emit `link-account`
+                        // so we inherit any future link-flow improvements
+                        // (status row, retry logic, etc.) without
+                        // duplicating that ~90 LOC handler here.
+                        log::info!("[Copilot] Tray: Set Up Copilot → link-account");
+                        let _ = handle_ref.emit("wolfee-action", "link-account");
                     }
 
                     // ─────────────────────────────────────────
