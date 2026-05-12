@@ -34,7 +34,12 @@ const APP_PATH = `${BUNDLE_DIR}/macos/${APP_NAME}.app`;
 const DMG_DIR = `${BUNDLE_DIR}/dmg`;
 
 const SIGNING_IDENTITY = "Developer ID Application: XPAND TECHNOLOGY LLC (LT73Z72CKR)";
-const DMG_NAME = `wolfee-desktop.dmg`;
+// MUST match the R2 key WOLFEE-MVP's `server/routes.ts` references
+// (DESKTOP_DMG_URL = `${R2_PUBLIC_BASE}/downloads/wolfee-desktop-mac.dmg`).
+// Originally `wolfee-desktop.dmg` here — that's a different R2 object
+// nobody reads, so 0.7.6 went out and the wolfee.io download button
+// kept serving 0.7.5 until we noticed.
+const DMG_NAME = `wolfee-desktop-mac.dmg`;
 const R2_KEY = `downloads/${DMG_NAME}`;
 // 5 MB min sanity check — catches truly broken builds without false-
 // rejecting our actual ~9 MB output (the .app is small because Tauri
