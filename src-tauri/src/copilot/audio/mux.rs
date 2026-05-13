@@ -192,8 +192,38 @@ impl AudioMux {
         }
 
         let mut interleaved: Vec<i16> = Vec::with_capacity(FRAME_SAMPLES_PER_CHANNEL * 2);
+        // When system playout is much louder than the mic in this frame,
+        // the mic channel is almost certainly room echo of the same
+        // signal (ChatGPT voice, Zoom far-end, etc.). Attenuate L before
+        // Deepgram sees it so multichannel ASR doesn't ping-pong the
+        // same sentence between channel 0 and 1.
+        let n = FRAME_SAMPLES_PER_CHANNEL;
+        let r_sys: f32 = self
+            .sys_out
+            .iter()
+            .take(n)
+            .map(|&s| s * s)
+            .sum::<f32>()
+            / n as f32;
+        let r_sys = r_sys.sqrt();
+        let r_mic: f32 = self
+            .mic_out
+            .iter()
+            .take(n)
+            .map(|&s| s * s)
+            .sum::<f32>()
+            / n as f32;
+        let r_mic = r_mic.sqrt();
+        const SYS_FLOOR: f32 = 0.008;
+        const SYS_DOMINATES_MIC: f32 = 12.0;
+        let mic_gain = if r_sys > SYS_FLOOR && r_sys > r_mic * SYS_DOMINATES_MIC {
+            0.15f32
+        } else {
+            1.0f32
+        };
+
         for _ in 0..FRAME_SAMPLES_PER_CHANNEL {
-            let m = self.mic_out.pop_front().unwrap_or(0.0);
+            let m = self.mic_out.pop_front().unwrap_or(0.0) * mic_gain;
             let s = self.sys_out.pop_front().unwrap_or(0.0);
             interleaved.push(f32_to_i16(m));
             interleaved.push(f32_to_i16(s));

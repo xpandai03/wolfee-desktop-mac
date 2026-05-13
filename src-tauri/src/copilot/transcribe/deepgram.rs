@@ -6,7 +6,11 @@
 //! the multichannel transcript JSON back into Utterances. Finals
 //! enter `TranscriptBuffer` (Sub-prompt 3 reads it for moment
 //! detection); partials + finals both emit `transcript-chunk` Tauri
-//! events for the overlay UI in Sub-prompt 4.
+//! events for the overlay UI in Sub-prompt 4. Finals additionally pass
+//! through `dedup::apply_final_dedup` so mic bleed of system playout
+//! does not duplicate lines across channels; `transcript-retract`
+//! removes superseded overlay rows when a **Speakers** final replaces
+//! a mic-echo **User** fragment.
 //!
 //! Resilience (plan §5 Option C — hybrid):
 //! - audio capture keeps running through a disconnect; up to 20 frames
@@ -46,6 +50,7 @@ use crate::copilot::audio::AudioFrame;
 use crate::copilot::session::api::{SessionApi, SessionApiError};
 use crate::copilot::state::{CopilotState, CopilotStateMutex, TranscriptBufferMutex};
 use crate::copilot::transcribe::buffer::{ChannelLabel, Utterance};
+use crate::copilot::transcribe::dedup::{apply_final_dedup, FinalDedupOutcome, TranscriptRetractPayload};
 
 /// URL params locked in plan §3. Audio format must match what the mux
 /// pump produces (16 kHz int16 stereo, multichannel so each channel
@@ -504,38 +509,98 @@ fn handle_message<R: Runtime>(text: &str, app_handle: &AppHandle<R>, session_id:
     let started_at_ms = (msg.start * 1000.0) as u64;
     let ended_at_ms = ((msg.start + msg.duration) * 1000.0) as u64;
 
-    let payload = TranscriptChunkPayload {
-        session_id: session_id.to_string(),
-        channel: channel_label.as_str(),
-        is_final: msg.is_final,
-        transcript: alt.transcript.clone(),
-        confidence: alt.confidence,
-        started_at_ms,
-        ended_at_ms,
-    };
-
-    if let Err(e) = app_handle.emit("transcript-chunk", &payload) {
-        log::warn!("[Copilot/dg] transcript-chunk emit failed: {}", e);
-    }
-
-    if msg.is_final {
-        log::info!(
-            "[Copilot/dg] final ({}, {:.2}): {}",
-            channel_label.as_str(),
-            alt.confidence,
-            alt.transcript
-        );
-        let utterance = Utterance {
-            channel: channel_label,
+    // Partials: always stream to overlay (no buffer write). Finals:
+    // run cross-channel echo dedup before buffer + overlay so mic
+    // bleed from system playout doesn't duplicate lines.
+    if !msg.is_final {
+        let payload = TranscriptChunkPayload {
+            session_id: session_id.to_string(),
+            channel: channel_label.as_str(),
+            is_final: false,
+            transcript: alt.transcript.clone(),
+            confidence: alt.confidence,
             started_at_ms,
             ended_at_ms,
-            text: alt.transcript,
-            confidence: alt.confidence,
-            recorded_at: Instant::now(),
         };
-        if let Ok(mut buf) = app_handle.state::<TranscriptBufferMutex>().0.lock() {
-            buf.append(utterance);
+        if let Err(e) = app_handle.emit("transcript-chunk", &payload) {
+            log::warn!("[Copilot/dg] transcript-chunk emit failed: {}", e);
         }
+        return;
+    }
+
+    log::info!(
+        "[Copilot/dg] final ({}, {:.2}): {}",
+        channel_label.as_str(),
+        alt.confidence,
+        alt.transcript
+    );
+
+    let utterance = Utterance {
+        channel: channel_label,
+        started_at_ms,
+        ended_at_ms,
+        text: alt.transcript,
+        confidence: alt.confidence,
+        recorded_at: Instant::now(),
+    };
+
+    let mut retract_keys: Vec<String> = Vec::new();
+    let buf_state = app_handle.state::<TranscriptBufferMutex>();
+    let emit_utterance: Option<Utterance> = {
+        let mut buf = buf_state
+            .0
+            .lock()
+            .unwrap_or_else(|e| {
+                log::error!(
+                    "[Copilot/dg] transcript buffer mutex was poisoned — recovering inner lock"
+                );
+                e.into_inner()
+            });
+        match apply_final_dedup(&mut buf, utterance) {
+            FinalDedupOutcome::Suppress { retract_keys: keys } => {
+                retract_keys = keys;
+                None
+            }
+            FinalDedupOutcome::Append { utterance: u } => {
+                buf.append(u.clone());
+                Some(u)
+            }
+            FinalDedupOutcome::AppendAfterRetracting {
+                retract_keys: keys,
+                utterance: u,
+            } => {
+                buf.append(u.clone());
+                retract_keys = keys;
+                Some(u)
+            }
+        }
+    };
+
+    if !retract_keys.is_empty() {
+        let retract = TranscriptRetractPayload {
+            session_id: session_id.to_string(),
+            keys: retract_keys,
+        };
+        if let Err(err) = app_handle.emit("transcript-retract", &retract) {
+            log::warn!("[Copilot/dg] transcript-retract emit failed: {}", err);
+        }
+    }
+
+    let Some(u) = emit_utterance else {
+        return;
+    };
+
+    let payload = TranscriptChunkPayload {
+        session_id: session_id.to_string(),
+        channel: u.channel.as_str(),
+        is_final: true,
+        transcript: u.text.clone(),
+        confidence: u.confidence,
+        started_at_ms: u.started_at_ms,
+        ended_at_ms: u.ended_at_ms,
+    };
+    if let Err(e) = app_handle.emit("transcript-chunk", &payload) {
+        log::warn!("[Copilot/dg] transcript-chunk emit failed: {}", e);
     }
 }
 

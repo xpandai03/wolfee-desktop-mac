@@ -95,6 +95,14 @@ export function overlayReducer(
       return { ...state, transcript: next, fullTranscript: fullNext };
     }
 
+    case "TRANSCRIPT_RETRACT": {
+      const drop = new Set(action.payload.keys);
+      if (drop.size === 0) return state;
+      const transcript = state.transcript.filter((u) => !drop.has(u.key));
+      const fullTranscript = state.fullTranscript.filter((u) => !drop.has(u.key));
+      return { ...state, transcript, fullTranscript };
+    }
+
     case "SUMMARY_UPDATED":
       return { ...state, summary: action.payload.summary };
 

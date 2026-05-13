@@ -17,6 +17,7 @@ import {
 import type {
   ChatMessage,
   TranscriptChunkPayload,
+  TranscriptRetractPayload,
   SummaryUpdatedPayload,
   MomentDetectedPayload,
   SuggestionPendingPayload,
@@ -218,6 +219,7 @@ export default function CopilotOverlay() {
 
     let permUnlisten: UnlistenFn | undefined;
     let transcriptUnlisten: UnlistenFn | undefined;
+    let transcriptRetractUnlisten: UnlistenFn | undefined;
     let summaryUnlisten: UnlistenFn | undefined;
     let momentUnlisten: UnlistenFn | undefined;
     let pendingUnlisten: UnlistenFn | undefined;
@@ -252,6 +254,13 @@ export default function CopilotOverlay() {
         "transcript-chunk",
         (event) => {
           dispatch({ type: "TRANSCRIPT_CHUNK", payload: event.payload });
+        },
+      );
+
+      transcriptRetractUnlisten = await listen<TranscriptRetractPayload>(
+        "transcript-retract",
+        (event) => {
+          dispatch({ type: "TRANSCRIPT_RETRACT", payload: event.payload });
         },
       );
 
@@ -483,6 +492,7 @@ export default function CopilotOverlay() {
       window.removeEventListener("keydown", handleKey);
       permUnlisten?.();
       transcriptUnlisten?.();
+      transcriptRetractUnlisten?.();
       summaryUnlisten?.();
       momentUnlisten?.();
       pendingUnlisten?.();

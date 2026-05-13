@@ -8,4 +8,5 @@
 //!   overlay UI in Sub-prompt 4.
 
 pub mod buffer;
+pub mod dedup;
 pub mod deepgram;

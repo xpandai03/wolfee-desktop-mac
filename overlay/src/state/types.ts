@@ -5,7 +5,8 @@
  * Sub-prompt 4 N3 event (`copilot-suggestion-pending`).
  *
  * Keep these in sync with:
- *   - `src-tauri/src/copilot/transcribe/deepgram.rs` (transcript-chunk)
+ *   - `src-tauri/src/copilot/transcribe/deepgram.rs` (transcript-chunk,
+ *     transcript-retract)
  *   - `src-tauri/src/copilot/intelligence/summary_worker.rs` (summary-updated)
  *   - `src-tauri/src/copilot/intelligence/moment_worker.rs` (moment-detected)
  *   - `src-tauri/src/copilot/intelligence/suggest_client.rs` (suggestion + streaming + failed)
@@ -22,6 +23,12 @@ export interface TranscriptChunkPayload {
   confidence: number;
   started_at_ms: number;
   ended_at_ms: number;
+}
+
+/** Remove finalized / partial rows by overlay key (`channel:started_at_ms`). */
+export interface TranscriptRetractPayload {
+  session_id: string;
+  keys: string[];
 }
 
 export interface SummaryUpdatedPayload {
@@ -357,6 +364,7 @@ export interface OverlayState {
 
 export type Action =
   | { type: "TRANSCRIPT_CHUNK"; payload: TranscriptChunkPayload }
+  | { type: "TRANSCRIPT_RETRACT"; payload: TranscriptRetractPayload }
   | { type: "SUMMARY_UPDATED"; payload: SummaryUpdatedPayload }
   | { type: "MOMENT_DETECTED"; payload: MomentDetectedPayload }
   | { type: "SUGGESTION_PENDING"; payload: SuggestionPendingPayload }

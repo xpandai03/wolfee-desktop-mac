@@ -107,6 +107,21 @@ impl TranscriptBuffer {
         Self::prune(queue, self.window_ms);
     }
 
+    /// Remove the user-channel utterance whose Deepgram `start` matches.
+    /// Used when a later **Speakers** final supersedes a mic-echo fragment.
+    /// Returns whether a row was removed.
+    pub fn remove_user_utterance_at(&mut self, started_at_ms: u64) -> bool {
+        if let Some(pos) = self
+            .user
+            .iter()
+            .rposition(|u| u.started_at_ms == started_at_ms)
+        {
+            self.user.remove(pos);
+            return true;
+        }
+        false
+    }
+
     fn prune(queue: &mut VecDeque<Utterance>, window_ms: u64) {
         let now = Instant::now();
         while let Some(front) = queue.front() {
@@ -282,6 +297,15 @@ mod tests {
         assert!(u.ends_with_question());
         let u = utt(ChannelLabel::User, 0, "no question.", Instant::now());
         assert!(!u.ends_with_question());
+    }
+
+    #[test]
+    fn remove_user_utterance_at_drops_matching_row() {
+        let mut buf = TranscriptBuffer::with_default_window();
+        buf.append(utt(ChannelLabel::User, 100, "echo fragment", Instant::now()));
+        assert!(buf.remove_user_utterance_at(100));
+        assert_eq!(buf.user_len(), 0);
+        assert!(!buf.remove_user_utterance_at(999));
     }
 
     #[test]
