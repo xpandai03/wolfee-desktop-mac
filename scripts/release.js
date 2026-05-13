@@ -231,9 +231,18 @@ async function main() {
 
   if (fs.existsSync(absDmgDir)) {
     const dmgs = fs.readdirSync(absDmgDir).filter((f) => f.endsWith(".dmg"));
-    if (dmgs.length > 0) {
-      dmgFile = path.join(DMG_DIR, dmgs[0]);
+    // `cargo tauri build --bundles app` does not refresh DMG. A leftover
+    // `wolfee-desktop-0.7.7.dmg` must NOT be picked for 0.7.8 — we have
+    // shipped wrong bits that way. Only reuse a DMG whose basename matches
+    // this release's VERSION; otherwise fall through to hdiutil below.
+    const exactName = `wolfee-desktop-${VERSION}.dmg`;
+    if (dmgs.includes(exactName)) {
+      dmgFile = path.join(DMG_DIR, exactName);
       console.log(`  ✓ Tauri DMG: ${dmgFile}`);
+    } else if (dmgs.length > 0) {
+      console.log(
+        `  Ignoring stale DMG(s): ${dmgs.join(", ")} (need ${exactName})`,
+      );
     }
   }
 
