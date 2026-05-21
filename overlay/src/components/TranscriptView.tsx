@@ -11,7 +11,7 @@ import type { Utterance } from "@/state/types";
  *
  * Speaker labeling matches Cluely:
  *   "user"     → "You" (right-aligned bubble, accent-tinted)
- *   "speakers" → "Speakers" (left-aligned bubble, neutral)
+ *   "speakers" → "Other" (left-aligned bubble, neutral)
  */
 
 interface Props {
@@ -81,7 +81,7 @@ function UtteranceRow({ utterance }: { utterance: Utterance }) {
           isYou ? "text-copilot-accent" : "text-zinc-500",
         )}
       >
-        {isYou ? "You" : "Speakers"}
+        {isYou ? "You" : "Other"}
       </span>
       <div
         className={cn(

@@ -24,7 +24,7 @@ function TranscriptZoneImpl({ utterances }: Props) {
       {utterances.map((u) => (
         <div key={u.key} className="flex items-baseline gap-2 leading-snug">
           <span className="shrink-0 text-zinc-500 text-[10px] uppercase tracking-wider w-12">
-            {u.channel === "user" ? "You" : "Speakers"}
+            {u.channel === "user" ? "You" : "Other"}
           </span>
           <span
             className={cn(

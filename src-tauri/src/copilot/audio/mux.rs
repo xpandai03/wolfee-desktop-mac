@@ -215,9 +215,16 @@ impl AudioMux {
             / n as f32;
         let r_mic = r_mic.sqrt();
         const SYS_FLOOR: f32 = 0.008;
-        const SYS_DOMINATES_MIC: f32 = 12.0;
+        // 2026-05-20 echo stop-gap retune (v0.7.9): the old 12.0 gate
+        // almost never fired in real calls, so speaker bleed kept
+        // ping-ponging onto the user channel. 4.0 catches far more
+        // bleed and 0.05 near-silences the mic so multichannel ASR
+        // won't transcribe it. Trade-off: when the user talks *under*
+        // a louder far end their words can get ducked too — accepted
+        // until real AEC lands. See wolfee-copilot-diagnosis-2026-05-20.md.
+        const SYS_DOMINATES_MIC: f32 = 4.0;
         let mic_gain = if r_sys > SYS_FLOOR && r_sys > r_mic * SYS_DOMINATES_MIC {
-            0.15f32
+            0.05f32
         } else {
             1.0f32
         };

@@ -43,7 +43,10 @@ pub enum FinalDedupOutcome {
 }
 
 /// How far apart Deepgram `start` timestamps can be for echo pairing.
-const TIME_WINDOW_MS: u64 = 7_500;
+/// Widened 7_500 → 12_000 (v0.7.9): Deepgram timestamps each channel on
+/// its own timeline, so genuine echo pairs can be further apart than the
+/// old window assumed.
+const TIME_WINDOW_MS: u64 = 12_000;
 /// How many merged utterances we scan backward.
 const MERGED_LOOKBACK: usize = 24;
 
@@ -82,19 +85,24 @@ pub(crate) fn is_near_duplicate_text(a: &str, b: &str) -> bool {
         (nb.as_str(), na.as_str())
     };
     // One transcript is a substring of the other (common when mic catches
-    // a fragment of a longer system-audio sentence).
-    if shorter.len() >= 10 && longer.contains(shorter) {
+    // a fragment of a longer system-audio sentence). Min length lowered
+    // 10 → 4 (v0.7.9): short echo fragments ("on", "okay", "yeah") are
+    // the most common cross-channel duplicates.
+    if shorter.len() >= 4 && longer.contains(shorter) {
         return true;
     }
     // Token Jaccard — good for punctuation / ASR word-boundary drift.
     let wa: HashSet<&str> = na.split_whitespace().collect();
     let wb: HashSet<&str> = nb.split_whitespace().collect();
-    if wa.len() >= 2 && wb.len() >= 2 {
+    // Token count 2 → 1 and Jaccard 72 → 50 (v0.7.9): catch single-word
+    // echoes and near-duplicate phrases where ASR drifts words between
+    // the original and the mic-bleed copy.
+    if wa.len() >= 1 && wb.len() >= 1 {
         let inter = wa.intersection(&wb).count();
         let union = wa.union(&wb).count();
         if union > 0 {
             let j = (inter * 100) / union;
-            if j >= 72 {
+            if j >= 50 {
                 return true;
             }
         }
