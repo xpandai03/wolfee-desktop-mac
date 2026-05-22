@@ -26,9 +26,26 @@ chrono = { version = "0.4", features = ["serde"] }
 hostname = "0.4"
 urlencoding = "2"
 
+# Loom recorder Phase 1 — stream the recorded MP4 from disk to the
+# presigned R2 URL. `tokio-util`'s ReaderStream + a hand-rolled
+# progress Stream feed reqwest::Body::wrap_stream so the file is
+# never read fully into memory. `futures-core` gives us the `Stream`
+# trait for the progress wrapper. Both are already in Cargo.lock
+# transitively (reqwest / tokio-tungstenite) — declaring direct just
+# unlocks the API without growing the binary.
+tokio-util = { version = "0.7", features = ["io"] }
+futures-core = "0.3"
+
 # Sub-prompt 2 (Listening) — macOS audio capture + Deepgram WS
 [target.'cfg(target_os = "macos")'.dependencies]
-screencapturekit = { version = "1.5", features = ["macos_13_0"] }
+# Loom recorder Phase 1 bumps the feature from macos_13_0 to
+# macos_15_0: `SCRecordingOutput` (direct-to-MP4 hardware H.264
+# encoding) and `SCStreamConfiguration::captures_microphone` are
+# macOS 15.0 APIs. macos_15_0 transitively enables macos_13_0, so
+# the existing Copilot system-audio capture is unaffected. The
+# recorder feature itself is runtime-gated (see screen_capture.rs)
+# so the app still launches on macOS 13/14.
+screencapturekit = { version = "1.5", features = ["macos_15_0"] }
 core-graphics = "0.25"
 
 # Sub-prompt 4 fix 2026-05-03 — overlay must float above fullscreen

@@ -17,7 +17,7 @@ use copilot::state::{
 };
 use copilot::transcribe::deepgram::DeepgramClient;
 use recorder::Recorder;
-use state::{AppState, LinkingStatus, RecordingState, UploadStatus};
+use state::{AppState, LinkingStatus, LoomState, RecordingState, UploadStatus};
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Listener, Manager, WindowEvent};
 use tauri_plugin_store::StoreExt;
@@ -97,6 +97,41 @@ where
             rt.block_on(f());
         })
         .unwrap_or_else(|e| panic!("Failed to spawn thread {}: {}", name, e));
+}
+
+/// Best-effort macOS notification — used by the Loom recorder for
+/// countdown / success / failure toasts. Never fatal.
+#[cfg(target_os = "macos")]
+fn notify<R: tauri::Runtime>(handle: &tauri::AppHandle<R>, title: &str, body: &str) {
+    use tauri_plugin_notification::NotificationExt;
+    if let Err(e) = handle
+        .notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .show()
+    {
+        log::warn!("[Loom] notification failed: {e}");
+    }
+}
+
+/// Mark the Loom recorder failed: store the message, flip state to
+/// `Failed`, refresh the tray, and toast the user. The local recording
+/// file (if any) is deliberately left on disk by the callers.
+#[cfg(target_os = "macos")]
+fn finish_loom_failure<R: tauri::Runtime>(
+    handle: &tauri::AppHandle<R>,
+    tray: &tauri::tray::TrayIcon<R>,
+    msg: String,
+) {
+    log::error!("[Loom] failure: {msg}");
+    {
+        let state: tauri::State<'_, AppState> = handle.state();
+        *state.loom_error.lock().unwrap() = Some(msg.clone());
+        state.set_loom_state(LoomState::Failed);
+    }
+    tray::update_tray_for_loom(tray, handle);
+    notify(handle, "Recording failed", &msg);
 }
 
 /// Tauri-managed wrapper around the active session's intelligence
@@ -1328,6 +1363,9 @@ pub fn run() {
         recording_start_time: Mutex::new(None),
         linking_status: Mutex::new(LinkingStatus::Idle),
         upload_status: Mutex::new(UploadStatus::Idle),
+        loom_state: Mutex::new(LoomState::Idle),
+        loom_share_url: Mutex::new(None),
+        loom_error: Mutex::new(None),
     };
 
     let backend_url = auth_config.backend_url.clone();
@@ -1415,6 +1453,14 @@ pub fn run() {
             let tray_clone = tray.clone();
             let last_meeting_url_clone = last_meeting_url.clone();
             let backend_url_clone = backend_url.clone();
+
+            // Loom screen recorder (Phase 1) — the active recording
+            // handle, owned by the wolfee-action closure. Mirrors the
+            // legacy `recorder` Arc pattern; `None` between recordings.
+            #[cfg(target_os = "macos")]
+            let loom_recorder: Arc<
+                tokio::sync::Mutex<Option<recorder::screen_capture::ScreenRecorder>>,
+            > = Arc::new(tokio::sync::Mutex::new(None));
 
             handle.listen("wolfee-action", move |event| {
                 let raw_payload = event.payload();
@@ -1603,6 +1649,255 @@ pub fn run() {
                                 }
                             }
                         });
+                    }
+
+                    // ─────────────────────────────────────────
+                    // LOOM SCREEN RECORDER (Phase 1)
+                    // ─────────────────────────────────────────
+                    #[cfg(target_os = "macos")]
+                    "loom-record-screen" => {
+                        log::info!("[Loom] Record Screen requested");
+                        let state: tauri::State<'_, AppState> = handle_ref.state();
+
+                        if state.loom_state().is_busy() {
+                            log::info!("[Loom] ignoring — already {}", state.loom_state());
+                            return;
+                        }
+                        if !recorder::loom_recorder_available() {
+                            notify(
+                                handle_ref,
+                                "Screen recording unavailable",
+                                "Recording a screen video needs macOS 15 (Sequoia) or later.",
+                            );
+                            return;
+                        }
+                        if state.auth_token.lock().unwrap().is_none() {
+                            notify(
+                                handle_ref,
+                                "Link Wolfee first",
+                                "Link your Wolfee account before recording so the video can upload.",
+                            );
+                            return;
+                        }
+
+                        *state.loom_error.lock().unwrap() = None;
+                        state.set_loom_state(LoomState::Countdown);
+                        tray::update_tray_for_loom(&tray_clone, handle_ref);
+
+                        let tray = tray_clone.clone();
+                        let handle = handle_ref.clone();
+                        let loom_rec = loom_recorder.clone();
+                        spawn_async("loom-record", move || async move {
+                            // Permissions first — fail fast before the countdown.
+                            if let Err(e) =
+                                copilot::audio::permissions::ensure_screen_recording().await
+                            {
+                                finish_loom_failure(
+                                    &handle,
+                                    &tray,
+                                    format!("Screen-recording permission is required: {e}"),
+                                );
+                                return;
+                            }
+                            // Mic is folded into the recording by ScreenCaptureKit;
+                            // this just nudges the TCC prompt early. Non-fatal.
+                            let _ = copilot::audio::permissions::ensure_microphone().await;
+
+                            // 3-2-1 countdown. Phase 1 uses a notification + delay
+                            // rather than a dedicated countdown window.
+                            notify(
+                                &handle,
+                                "Recording starts in 3 seconds…",
+                                "Switch to whatever you want to capture.",
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+                            let path = recorder::screen_capture::new_recording_path();
+                            let started = tokio::task::spawn_blocking(move || {
+                                recorder::screen_capture::ScreenRecorder::start(path)
+                            })
+                            .await;
+
+                            match started {
+                                Ok(Ok(rec)) => {
+                                    *loom_rec.lock().await = Some(rec);
+                                    let state: tauri::State<'_, AppState> = handle.state();
+                                    state.set_loom_state(LoomState::Recording);
+                                    drop(state);
+                                    tray::update_tray_for_loom(&tray, &handle);
+                                    log::info!("[Loom] recording live");
+                                }
+                                Ok(Err(e)) => finish_loom_failure(&handle, &tray, e),
+                                Err(e) => finish_loom_failure(
+                                    &handle,
+                                    &tray,
+                                    format!("recorder thread panicked: {e}"),
+                                ),
+                            }
+                        });
+                    }
+
+                    #[cfg(target_os = "macos")]
+                    "loom-stop-recording" => {
+                        log::info!("[Loom] Stop Recording requested");
+                        let state: tauri::State<'_, AppState> = handle_ref.state();
+                        if state.loom_state() != LoomState::Recording {
+                            log::info!("[Loom] ignoring stop — state {}", state.loom_state());
+                            return;
+                        }
+                        state.set_loom_state(LoomState::Stopping);
+                        drop(state);
+                        tray::update_tray_for_loom(&tray_clone, handle_ref);
+
+                        let tray = tray_clone.clone();
+                        let handle = handle_ref.clone();
+                        let loom_rec = loom_recorder.clone();
+                        let backend_url = backend_url_clone.clone();
+                        spawn_async("loom-stop", move || async move {
+                            let rec = match loom_rec.lock().await.take() {
+                                Some(r) => r,
+                                None => {
+                                    finish_loom_failure(
+                                        &handle,
+                                        &tray,
+                                        "No active recording to stop.".to_string(),
+                                    );
+                                    return;
+                                }
+                            };
+
+                            // Finalize the MP4 on a blocking thread.
+                            let result = match tokio::task::spawn_blocking(move || rec.stop())
+                                .await
+                            {
+                                Ok(Ok(r)) => r,
+                                Ok(Err(e)) => {
+                                    finish_loom_failure(&handle, &tray, e);
+                                    return;
+                                }
+                                Err(e) => {
+                                    finish_loom_failure(
+                                        &handle,
+                                        &tray,
+                                        format!("stop thread panicked: {e}"),
+                                    );
+                                    return;
+                                }
+                            };
+
+                            let token = {
+                                let state: tauri::State<'_, AppState> = handle.state();
+                                let t = state.auth_token.lock().unwrap().clone();
+                                t
+                            };
+                            let token = match token {
+                                Some(t) => t,
+                                None => {
+                                    finish_loom_failure(
+                                        &handle,
+                                        &tray,
+                                        format!(
+                                            "Not linked — recording saved locally at {}",
+                                            result.file_path.display()
+                                        ),
+                                    );
+                                    return;
+                                }
+                            };
+
+                            {
+                                let state: tauri::State<'_, AppState> = handle.state();
+                                state.set_loom_state(LoomState::Uploading);
+                            }
+                            tray::update_tray_for_loom(&tray, &handle);
+
+                            // Live upload progress → tray menu-bar title.
+                            let tray_progress = tray.clone();
+                            let on_progress = move |pct: u8| {
+                                let t = format!("⬆ {pct}%");
+                                let _ = tray_progress.set_title(Some(t.as_str()));
+                            };
+
+                            let upload = recorder::uploader_v2::upload_video(
+                                &result.file_path,
+                                result.duration_secs,
+                                result.size_bytes,
+                                &backend_url,
+                                &token,
+                                on_progress,
+                            )
+                            .await;
+
+                            match upload {
+                                Ok(share) => {
+                                    use tauri_plugin_clipboard_manager::ClipboardExt;
+                                    let _ = handle.clipboard().write_text(share.share_url.clone());
+                                    {
+                                        let state: tauri::State<'_, AppState> = handle.state();
+                                        *state.loom_share_url.lock().unwrap() =
+                                            Some(share.share_url.clone());
+                                        *state.loom_error.lock().unwrap() = None;
+                                        state.set_loom_state(LoomState::Complete);
+                                    }
+                                    tray::update_tray_for_loom(&tray, &handle);
+                                    notify(
+                                        &handle,
+                                        "Recording uploaded ✅",
+                                        &format!(
+                                            "Link copied to clipboard:\n{}",
+                                            share.share_url
+                                        ),
+                                    );
+                                    // Upload succeeded — the local file is no
+                                    // longer needed.
+                                    let _ = std::fs::remove_file(&result.file_path);
+
+                                    // Auto-clear the Complete row after 12s.
+                                    let tray2 = tray.clone();
+                                    let handle2 = handle.clone();
+                                    std::thread::spawn(move || {
+                                        std::thread::sleep(std::time::Duration::from_secs(12));
+                                        let state: tauri::State<'_, AppState> = handle2.state();
+                                        if state.loom_state() == LoomState::Complete {
+                                            state.set_loom_state(LoomState::Idle);
+                                            drop(state);
+                                            tray::update_tray_for_loom(&tray2, &handle2);
+                                        }
+                                    });
+                                }
+                                Err(e) => {
+                                    // Keep the local file so the user can retry.
+                                    finish_loom_failure(
+                                        &handle,
+                                        &tray,
+                                        format!(
+                                            "{e} — recording kept at {}",
+                                            result.file_path.display()
+                                        ),
+                                    );
+                                }
+                            }
+                        });
+                    }
+
+                    #[cfg(target_os = "macos")]
+                    "loom-open-recording" => {
+                        let state: tauri::State<'_, AppState> = handle_ref.state();
+                        if let Some(url) = state.loom_share_url() {
+                            open_url(&url);
+                        }
+                        state.set_loom_state(LoomState::Idle);
+                        drop(state);
+                        tray::update_tray_for_loom(&tray_clone, handle_ref);
+                    }
+
+                    #[cfg(target_os = "macos")]
+                    "loom-dismiss" => {
+                        let state: tauri::State<'_, AppState> = handle_ref.state();
+                        state.set_loom_state(LoomState::Idle);
+                        *state.loom_error.lock().unwrap() = None;
+                        drop(state);
+                        tray::update_tray_for_loom(&tray_clone, handle_ref);
                     }
 
                     // ─────────────────────────────────────────

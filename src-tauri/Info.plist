@@ -14,6 +14,15 @@
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Wolfee Copilot listens to your meeting audio so it can show you live insights and follow-up suggestions during the call. Audio is captured only while a Copilot session is active.</string>
 	<key>NSScreenCaptureUsageDescription</key>
-	<string>Wolfee Copilot captures your computer's audio output so it can transcribe the other parties on a call. Only audio is recorded — no screen contents are captured.</string>
+	<string>Wolfee captures your computer's audio output so it can transcribe the other parties on a call. When you record a screen video, the display you choose is also captured.</string>
+	<!--
+		Camera permission. Not used yet — the Phase 1 screen recorder
+		captures screen + audio only. Added now so the Phase 2 webcam
+		bubble won't need a separate signed release just to introduce
+		a usage string. macOS only prompts for camera access the first
+		time an AVCaptureDevice is actually opened.
+	-->
+	<key>NSCameraUsageDescription</key>
+	<string>Wolfee uses your camera to record a webcam bubble alongside your screen recordings.</string>
 </dict>
 </plist>

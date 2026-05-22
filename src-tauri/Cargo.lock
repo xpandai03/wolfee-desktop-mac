@@ -6912,6 +6912,7 @@ dependencies = [
  "dirs",
  "env_logger",
  "eventsource-stream",
+ "futures-core",
  "futures-util",
  "hostname",
  "log",
@@ -6935,6 +6936,7 @@ dependencies = [
  "tauri-plugin-updater",
  "tokio",
  "tokio-tungstenite",
+ "tokio-util",
  "urlencoding",
  "uuid",
 ]

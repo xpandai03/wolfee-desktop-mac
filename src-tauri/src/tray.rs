@@ -6,7 +6,7 @@ use tauri::{
 };
 
 use crate::copilot::state::{CopilotState, CopilotStateMutex};
-use crate::state::{AppState, LinkingStatus, RecordingState, UploadStatus};
+use crate::state::{AppState, LinkingStatus, LoomState, RecordingState, UploadStatus};
 
 fn current_copilot_state<R: Runtime>(app: &AppHandle<R>) -> CopilotState {
     if let Some(state) = app.try_state::<CopilotStateMutex>() {
@@ -27,6 +27,28 @@ fn current_upload_status<R: Runtime>(app: &AppHandle<R>) -> UploadStatus {
         return *state.upload_status.lock().unwrap();
     }
     UploadStatus::Idle
+}
+
+fn current_loom_state<R: Runtime>(app: &AppHandle<R>) -> LoomState {
+    if let Some(state) = app.try_state::<AppState>() {
+        return *state.loom_state.lock().unwrap();
+    }
+    LoomState::Idle
+}
+
+fn current_loom_error<R: Runtime>(app: &AppHandle<R>) -> Option<String> {
+    app.try_state::<AppState>()
+        .and_then(|s| s.loom_error.lock().unwrap().clone())
+}
+
+/// Truncate a string for a single-line menu row.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let kept: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{kept}…")
+    }
 }
 
 // Wolfee tray icon (template-style, 44x44 @2x)
@@ -83,6 +105,36 @@ pub fn update_tray_menu<R: Runtime>(
         RecordingState::Idle => None,
     };
     let _ = tray.set_title(title);
+}
+
+/// Rebuild the tray menu and refresh the menu-bar title/tooltip for a
+/// Loom screen-recorder state change. `build_menu` reads the Loom
+/// state straight from `AppState`, so this just re-renders.
+///
+/// During `Uploading` the title is left for the live progress
+/// callback in lib.rs to drive (`⬆ NN%`); every other state sets it
+/// here.
+pub fn update_tray_for_loom<R: Runtime>(tray: &TrayIcon<R>, app: &AppHandle<R>) {
+    let copilot_state = current_copilot_state(app);
+    let is_authed = app
+        .try_state::<AppState>()
+        .map(|s| s.auth_token.lock().unwrap().is_some())
+        .unwrap_or(false);
+    if let Ok(menu) = build_menu(app, RecordingState::Idle, copilot_state, is_authed) {
+        let _ = tray.set_menu(Some(menu));
+    }
+
+    let (title, tooltip): (Option<&str>, &str) = match current_loom_state(app) {
+        LoomState::Countdown => (Some("● ···"), "Wolfee — recording starts soon"),
+        LoomState::Recording => (Some("● REC"), "Wolfee — recording your screen"),
+        LoomState::Stopping => (Some("● ···"), "Wolfee — finishing recording"),
+        LoomState::Uploading => (Some("⬆ 0%"), "Wolfee — uploading recording"),
+        LoomState::Complete => (None, "Wolfee — recording uploaded"),
+        LoomState::Failed => (None, "Wolfee — recording failed"),
+        LoomState::Idle => (None, "Wolfee Desktop"),
+    };
+    let _ = tray.set_title(title);
+    let _ = tray.set_tooltip(Some(tooltip));
 }
 
 fn copilot_status_label(state: &CopilotState) -> &'static str {
@@ -234,6 +286,93 @@ fn build_menu<R: Runtime>(
 
     let section_sep = MenuItem::with_id(app, "section_sep", "———", false, None::<&str>)?;
     menu.append(&section_sep)?;
+
+    // ─────────────────────────────────────────────
+    // LOOM SCREEN RECORDER (Phase 1)
+    // Tray-driven: a single "Record Screen" entry that captures the
+    // primary display. The control bar / pre-record panel windows are
+    // deferred — driving from the tray means there is no recorder UI
+    // window to exclude from the capture in the first place.
+    // ─────────────────────────────────────────────
+    let loom_state = current_loom_state(app);
+    match loom_state {
+        LoomState::Idle | LoomState::Complete | LoomState::Failed => {
+            let (label, enabled) = if !crate::recorder::loom_recorder_available() {
+                ("Record Screen  (needs macOS 15)".to_string(), false)
+            } else if !is_authenticated {
+                ("Record Screen  (link Wolfee first)".to_string(), false)
+            } else {
+                ("🎬  Record Screen".to_string(), true)
+            };
+            let item = MenuItem::with_id(app, "loom_record", &label, enabled, None::<&str>)?;
+            menu.append(&item)?;
+        }
+        LoomState::Countdown => {
+            let item =
+                MenuItem::with_id(app, "loom_starting", "● Recording starting…", false, None::<&str>)?;
+            menu.append(&item)?;
+        }
+        LoomState::Recording => {
+            let item =
+                MenuItem::with_id(app, "loom_stop", "⏹  Stop Recording", true, None::<&str>)?;
+            menu.append(&item)?;
+        }
+        LoomState::Stopping => {
+            let item = MenuItem::with_id(
+                app,
+                "loom_finishing",
+                "● Finishing recording…",
+                false,
+                None::<&str>,
+            )?;
+            menu.append(&item)?;
+        }
+        LoomState::Uploading => {
+            let item = MenuItem::with_id(
+                app,
+                "loom_uploading",
+                "⬆ Uploading recording…",
+                false,
+                None::<&str>,
+            )?;
+            menu.append(&item)?;
+        }
+    }
+
+    // Result rows for the just-finished recording.
+    match loom_state {
+        LoomState::Complete => {
+            let row = MenuItem::with_id(
+                app,
+                "loom_open",
+                "✅ Recording uploaded — open & copy link",
+                true,
+                None::<&str>,
+            )?;
+            menu.append(&row)?;
+            let dismiss =
+                MenuItem::with_id(app, "loom_dismiss", "  Dismiss", true, None::<&str>)?;
+            menu.append(&dismiss)?;
+        }
+        LoomState::Failed => {
+            let err = current_loom_error(app).unwrap_or_else(|| "Recording failed".to_string());
+            let row = MenuItem::with_id(
+                app,
+                "loom_failed",
+                &format!("❌ {}", truncate(&err, 52)),
+                false,
+                None::<&str>,
+            )?;
+            menu.append(&row)?;
+            let dismiss =
+                MenuItem::with_id(app, "loom_dismiss", "  Dismiss", true, None::<&str>)?;
+            menu.append(&dismiss)?;
+        }
+        _ => {}
+    }
+
+    let loom_sep = MenuItem::with_id(app, "loom_sep", "—", false, None::<&str>)?;
+    menu.append(&loom_sep)?;
 
     // ─────────────────────────────────────────────
     // NOTES SECTION
@@ -460,6 +599,25 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, id: &str) {
             log::info!("[Tray] Quit clicked");
             app.exit(0);
         }
+
+        // ─── Loom screen recorder (Phase 1) ───
+        "loom_record" => {
+            log::info!("[Tray] Record Screen clicked");
+            let _ = app.emit("wolfee-action", "loom-record-screen");
+        }
+        "loom_stop" => {
+            log::info!("[Tray] Stop Recording clicked");
+            let _ = app.emit("wolfee-action", "loom-stop-recording");
+        }
+        "loom_open" => {
+            log::info!("[Tray] Open uploaded recording clicked");
+            let _ = app.emit("wolfee-action", "loom-open-recording");
+        }
+        "loom_dismiss" => {
+            log::info!("[Tray] Dismiss Loom status clicked");
+            let _ = app.emit("wolfee-action", "loom-dismiss");
+        }
+
         _ => {}
     }
 }

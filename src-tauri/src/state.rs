@@ -35,6 +35,51 @@ pub enum UploadStatus {
     Failed,
 }
 
+/// Loom-style screen recorder pipeline state (Phase 1).
+///
+/// Deliberately separate from `RecordingState` (the legacy audio
+/// recorder): the two pipelines never share a lock, a tray row, or a
+/// state transition, so re-lighting one cannot regress the other.
+///
+/// Flow: `Idle → Countdown → Recording → Stopping → Uploading →
+/// Complete → Idle`. `Failed` is reachable from any active state and
+/// is sticky until the user dismisses it or starts a new recording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoomState {
+    Idle,
+    Countdown,
+    Recording,
+    Stopping,
+    Uploading,
+    Complete,
+    Failed,
+}
+
+impl std::fmt::Display for LoomState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Idle => write!(f, "idle"),
+            Self::Countdown => write!(f, "countdown"),
+            Self::Recording => write!(f, "recording"),
+            Self::Stopping => write!(f, "stopping"),
+            Self::Uploading => write!(f, "uploading"),
+            Self::Complete => write!(f, "complete"),
+            Self::Failed => write!(f, "failed"),
+        }
+    }
+}
+
+impl LoomState {
+    /// True while a recording or upload is actively in flight — used to
+    /// reject a second "Record Screen" click.
+    pub fn is_busy(&self) -> bool {
+        matches!(
+            self,
+            Self::Countdown | Self::Recording | Self::Stopping | Self::Uploading
+        )
+    }
+}
+
 impl std::fmt::Display for RecordingState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -74,6 +119,14 @@ pub struct AppState {
     /// Upload flow status — drives the tray "🔄 Uploading…" / "✅ Uploaded" /
     /// "⚠️ Saved locally — link to upload" / "❌ Upload failed" rows.
     pub upload_status: Mutex<UploadStatus>,
+
+    // ── Loom screen recorder (Phase 1) ──────────────────────────────
+    /// Current Loom recorder pipeline state.
+    pub loom_state: Mutex<LoomState>,
+    /// Shareable wolfee.io/v/<shortId> URL of the most recent upload.
+    pub loom_share_url: Mutex<Option<String>>,
+    /// Human-readable error from the last failed Loom recording/upload.
+    pub loom_error: Mutex<Option<String>>,
 }
 
 impl AppState {
@@ -106,5 +159,20 @@ impl AppState {
 
     pub fn set_upload_status(&self, s: UploadStatus) {
         *self.upload_status.lock().unwrap() = s;
+    }
+
+    // ── Loom screen recorder helpers ────────────────────────────────
+
+    pub fn loom_state(&self) -> LoomState {
+        *self.loom_state.lock().unwrap()
+    }
+
+    pub fn set_loom_state(&self, s: LoomState) {
+        log::info!("[Loom/State] -> {}", s);
+        *self.loom_state.lock().unwrap() = s;
+    }
+
+    pub fn loom_share_url(&self) -> Option<String> {
+        self.loom_share_url.lock().unwrap().clone()
     }
 }

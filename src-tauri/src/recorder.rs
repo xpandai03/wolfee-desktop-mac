@@ -3,6 +3,28 @@ use std::process::Stdio;
 use tokio::process::{Child, Command};
 use tokio::io::AsyncWriteExt;
 
+// ── Loom-style screen recorder (Phase 1) ────────────────────────────
+// `screen_capture` is macOS-only (it depends on the macOS-only
+// `screencapturekit` crate). `uploader_v2` is plain reqwest and
+// compiles everywhere. The legacy `Recorder` below — the audio-only
+// WAV recorder — is left untouched.
+#[cfg(target_os = "macos")]
+pub mod screen_capture;
+pub mod uploader_v2;
+
+/// Whether the Loom screen recorder can run on this OS/build. macOS
+/// 15+ only; always `false` off macOS. Safe to call from any module.
+pub fn loom_recorder_available() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        screen_capture::macos_supports_recording()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 pub struct Recorder {
     process: Option<Child>,
     output_path: Option<PathBuf>,
