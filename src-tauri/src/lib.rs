@@ -387,7 +387,21 @@ fn spawn_session_workers(
         // 2. Start audio capture (mic + system + mux pump).
         let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<copilot::audio::AudioFrame>(64);
 
-        let capture = match CopilotAudioCapture::start(session_id.clone(), frame_tx).await {
+        // Phase 1 Copilot recordings: tee the muxed audio to a WAV file
+        // alongside Deepgram, then encode to M4A on session end. Path
+        // is best-effort — if dirs::data_dir() is unavailable or the
+        // directory can't be created we run the session without a
+        // recording (logged inside CopilotAudioCapture::start).
+        let recording_dir = dirs::data_dir()
+            .map(|d| d.join("io.wolfee.desktop").join("copilot_recordings"));
+
+        let capture = match CopilotAudioCapture::start(
+            session_id.clone(),
+            frame_tx,
+            recording_dir,
+        )
+        .await
+        {
             Ok(c) => c,
             Err(e) => {
                 log::error!(

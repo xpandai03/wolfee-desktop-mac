@@ -258,6 +258,10 @@ pub async fn run_pump(
     mut mic_rx: mpsc::Receiver<MicFrame>,
     mut sys_rx: mpsc::Receiver<SystemFrame>,
     out: mpsc::Sender<AudioFrame>,
+    // Phase 1 Copilot recording: an optional tee. Each produced frame
+    // is cloned + try_send'd here before going to Deepgram, so the
+    // recorder can never backpressure the live transcription path.
+    recorder_tx: Option<mpsc::Sender<AudioFrame>>,
     state: Arc<Mutex<CaptureState>>,
 ) {
     // We discover the mic sample rate from the first frame. cpal default
@@ -374,6 +378,13 @@ pub async fn run_pump(
                     } else if a > diag_c_r_max_abs_i16 {
                         diag_c_r_max_abs_i16 = a;
                     }
+                }
+                // Phase 1 Copilot recording — tee a clone to the WAV
+                // writer if one is attached. try_send is non-blocking;
+                // on a full channel we drop the frame silently so the
+                // recorder can never stall Deepgram.
+                if let Some(rec_tx) = recorder_tx.as_ref() {
+                    let _ = rec_tx.try_send(frame.clone());
                 }
                 if out.try_send(frame).is_err() {
                     // Downstream backed up — let it catch up before

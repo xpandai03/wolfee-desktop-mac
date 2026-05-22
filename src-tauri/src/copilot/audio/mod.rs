@@ -24,6 +24,8 @@ pub mod system_macos;
 pub mod mic;
 pub mod mux;
 pub mod permissions;
+#[cfg(target_os = "macos")]
+pub mod recorder;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -112,6 +114,11 @@ pub struct CopilotAudioCapture {
     /// Pump task that pulls from the mux and pushes onto `out`. Aborted
     /// in `stop()`.
     pump: Option<tokio::task::JoinHandle<()>>,
+    /// Phase 1 per-session WAV/M4A recorder. `None` when recording was
+    /// disabled (no path passed in) or the writer failed to open — the
+    /// session still runs in that case, just without a recording.
+    #[cfg(target_os = "macos")]
+    recorder: Option<recorder::CopilotRecorder>,
 }
 
 impl CopilotAudioCapture {
@@ -122,8 +129,9 @@ impl CopilotAudioCapture {
     /// and the streams are NOT started — the caller (Phase 6 overlay
     /// modal handler) is expected to prompt the user, then re-call `start`.
     pub async fn start(
-        _session_id: String,
+        session_id: String,
         out: mpsc::Sender<AudioFrame>,
+        recording_dir: Option<std::path::PathBuf>,
     ) -> Result<Self, AudioError> {
         // Probe permissions deliberately before any capture begins, so
         // the OS prompts fire in a known order (mic first per locked
@@ -141,6 +149,28 @@ impl CopilotAudioCapture {
         #[cfg(target_os = "macos")]
         let system_stream = system_macos::SystemAudioStream::start(sys_tx).await?;
 
+        // Phase 1: per-session WAV → M4A recording, best-effort. On a
+        // setup failure we log and run the session without a recording
+        // rather than fail the whole start.
+        #[cfg(target_os = "macos")]
+        let (recorder_opt, recorder_tx): (
+            Option<recorder::CopilotRecorder>,
+            Option<mpsc::Sender<AudioFrame>>,
+        ) = match recording_dir.as_deref() {
+            Some(dir) => match recorder::CopilotRecorder::start(&session_id, dir) {
+                Ok((rec, tx)) => (Some(rec), Some(tx)),
+                Err(e) => {
+                    log::warn!("[Copilot/rec] not recording — {e}");
+                    (None, None)
+                }
+            },
+            None => (None, None),
+        };
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (recording_dir, &session_id);
+        }
+
         let state = Arc::new(Mutex::new(CaptureState::Capturing));
 
         // Spawn mux pump. Sub-prompt 2 keeps this minimal — Phase 3 will
@@ -148,7 +178,7 @@ impl CopilotAudioCapture {
         let pump_state = state.clone();
         let pump = tokio::spawn(async move {
             #[cfg(target_os = "macos")]
-            mux::run_pump(mic_rx, sys_rx, out, pump_state).await;
+            mux::run_pump(mic_rx, sys_rx, out, recorder_tx, pump_state).await;
             #[cfg(not(target_os = "macos"))]
             {
                 let _ = mic_rx;
@@ -164,6 +194,8 @@ impl CopilotAudioCapture {
             mic: Some(mic_stream),
             state,
             pump: Some(pump),
+            #[cfg(target_os = "macos")]
+            recorder: recorder_opt,
         })
     }
 
@@ -184,6 +216,21 @@ impl CopilotAudioCapture {
         if let Some(pump) = self.pump.take() {
             pump.abort();
             let _ = pump.await;
+        }
+
+        // Phase 1 recording: finalize the WAV → M4A. The pump above is
+        // gone, so its sender to the recorder is dropped; the writer
+        // task's channel is closing as we get here. Best-effort —
+        // errors are logged but don't fail the session teardown.
+        #[cfg(target_os = "macos")]
+        if let Some(rec) = self.recorder.take() {
+            match rec.finalize().await {
+                Ok(path) => log::info!(
+                    "[Copilot/rec] session recording saved → {}",
+                    path.display()
+                ),
+                Err(e) => log::warn!("[Copilot/rec] finalize failed: {e}"),
+            }
         }
 
         {

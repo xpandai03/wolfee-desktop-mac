@@ -36,6 +36,12 @@ urlencoding = "2"
 tokio-util = { version = "0.7", features = ["io"] }
 futures-core = "0.3"
 
+# Copilot per-session recording (Phase 1). The mux pump tees its
+# 16 kHz int16 stereo AudioFrames into a WAV file alongside Deepgram,
+# then macOS's built-in `afconvert` re-encodes to M4A on session end.
+# hound is a small, pure-Rust WAV writer; no system deps.
+hound = "3"
+
 # Sub-prompt 2 (Listening) — macOS audio capture + Deepgram WS
 [target.'cfg(target_os = "macos")'.dependencies]
 # Loom recorder Phase 1 bumps the feature from macos_13_0 to
