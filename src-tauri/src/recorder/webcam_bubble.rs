@@ -72,14 +72,22 @@ pub fn open_webcam_bubble<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
 }
 
 /// Destroy the bubble. Safe to call when it isn't open.
+///
+/// Deferred to the next main-loop tick: the bubble's own X button
+/// emits `webcam-bubble-close`, and destroying the webview from inside
+/// that event's handler is a use-after-free. `run_on_main_thread`
+/// runs the destroy once the dispatch has unwound.
 pub fn close_webcam_bubble<R: Runtime>(app: &AppHandle<R>) {
-    if let Some(window) = app.get_webview_window(WEBCAM_BUBBLE_LABEL) {
-        if let Err(e) = window.destroy() {
-            log::warn!("[Bubble] destroy failed: {e}");
-        } else {
-            log::info!("[Bubble] webcam bubble closed");
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if let Some(window) = handle.get_webview_window(WEBCAM_BUBBLE_LABEL) {
+            if let Err(e) = window.destroy() {
+                log::warn!("[Bubble] destroy failed: {e}");
+            } else {
+                log::info!("[Bubble] webcam bubble closed");
+            }
         }
-    }
+    });
 }
 
 /// Resize the bubble. `small`/`medium` stay floating circles (center

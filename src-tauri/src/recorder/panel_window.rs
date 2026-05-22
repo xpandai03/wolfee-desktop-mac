@@ -34,12 +34,22 @@ pub fn open_recorder_panel<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> 
 }
 
 /// Destroy the panel window. Safe to call when it isn't open.
+///
+/// The destroy is deferred to the next main-loop tick via
+/// `run_on_main_thread`. This is almost always called from the handler
+/// of a `wolfee-action` event the panel *itself* emitted (Start /
+/// Cancel); destroying the webview synchronously while that event is
+/// still being dispatched is a use-after-free that segfaults the whole
+/// app. Deferring runs the destroy after the dispatch has unwound.
 pub fn close_recorder_panel<R: Runtime>(app: &AppHandle<R>) {
-    if let Some(window) = app.get_webview_window(RECORDER_PANEL_LABEL) {
-        if let Err(e) = window.destroy() {
-            log::warn!("[Panel] destroy failed: {e}");
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if let Some(window) = handle.get_webview_window(RECORDER_PANEL_LABEL) {
+            if let Err(e) = window.destroy() {
+                log::warn!("[Panel] destroy failed: {e}");
+            }
         }
-    }
+    });
 }
 
 fn open_panel<R: Runtime>(

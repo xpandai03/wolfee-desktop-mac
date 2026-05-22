@@ -123,6 +123,7 @@ impl ScreenRecorder {
     /// calls cross into the Objective-C runtime; the existing Copilot
     /// system-audio capture uses the same `spawn_blocking` discipline.
     pub fn start(output_path: PathBuf) -> Result<Self, String> {
+        log::info!("[recorder] ScreenRecorder::start — entering");
         if !macos_supports_recording() {
             return Err("Screen recording requires macOS 15 (Sequoia) or later.".to_string());
         }
@@ -130,6 +131,7 @@ impl ScreenRecorder {
         // 1. Pick the primary display. Phase 1 records the primary
         //    display only; multi-display selection lands with the
         //    pre-record panel (deferred — see the test plan).
+        log::info!("[recorder] calling SCShareableContent::get()");
         let content = SCShareableContent::get().map_err(|e| {
             format!(
                 "Screen recording is blocked. Enable Wolfee under System Settings → \
@@ -206,10 +208,12 @@ impl ScreenRecorder {
         );
 
         // 6. Build the stream, attach the recording output, go.
+        log::info!("[recorder] building SCStream + attaching recording output");
         let stream = SCStream::new(&filter, &config);
         stream
             .add_recording_output(&recording_output)
             .map_err(|e| format!("add_recording_output failed: {e}"))?;
+        log::info!("[recorder] calling SCStream::start_capture()");
         stream
             .start_capture()
             .map_err(|e| format!("start_capture failed: {e}"))?;

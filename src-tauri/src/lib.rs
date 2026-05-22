@@ -1737,14 +1737,15 @@ pub fn run() {
                             );
                             return;
                         }
-                        if state.auth_token.lock().unwrap().is_none() {
-                            notify(
-                                handle_ref,
-                                "Link Wolfee first",
-                                "Link your Wolfee account before recording so the video can upload.",
-                            );
-                            return;
-                        }
+                        // No auth gate here. Recording does not need a
+                        // Wolfee account — only the *upload* does. The
+                        // old gate returned silently for unlinked users
+                        // (notification suppressed on a fresh install),
+                        // which was the "Record Screen does nothing"
+                        // bug seen in the 14:29 logs. An unlinked user
+                        // now records normally and gets a local MP4;
+                        // `loom-stop-recording` handles the missing
+                        // token and reports where the file was saved.
 
                         *state.loom_error.lock().unwrap() = None;
                         state.set_loom_state(LoomState::Countdown);
