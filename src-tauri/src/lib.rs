@@ -2692,31 +2692,43 @@ pub fn run() {
                                 *g = None;
                             }
 
-                            // 1. Stop audio capture (drops mic + sys + pump).
+                            // 1. Stop audio capture (drops mic + sys + pump,
+                            //    finalizes the Phase 1 recording to M4A).
                             //    Bind State outside the await so its borrow of
                             //    `handle` lives across the suspend point.
                             let cap_mutex = handle.state::<CopilotAudioCaptureMutex>();
                             let capture_opt = cap_mutex.0.lock().await.take();
                             drop(cap_mutex);
-                            if let Some(capture) = capture_opt {
-                                if let Err(e) = capture.stop().await {
-                                    log::warn!(
-                                        "[Copilot] capture.stop() error (non-fatal): {}",
-                                        e
-                                    );
+                            let recording: Option<copilot::audio::CopilotRecordingResult> =
+                                if let Some(capture) = capture_opt {
+                                    match capture.stop().await {
+                                        Ok(rec) => {
+                                            log::info!(
+                                                "[Copilot] audio capture stopped cleanly"
+                                            );
+                                            rec
+                                        }
+                                        Err(e) => {
+                                            log::warn!(
+                                                "[Copilot] capture.stop() error (non-fatal): {}",
+                                                e
+                                            );
+                                            None
+                                        }
+                                    }
                                 } else {
-                                    log::info!("[Copilot] audio capture stopped cleanly");
-                                }
-                            } else {
-                                log::warn!(
-                                    "[Copilot] No capture handle in managed state — \
-                                     possibly already torn down"
-                                );
-                            }
+                                    log::warn!(
+                                        "[Copilot] No capture handle in managed state — \
+                                         possibly already torn down"
+                                    );
+                                    None
+                                };
 
                             // 2. Notify backend (non-fatal — local end already happened).
-                            if let Some(token) = device_token {
-                                let api = SessionApi::new(backend_url, token);
+                            //    Clone token + URL so the Phase 3 upload below can
+                            //    reuse them after this consumes them for the SessionApi.
+                            if let Some(ref token) = device_token {
+                                let api = SessionApi::new(backend_url.clone(), token.clone());
                                 match api
                                     .end_session(&session_id, EndReason::UserRequested)
                                     .await
@@ -2752,6 +2764,43 @@ pub fn run() {
                                 app_state.auth_token.lock().unwrap().is_some(),
                             );
                             log::info!("[Copilot] session ended — back to Idle");
+
+                            // 4. Phase 3 — upload the per-session recording.
+                            //    Best-effort: on success the local M4A is
+                            //    deleted; on any failure (network, 401,
+                            //    R2 error) the file stays on disk so the
+                            //    user can recover it manually.
+                            if let Some(rec) = recording {
+                                if let Some(token) = device_token {
+                                    let backend = backend_url.clone();
+                                    let sid = session_id.clone();
+                                    tokio::spawn(async move {
+                                        match copilot::audio::recording_upload::upload_recording(
+                                            &backend, &token, &sid, &rec,
+                                        )
+                                        .await
+                                        {
+                                            Ok(()) => {
+                                                let _ = std::fs::remove_file(&rec.path);
+                                                log::info!(
+                                                    "[Copilot/rec] uploaded + local file removed"
+                                                );
+                                            }
+                                            Err(e) => {
+                                                log::warn!(
+                                                    "[Copilot/rec] upload failed: {e} — local file kept at {}",
+                                                    rec.path.display()
+                                                );
+                                            }
+                                        }
+                                    });
+                                } else {
+                                    log::warn!(
+                                        "[Copilot/rec] no device token — local file kept at {}",
+                                        rec.path.display()
+                                    );
+                                }
+                            }
                         });
                     }
 

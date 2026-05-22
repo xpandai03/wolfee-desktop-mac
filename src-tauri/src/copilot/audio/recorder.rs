@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use super::AudioFrame;
+use super::{AudioFrame, CopilotRecordingResult};
 
 /// One-per-Copilot-session WAV writer. `start()` opens the file +
 /// spawns the writer task; `finalize()` closes it and encodes M4A.
@@ -103,13 +103,14 @@ impl CopilotRecorder {
     }
 
     /// Wait for the writer to finish, then re-encode the WAV to M4A
-    /// (AAC) using macOS's `afconvert`. Returns the M4A path. The
-    /// intermediate WAV is deleted on success.
+    /// (AAC) using macOS's `afconvert`. Returns the encoded file's
+    /// path, captured duration, and size — enough for the Phase 3
+    /// upload to send the right metadata to the backend.
     ///
     /// Errors here are non-fatal to the session — callers log + move
     /// on. The local WAV will remain on disk for manual recovery if
     /// encoding fails.
-    pub async fn finalize(self) -> Result<PathBuf, String> {
+    pub async fn finalize(self) -> Result<CopilotRecordingResult, String> {
         // Wait for the writer task. By the time we get here, the pump
         // has been aborted (see CopilotAudioCapture::stop), so its
         // sender is already dropped and the writer's channel has
@@ -149,13 +150,19 @@ impl CopilotRecorder {
         // Encoded successfully — drop the WAV.
         let _ = std::fs::remove_file(&wav);
 
-        let size = std::fs::metadata(&m4a).map(|m| m.len()).unwrap_or(0);
+        let size_bytes = std::fs::metadata(&m4a).map(|m| m.len()).unwrap_or(0);
+        let duration_ms = frames * 250;
         log::info!(
-            "[Copilot/rec] encoded → {} ({:.2} MB, {} frames)",
+            "[Copilot/rec] encoded → {} ({:.2} MB, {} ms, {} frames)",
             m4a.display(),
-            (size as f64) / 1_048_576.0,
+            (size_bytes as f64) / 1_048_576.0,
+            duration_ms,
             frames
         );
-        Ok(m4a)
+        Ok(CopilotRecordingResult {
+            path: m4a,
+            duration_ms,
+            size_bytes,
+        })
     }
 }

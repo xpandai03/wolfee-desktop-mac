@@ -26,6 +26,20 @@ pub mod mux;
 pub mod permissions;
 #[cfg(target_os = "macos")]
 pub mod recorder;
+#[cfg(target_os = "macos")]
+pub mod recording_upload;
+
+/// Output of `CopilotAudioCapture::stop` when a per-session recording
+/// was active. Carries everything `recording_upload::upload_recording`
+/// needs: the local M4A path, the captured duration, and the file
+/// size. Defined cross-platform (rather than inside the macOS-gated
+/// `recorder` module) so the `stop()` signature stays uniform.
+#[derive(Debug, Clone)]
+pub struct CopilotRecordingResult {
+    pub path: std::path::PathBuf,
+    pub duration_ms: u64,
+    pub size_bytes: u64,
+}
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -199,7 +213,7 @@ impl CopilotAudioCapture {
         })
     }
 
-    pub async fn stop(mut self) -> Result<(), AudioError> {
+    pub async fn stop(mut self) -> Result<Option<CopilotRecordingResult>, AudioError> {
         {
             let mut s = self.state.lock().await;
             *s = CaptureState::Stopping;
@@ -223,21 +237,34 @@ impl CopilotAudioCapture {
         // task's channel is closing as we get here. Best-effort —
         // errors are logged but don't fail the session teardown.
         #[cfg(target_os = "macos")]
-        if let Some(rec) = self.recorder.take() {
-            match rec.finalize().await {
-                Ok(path) => log::info!(
-                    "[Copilot/rec] session recording saved → {}",
-                    path.display()
-                ),
-                Err(e) => log::warn!("[Copilot/rec] finalize failed: {e}"),
-            }
-        }
+        let recording: Option<CopilotRecordingResult> =
+            if let Some(rec) = self.recorder.take() {
+                match rec.finalize().await {
+                    Ok(result) => {
+                        log::info!(
+                            "[Copilot/rec] session recording saved → {} ({} ms, {} bytes)",
+                            result.path.display(),
+                            result.duration_ms,
+                            result.size_bytes
+                        );
+                        Some(result)
+                    }
+                    Err(e) => {
+                        log::warn!("[Copilot/rec] finalize failed: {e}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+        #[cfg(not(target_os = "macos"))]
+        let recording: Option<CopilotRecordingResult> = None;
 
         {
             let mut s = self.state.lock().await;
             *s = CaptureState::Idle;
         }
-        Ok(())
+        Ok(recording)
     }
 
     pub async fn current_state(&self) -> CaptureState {
