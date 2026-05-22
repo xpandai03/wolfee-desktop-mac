@@ -2741,6 +2741,21 @@ pub fn run() {
                         });
                     }
 
+                    // The panel's "End Copilot session" button. The
+                    // panel doesn't hold the live transcript, so it
+                    // can't run finalize-and-push-session itself — it
+                    // asks the overlay (which owns the transcript) to
+                    // run its full stop sequence: finalize + push,
+                    // then end-copilot-session. This makes the panel's
+                    // End behave exactly like the overlay's Stop, so
+                    // the SessionCompleteCard always appears.
+                    "request-end-copilot-session" => {
+                        log::info!(
+                            "[Copilot] End requested from panel — delegating to overlay"
+                        );
+                        let _ = handle_ref.emit("copilot-request-end", ());
+                    }
+
                     _ => {
                         log::warn!("[App] Unknown action: {}", action);
                     }

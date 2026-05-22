@@ -120,6 +120,12 @@ export default function CopilotOverlay() {
     onboardingCompletedRef.current = overlayState.onboardingCompleted;
   }, [overlayState.onboardingCompleted]);
 
+  // Ref to the latest handleStop, so the global `copilot-request-end`
+  // listener (the panel's "End Copilot session" button, routed via
+  // Rust) runs the current finalize-then-end logic — not a closure
+  // captured stale at mount with an empty transcript.
+  const handleStopRef = useRef<() => void>(() => {});
+
   // Tick — drives existing 2s reasoning fallback + 30s TTL.
   useEffect(() => {
     const id = window.setInterval(() => {
@@ -233,6 +239,7 @@ export default function CopilotOverlay() {
     let chatFailedUnlisten: UnlistenFn | undefined;
     let newThreadUnlisten: UnlistenFn | undefined;
     let finalizedUnlisten: UnlistenFn | undefined;
+    let requestEndUnlisten: UnlistenFn | undefined;
     let sessionFailedUnlisten: UnlistenFn | undefined;
     let onboardingFlagUnlisten: UnlistenFn | undefined;
     let onboardingShowUnlisten: UnlistenFn | undefined;
@@ -399,6 +406,15 @@ export default function CopilotOverlay() {
         }
       });
 
+      // The panel's "End Copilot session" button can't run finalize
+      // itself (it doesn't hold the transcript). Its Rust handler
+      // re-emits copilot-request-end here so the overlay runs the
+      // exact same stop sequence as its own Stop button — finalize +
+      // push, then end — which is what produces the SessionCompleteCard.
+      requestEndUnlisten = await listen("copilot-request-end", () => {
+        handleStopRef.current();
+      });
+
       // Sub-prompt 6.0 — onboarding wizard boot flow (replaces SP5.0
       // welcome). Rust replies with `onboarding-flag-loaded` carrying
       // {completed, last_step}. If completed=false on a fresh user,
@@ -506,6 +522,7 @@ export default function CopilotOverlay() {
       chatFailedUnlisten?.();
       newThreadUnlisten?.();
       finalizedUnlisten?.();
+      requestEndUnlisten?.();
       sessionFailedUnlisten?.();
       onboardingFlagUnlisten?.();
       onboardingShowUnlisten?.();
@@ -606,6 +623,9 @@ export default function CopilotOverlay() {
     // Then the existing teardown — keeps the session-end path intact.
     void emit("wolfee-action", "end-copilot-session");
   };
+  // Keep the ref pointed at the latest handleStop so the
+  // copilot-request-end listener never runs a stale closure.
+  handleStopRef.current = handleStop;
   const handleToggleExpand = () => {
     void emit(
       "wolfee-action",

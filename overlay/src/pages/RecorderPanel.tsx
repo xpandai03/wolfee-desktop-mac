@@ -512,7 +512,7 @@ function CopilotTab({ app, loomBusy }: { app: WolfeeState; loomBusy: boolean }) 
       ) : (
         <>
           <button
-            onClick={() => !transient && emitAction("end-copilot-session")}
+            onClick={() => !transient && emitAction("request-end-copilot-session")}
             disabled={transient}
             className={clsx(
               "h-[42px] w-full rounded-[11px] text-[14px] font-semibold transition-colors",
