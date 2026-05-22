@@ -288,6 +288,22 @@ function RecordTab(p: RecordTabProps) {
         <Progress pct={uploadPct} />
       </StatusBody>
     );
+  if (app.loom === "needslink")
+    return (
+      <StatusBody
+        tone="ok"
+        title="✅ Recording saved"
+        sub={app.loomError ?? "Saved locally on your Mac — link your account to upload it."}
+      >
+        <BigButton
+          color="accent"
+          label="Link account to upload"
+          onClick={() => emitAction("link-account")}
+        />
+        <TextButton label="Already linked? Upload now" onClick={() => emitAction("loom-retry-upload")} />
+        <TextButton label="Not now" onClick={() => emitAction("loom-dismiss")} />
+      </StatusBody>
+    );
   if (app.loom === "complete")
     return (
       <StatusBody tone="ok" title="✅ Recording uploaded" sub="The share link is on your clipboard.">
@@ -309,6 +325,20 @@ function RecordTab(p: RecordTabProps) {
 
   return (
     <div className="space-y-1.5 px-3 pb-2">
+      <div className="flex items-center gap-1.5 px-1 pb-0.5 text-[11px]">
+        <span
+          className={clsx(
+            "h-1.5 w-1.5 shrink-0 rounded-full",
+            p.app.authed ? "bg-[#1faa4f]" : "bg-[#e0a82e]",
+          )}
+        />
+        <span className="text-[#8a8a8e]">
+          {p.app.authed
+            ? "Connected to Wolfee"
+            : "Not linked — recordings save to your Mac"}
+        </span>
+      </div>
+
       <DeviceRow
         icon={Monitor}
         label="Full screen"

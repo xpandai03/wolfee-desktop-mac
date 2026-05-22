@@ -6,13 +6,13 @@
 //! a restart destroys and recreates the window, so the timer resets
 //! naturally.
 //!
-//! Pause is intentionally disabled — ScreenCaptureKit's
-//! `SCRecordingOutput` has no pause API. It's left visible (greyed)
-//! as a placeholder for a future macOS version.
+//! There is no Pause button — ScreenCaptureKit's `SCRecordingOutput`
+//! has no pause/resume API, so rather than ship a dead control the bar
+//! offers Restart (redo this take), Stop and Discard.
 
 import { useEffect, useState, type ReactNode } from "react";
 import { emit } from "@tauri-apps/api/event";
-import { Pause, RotateCcw, Square, Trash2 } from "lucide-react";
+import { RotateCcw, Square, Trash2 } from "lucide-react";
 import clsx from "clsx";
 
 function fmt(total: number): string {
@@ -49,9 +49,6 @@ export function ControlBar() {
         </span>
         <span data-tauri-drag-region className="mx-0.5 h-5 w-px bg-white/15" />
 
-        <CtrlButton title="Pause isn't available yet" disabled>
-          <Pause size={15} />
-        </CtrlButton>
         <CtrlButton title="Restart recording" onClick={act("loom-restart-recording")}>
           <RotateCcw size={15} />
         </CtrlButton>

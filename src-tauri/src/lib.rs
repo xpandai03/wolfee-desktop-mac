@@ -146,6 +146,84 @@ fn finish_loom_failure<R: tauri::Runtime>(
     }
 }
 
+/// Upload a finished recording and drive the panel through Uploading →
+/// Complete (or → failure). Shared by `loom-stop-recording` (when the
+/// account is linked) and `loom-retry-upload` (after the user links).
+#[cfg(target_os = "macos")]
+async fn perform_loom_upload(
+    handle: tauri::AppHandle,
+    tray: std::sync::Arc<tauri::tray::TrayIcon>,
+    file_path: std::path::PathBuf,
+    duration_secs: f64,
+    size_bytes: u64,
+    backend_url: String,
+    token: String,
+) {
+    {
+        let state: tauri::State<'_, AppState> = handle.state();
+        state.set_loom_state(LoomState::Uploading);
+    }
+    tray::update_tray_for_loom(&tray, &handle);
+
+    // Live upload progress → tray title + the panel.
+    let tray_progress = tray.clone();
+    let handle_progress = handle.clone();
+    let on_progress = move |pct: u8| {
+        let _ = tray_progress.set_title(Some(format!("⬆ {pct}%").as_str()));
+        let _ = handle_progress.emit("wolfee-loom-progress", pct);
+    };
+
+    let upload = recorder::uploader_v2::upload_video(
+        &file_path,
+        duration_secs,
+        size_bytes,
+        &backend_url,
+        &token,
+        on_progress,
+    )
+    .await;
+
+    match upload {
+        Ok(share) => {
+            use tauri_plugin_clipboard_manager::ClipboardExt;
+            let _ = handle.clipboard().write_text(share.share_url.clone());
+            {
+                let state: tauri::State<'_, AppState> = handle.state();
+                *state.loom_share_url.lock().unwrap() = Some(share.share_url.clone());
+                *state.loom_error.lock().unwrap() = None;
+                *state.loom_pending_upload.lock().unwrap() = None;
+                state.set_loom_state(LoomState::Complete);
+            }
+            tray::update_tray_for_loom(&tray, &handle);
+            notify(&handle, "Recording uploaded!", "Link copied to clipboard.");
+            log::info!("[recorder] upload complete — opening videos page");
+            open_url(&format!("{}/videos", backend_url.trim_end_matches('/')));
+            let _ = std::fs::remove_file(&file_path);
+
+            // Auto-clear the Complete state after 12s.
+            let tray2 = tray.clone();
+            let handle2 = handle.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(12));
+                let state: tauri::State<'_, AppState> = handle2.state();
+                if state.loom_state() == LoomState::Complete {
+                    state.set_loom_state(LoomState::Idle);
+                    drop(state);
+                    tray::update_tray_for_loom(&tray2, &handle2);
+                }
+            });
+        }
+        Err(e) => {
+            // Keep the local file + the pending record so the user can retry.
+            finish_loom_failure(
+                &handle,
+                &tray,
+                format!("{e} — recording kept at {}", file_path.display()),
+            );
+        }
+    }
+}
+
 /// Tauri-managed wrapper around the active session's intelligence
 /// workers. `None` between sessions; populated when
 /// `start-copilot-session` finishes spawning workers and taken back
@@ -1378,6 +1456,7 @@ pub fn run() {
         loom_state: Mutex::new(LoomState::Idle),
         loom_share_url: Mutex::new(None),
         loom_error: Mutex::new(None),
+        loom_pending_upload: Mutex::new(None),
     };
 
     let backend_url = auth_config.backend_url.clone();
@@ -1888,100 +1967,101 @@ pub fn run() {
                                 let t = state.auth_token.lock().unwrap().clone();
                                 t
                             };
-                            let token = match token {
-                                Some(t) => t,
-                                None => {
-                                    finish_loom_failure(
-                                        &handle,
-                                        &tray,
-                                        format!(
-                                            "Not linked — recording saved locally at {}",
-                                            result.file_path.display()
-                                        ),
-                                    );
-                                    return;
+
+                            match token {
+                                Some(token) => {
+                                    perform_loom_upload(
+                                        handle,
+                                        tray,
+                                        result.file_path,
+                                        result.duration_secs,
+                                        result.size_bytes,
+                                        backend_url,
+                                        token,
+                                    )
+                                    .await;
                                 }
-                            };
-
-                            {
-                                let state: tauri::State<'_, AppState> = handle.state();
-                                state.set_loom_state(LoomState::Uploading);
-                            }
-                            tray::update_tray_for_loom(&tray, &handle);
-
-                            // Live upload progress → tray menu-bar title
-                            // + the panel (via the wolfee-loom-progress event).
-                            let tray_progress = tray.clone();
-                            let handle_progress = handle.clone();
-                            let on_progress = move |pct: u8| {
-                                let t = format!("⬆ {pct}%");
-                                let _ = tray_progress.set_title(Some(t.as_str()));
-                                let _ = handle_progress.emit("wolfee-loom-progress", pct);
-                            };
-
-                            let upload = recorder::uploader_v2::upload_video(
-                                &result.file_path,
-                                result.duration_secs,
-                                result.size_bytes,
-                                &backend_url,
-                                &token,
-                                on_progress,
-                            )
-                            .await;
-
-                            match upload {
-                                Ok(share) => {
-                                    use tauri_plugin_clipboard_manager::ClipboardExt;
-                                    let _ = handle.clipboard().write_text(share.share_url.clone());
+                                None => {
+                                    // Recording is safe on disk — there's
+                                    // just no linked account to upload to.
+                                    // Remember it so linking can retry, and
+                                    // surface the inline "Link account" UI.
+                                    log::info!(
+                                        "[recorder] not linked — recording held for upload \
+                                         after linking"
+                                    );
                                     {
                                         let state: tauri::State<'_, AppState> = handle.state();
-                                        *state.loom_share_url.lock().unwrap() =
-                                            Some(share.share_url.clone());
-                                        *state.loom_error.lock().unwrap() = None;
-                                        state.set_loom_state(LoomState::Complete);
+                                        *state.loom_pending_upload.lock().unwrap() =
+                                            Some(state::PendingUpload {
+                                                path: result
+                                                    .file_path
+                                                    .to_string_lossy()
+                                                    .to_string(),
+                                                duration_secs: result.duration_secs,
+                                                size_bytes: result.size_bytes,
+                                            });
+                                        *state.loom_error.lock().unwrap() = Some(format!(
+                                            "Saved on your Mac: {}",
+                                            result.file_path.display()
+                                        ));
+                                        state.set_loom_state(LoomState::NeedsLink);
                                     }
                                     tray::update_tray_for_loom(&tray, &handle);
                                     notify(
                                         &handle,
-                                        "Recording uploaded!",
-                                        "Link copied to clipboard.",
-                                    );
-                                    // Open the videos page so the user can watch
-                                    // it process and grab the share link.
-                                    log::info!("[recorder] upload complete — opening videos page");
-                                    open_url(&format!(
-                                        "{}/videos",
-                                        backend_url.trim_end_matches('/')
-                                    ));
-                                    // Upload succeeded — the local file is no
-                                    // longer needed.
-                                    let _ = std::fs::remove_file(&result.file_path);
-
-                                    // Auto-clear the Complete row after 12s.
-                                    let tray2 = tray.clone();
-                                    let handle2 = handle.clone();
-                                    std::thread::spawn(move || {
-                                        std::thread::sleep(std::time::Duration::from_secs(12));
-                                        let state: tauri::State<'_, AppState> = handle2.state();
-                                        if state.loom_state() == LoomState::Complete {
-                                            state.set_loom_state(LoomState::Idle);
-                                            drop(state);
-                                            tray::update_tray_for_loom(&tray2, &handle2);
-                                        }
-                                    });
-                                }
-                                Err(e) => {
-                                    // Keep the local file so the user can retry.
-                                    finish_loom_failure(
-                                        &handle,
-                                        &tray,
-                                        format!(
-                                            "{e} — recording kept at {}",
-                                            result.file_path.display()
-                                        ),
+                                        "Recording saved",
+                                        "Link your Wolfee account to upload and share it.",
                                     );
                                 }
                             }
+                        });
+                    }
+
+                    // Inline "Link account → upload" retry: upload a
+                    // recording held because the user wasn't linked when
+                    // it finished. Fired by the Record tab's button and
+                    // auto-fired right after a successful link.
+                    #[cfg(target_os = "macos")]
+                    "loom-retry-upload" => {
+                        let state: tauri::State<'_, AppState> = handle_ref.state();
+                        let pending = state.loom_pending_upload.lock().unwrap().clone();
+                        let token = state.auth_token.lock().unwrap().clone();
+                        drop(state);
+
+                        let pending = match pending {
+                            Some(p) => p,
+                            None => {
+                                log::info!("[recorder] retry-upload: nothing pending");
+                                return;
+                            }
+                        };
+                        let token = match token {
+                            Some(t) => t,
+                            None => {
+                                notify(
+                                    handle_ref,
+                                    "Not linked yet",
+                                    "Link your Wolfee account first, then upload.",
+                                );
+                                return;
+                            }
+                        };
+
+                        let tray = tray_clone.clone();
+                        let handle = handle_ref.clone();
+                        let backend_url = backend_url_clone.clone();
+                        spawn_async("loom-retry-upload", move || async move {
+                            perform_loom_upload(
+                                handle,
+                                tray,
+                                std::path::PathBuf::from(pending.path),
+                                pending.duration_secs,
+                                pending.size_bytes,
+                                backend_url,
+                                token,
+                            )
+                            .await;
                         });
                     }
 
@@ -2075,6 +2155,10 @@ pub fn run() {
                         let state: tauri::State<'_, AppState> = handle_ref.state();
                         state.set_loom_state(LoomState::Idle);
                         *state.loom_error.lock().unwrap() = None;
+                        // Drop any held-for-linking recording. The local
+                        // MP4 stays on disk — only the retry pointer is
+                        // cleared, so a recording is never lost here.
+                        *state.loom_pending_upload.lock().unwrap() = None;
                         drop(state);
                         tray::update_tray_for_loom(&tray_clone, handle_ref);
                     }
@@ -2139,6 +2223,16 @@ pub fn run() {
                                     // Refresh tray to remove "Link with Wolfee..." and show ready state
                                     tray::update_tray_menu(&tray, &handle, RecordingState::Idle, true);
                                     log::info!("[AUTH] Tray updated — ready to record + upload");
+
+                                    // If a recording was waiting on a linked
+                                    // account, upload it now — seamless.
+                                    if state.loom_pending_upload.lock().unwrap().is_some() {
+                                        log::info!(
+                                            "[recorder] link succeeded — auto-retrying \
+                                             pending upload"
+                                        );
+                                        let _ = handle.emit("wolfee-action", "loom-retry-upload");
+                                    }
 
                                     // Auto-clear the "✅ Linked!" status row after 5s.
                                     let tray2 = tray.clone();

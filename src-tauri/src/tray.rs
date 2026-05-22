@@ -164,6 +164,7 @@ pub fn update_tray_for_loom<R: Runtime>(tray: &TrayIcon<R>, app: &AppHandle<R>) 
         LoomState::Recording => (Some("● REC"), "Wolfee — recording your screen"),
         LoomState::Stopping => (Some("● ···"), "Wolfee — finishing recording"),
         LoomState::Uploading => (Some("⬆ 0%"), "Wolfee — uploading recording"),
+        LoomState::NeedsLink => (None, "Wolfee — recording saved, link to upload"),
         LoomState::Complete => (None, "Wolfee — recording uploaded"),
         LoomState::Failed => (None, "Wolfee — recording failed"),
         LoomState::Idle => (None, "Wolfee"),

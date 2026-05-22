@@ -51,6 +51,10 @@ pub enum LoomState {
     Recording,
     Stopping,
     Uploading,
+    /// Recording finished and saved locally, but the user isn't linked
+    /// to a Wolfee account so it can't be uploaded yet. The Record tab
+    /// surfaces an inline "Link account" action; linking auto-retries.
+    NeedsLink,
     Complete,
     Failed,
 }
@@ -63,10 +67,20 @@ impl std::fmt::Display for LoomState {
             Self::Recording => write!(f, "recording"),
             Self::Stopping => write!(f, "stopping"),
             Self::Uploading => write!(f, "uploading"),
+            Self::NeedsLink => write!(f, "needslink"),
             Self::Complete => write!(f, "complete"),
             Self::Failed => write!(f, "failed"),
         }
     }
+}
+
+/// A finished recording waiting to be uploaded — kept so that linking
+/// an account can retry the upload without re-recording.
+#[derive(Debug, Clone)]
+pub struct PendingUpload {
+    pub path: String,
+    pub duration_secs: f64,
+    pub size_bytes: u64,
 }
 
 impl LoomState {
@@ -127,6 +141,10 @@ pub struct AppState {
     pub loom_share_url: Mutex<Option<String>>,
     /// Human-readable error from the last failed Loom recording/upload.
     pub loom_error: Mutex<Option<String>>,
+    /// A finished recording waiting on a linked account before it can
+    /// upload. Set when a recording stops with no auth token; cleared
+    /// once the upload completes (or is dismissed).
+    pub loom_pending_upload: Mutex<Option<PendingUpload>>,
 }
 
 impl AppState {
