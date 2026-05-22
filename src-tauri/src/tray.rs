@@ -297,12 +297,13 @@ fn build_menu<R: Runtime>(
     let loom_state = current_loom_state(app);
     match loom_state {
         LoomState::Idle | LoomState::Complete | LoomState::Failed => {
-            let (label, enabled) = if !crate::recorder::loom_recorder_available() {
-                ("Record Screen  (needs macOS 15)".to_string(), false)
-            } else if !is_authenticated {
-                ("Record Screen  (link Wolfee first)".to_string(), false)
-            } else {
+            // Opens the pre-record panel. Not gated on auth — the
+            // panel is just setup UI; the `loom-record-screen`
+            // handler prompts to link Wolfee at Start time if needed.
+            let (label, enabled) = if crate::recorder::loom_recorder_available() {
                 ("🎬  Record Screen".to_string(), true)
+            } else {
+                ("Record Screen  (needs macOS 15)".to_string(), false)
             };
             let item = MenuItem::with_id(app, "loom_record", &label, enabled, None::<&str>)?;
             menu.append(&item)?;
@@ -602,8 +603,8 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, id: &str) {
 
         // ─── Loom screen recorder (Phase 1) ───
         "loom_record" => {
-            log::info!("[Tray] Record Screen clicked");
-            let _ = app.emit("wolfee-action", "loom-record-screen");
+            log::info!("[Tray] Record Screen clicked — opening pre-record panel");
+            let _ = app.emit("wolfee-action", "open-recorder-panel");
         }
         "loom_stop" => {
             log::info!("[Tray] Stop Recording clicked");

@@ -1654,9 +1654,29 @@ pub fn run() {
                     // ─────────────────────────────────────────
                     // LOOM SCREEN RECORDER (Phase 1)
                     // ─────────────────────────────────────────
+                    // Tray "Record Screen" → open the Loom-style
+                    // pre-record panel. The panel itself emits
+                    // `loom-record-screen` (start) or
+                    // `cancel-recorder-panel` (close).
+                    "open-recorder-panel" => {
+                        log::info!("[Recorder] open pre-record panel");
+                        if let Err(e) = recorder::panel_window::open_recorder_panel(handle_ref) {
+                            log::error!("[Recorder] failed to open panel: {e}");
+                        }
+                    }
+
+                    "cancel-recorder-panel" => {
+                        log::info!("[Recorder] pre-record panel cancelled");
+                        recorder::panel_window::close_recorder_panel(handle_ref);
+                    }
+
                     #[cfg(target_os = "macos")]
                     "loom-record-screen" => {
                         log::info!("[Loom] Record Screen requested");
+                        // Started from the pre-record panel — tear it
+                        // down before the countdown so it's never on
+                        // screen during capture.
+                        recorder::panel_window::close_recorder_panel(handle_ref);
                         let state: tauri::State<'_, AppState> = handle_ref.state();
 
                         if state.loom_state().is_busy() {
