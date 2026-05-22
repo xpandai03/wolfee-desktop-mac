@@ -1,26 +1,21 @@
-//! Unified Wolfee panel (UX redesign — iteration 2).
+//! Unified Wolfee panel (UX redesign — iterations 2 & 3).
 //!
 //! One floating panel, opened by a left-click on the tray icon, with
-//! two peer tabs — **Record** and **Copilot** — plus a disabled
-//! Screenshot tab. The Record tab is the iteration-1 recorder setup,
-//! now also a full lifecycle view (setup → recording → uploading →
-//! done). The Copilot tab surfaces what used to be the tray's Copilot
-//! menu section.
+//! Record and Copilot tabs. The webcam preview is no longer inline —
+//! it lives in its own floating bubble window (`WebcamBubble.tsx`),
+//! which is visible in the screen recording. Toggling the camera here
+//! just opens/closes that bubble; this webview never holds the camera,
+//! so there is no contention.
 //!
-//! State arrives from Rust via the `wolfee-state` event (broadcast by
-//! `tray::emit_wolfee_state`) and `wolfee-loom-progress`. The panel
-//! requests a snapshot on mount. Record and Copilot are mutually
-//! exclusive — each tab's primary action is disabled, with an inline
-//! reason, while the other feature is active.
+//! State arrives from Rust via `wolfee-state` + `wolfee-loom-progress`.
+//! Record and Copilot are mutually exclusive.
 
 import {
   useCallback,
   useEffect,
-  useRef,
   useState,
   type Dispatch,
   type ReactNode,
-  type RefObject,
   type SetStateAction,
 } from "react";
 import { emit, listen } from "@tauri-apps/api/event";
@@ -87,9 +82,6 @@ export function RecorderPanel() {
   const [openDd, setOpenDd] = useState<DropdownId>(null);
   const [starting, setStarting] = useState(false);
 
-  const previewRef = useRef<HTMLVideoElement | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-
   const loomBusy = LOOM_BUSY.includes(app.loom);
   const copilotActive = COPILOT_ACTIVE.includes(app.copilot);
 
@@ -108,13 +100,7 @@ export function RecorderPanel() {
     };
   }, []);
 
-  // ── Device enumeration + preview (Record tab) ─────────────────────
-  const stopPreview = useCallback(() => {
-    streamRef.current?.getTracks().forEach((t) => t.stop());
-    streamRef.current = null;
-    if (previewRef.current) previewRef.current.srcObject = null;
-  }, []);
-
+  // ── Device enumeration (Record tab) ───────────────────────────────
   const refreshDevices = useCallback(async () => {
     if (!navigator.mediaDevices?.enumerateDevices) return;
     try {
@@ -134,52 +120,28 @@ export function RecorderPanel() {
     void refreshDevices();
     const md = navigator.mediaDevices;
     md?.addEventListener?.("devicechange", refreshDevices);
-    return () => {
-      md?.removeEventListener?.("devicechange", refreshDevices);
-      stopPreview();
-    };
-  }, [refreshDevices, stopPreview]);
+    return () => md?.removeEventListener?.("devicechange", refreshDevices);
+  }, [refreshDevices]);
 
-  // Preview only while the setup UI is actually visible.
-  const wantCamera = tab === "record" && cameraOn && app.loom === "idle";
-  useEffect(() => {
-    let cancelled = false;
-    if (!wantCamera) {
-      stopPreview();
-      return;
-    }
-    void (async () => {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: cameraId ? { deviceId: { exact: cameraId } } : true,
-          audio: false,
-        });
-        if (cancelled) {
-          stream.getTracks().forEach((t) => t.stop());
-          return;
-        }
-        stopPreview();
-        streamRef.current = stream;
-        if (previewRef.current) previewRef.current.srcObject = stream;
-        void refreshDevices();
-      } catch {
-        if (!cancelled) setCameraOn(false);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [wantCamera, cameraId, refreshDevices, stopPreview]);
+  // Camera On/Off = open/close the floating bubble window. This webview
+  // never holds the camera itself. Only fired by explicit user action
+  // (never on mount), so reopening the panel mid-recording can't close
+  // a live bubble.
+  function applyCamera(on: boolean) {
+    setCameraOn(on);
+    emitAction(on ? "webcam-bubble-open" : "webcam-bubble-close");
+  }
 
   function handleStart() {
     if (starting || loomBusy || copilotActive) return;
     setStarting(true);
-    stopPreview();
+    // The bubble persists into the recording (Rust does not close it
+    // on loom-record-screen).
     emitAction("loom-record-screen");
   }
 
   function handleClose() {
-    stopPreview();
+    // Rust's cancel-recorder-panel handler also closes the bubble.
     emitAction("cancel-recorder-panel");
   }
 
@@ -190,10 +152,7 @@ export function RecorderPanel() {
     >
       <div className="relative w-[324px] overflow-visible rounded-[18px] bg-white text-[#1c1c1e] shadow-[0_14px_44px_rgba(0,0,0,0.30)]">
         {/* ── Header: tabs + close ────────────────────────────── */}
-        <div
-          data-tauri-drag-region
-          className="flex items-center justify-between px-3 pb-1.5 pt-3"
-        >
+        <div data-tauri-drag-region className="flex items-center justify-between px-3 pb-1.5 pt-3">
           <div className="flex items-center gap-1">
             <TabButton icon={Video} label="Record" active={tab === "record"} onClick={() => setTab("record")} />
             <TabButton icon={BrainCircuit} label="Copilot" active={tab === "copilot"} onClick={() => setTab("copilot")} />
@@ -224,10 +183,9 @@ export function RecorderPanel() {
             computerSounds={computerSounds}
             noiseFilter={noiseFilter}
             openDd={openDd}
-            previewRef={previewRef}
             setCameraId={setCameraId}
             setMicId={setMicId}
-            setCameraOn={setCameraOn}
+            applyCamera={applyCamera}
             setMicOn={setMicOn}
             setComputerSounds={setComputerSounds}
             setNoiseFilter={setNoiseFilter}
@@ -262,19 +220,13 @@ export function RecorderPanel() {
                 <MenuItem icon={Sparkles} label="Check for updates" hint="Soon" disabled />
                 <MenuItem icon={MoreHorizontal} label="About Wolfee" hint="Soon" disabled />
                 <MenuDivider />
-                <MenuItem
-                  icon={LogOut}
-                  label="Quit Wolfee"
-                  onClick={() => emitAction("quit-app")}
-                />
+                <MenuItem icon={LogOut} label="Quit Wolfee" onClick={() => emitAction("quit-app")} />
               </div>
             )}
           </div>
         </div>
 
-        {openDd && (
-          <div className="fixed inset-0 z-40" onClick={() => setOpenDd(null)} aria-hidden />
-        )}
+        {openDd && <div className="fixed inset-0 z-40" onClick={() => setOpenDd(null)} aria-hidden />}
       </div>
     </div>
   );
@@ -296,10 +248,9 @@ type RecordTabProps = {
   computerSounds: boolean;
   noiseFilter: boolean;
   openDd: DropdownId;
-  previewRef: RefObject<HTMLVideoElement>;
   setCameraId: Dispatch<SetStateAction<string | null>>;
   setMicId: Dispatch<SetStateAction<string | null>>;
-  setCameraOn: Dispatch<SetStateAction<boolean>>;
+  applyCamera: (on: boolean) => void;
   setMicOn: Dispatch<SetStateAction<boolean>>;
   setComputerSounds: Dispatch<SetStateAction<boolean>>;
   setNoiseFilter: Dispatch<SetStateAction<boolean>>;
@@ -310,7 +261,6 @@ type RecordTabProps = {
 function RecordTab(p: RecordTabProps) {
   const { app, uploadPct } = p;
 
-  // Active-recording lifecycle views.
   if (app.loom === "countdown")
     return <StatusBody tone="accent" title="Recording starts in 3…" sub="Switch to what you want to capture." />;
   if (app.loom === "recording")
@@ -366,7 +316,7 @@ function RecordTab(p: RecordTabProps) {
         label={p.cameraOn ? cameraLabel : "Camera"}
         open={p.openDd === "camera"}
         badge={p.cameraOn ? "on" : "off"}
-        onBadgeClick={() => p.setCameraOn((v) => !v)}
+        onBadgeClick={() => p.applyCamera(!p.cameraOn)}
         onClick={() => p.setOpenDd(p.openDd === "camera" ? null : "camera")}
       >
         <Menu>
@@ -375,7 +325,7 @@ function RecordTab(p: RecordTabProps) {
             label="No camera"
             selected={!p.cameraOn}
             onClick={() => {
-              p.setCameraOn(() => false);
+              p.applyCamera(false);
               p.setOpenDd(null);
             }}
           />
@@ -388,7 +338,7 @@ function RecordTab(p: RecordTabProps) {
               selected={p.cameraOn && p.cameraId === c.id}
               onClick={() => {
                 p.setCameraId(c.id);
-                p.setCameraOn(() => true);
+                p.applyCamera(true);
                 p.setOpenDd(null);
               }}
             />
@@ -426,9 +376,9 @@ function RecordTab(p: RecordTabProps) {
       </DeviceRow>
 
       {p.cameraOn && (
-        <div className="flex items-center gap-2 px-1 pt-0.5">
-          <CameraCircle videoRef={p.previewRef} size={52} />
-          <span className="text-[11px] text-[#8a8a8e]">Webcam preview</span>
+        <div className="flex items-center gap-1.5 px-1 pt-0.5 text-[11px] text-[#1faa4f]">
+          <span className="h-1.5 w-1.5 rounded-full bg-[#1faa4f]" />
+          <span className="text-[#8a8a8e]">Camera bubble is on screen — drag it anywhere.</span>
         </div>
       )}
 
@@ -813,21 +763,6 @@ function MenuToggle({
           )}
         />
       </button>
-    </div>
-  );
-}
-
-function CameraCircle({ videoRef, size }: { videoRef: RefObject<HTMLVideoElement>; size: number }) {
-  return (
-    <div className="overflow-hidden rounded-full bg-[#e9e9ec]" style={{ width: size, height: size }}>
-      <video
-        ref={videoRef}
-        autoPlay
-        muted
-        playsInline
-        className="h-full w-full object-cover"
-        style={{ transform: "scaleX(-1)" }}
-      />
     </div>
   );
 }

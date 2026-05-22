@@ -131,6 +131,7 @@ fn finish_loom_failure<R: tauri::Runtime>(
         state.set_loom_state(LoomState::Failed);
     }
     tray::update_tray_for_loom(tray, handle);
+    recorder::webcam_bubble::close_webcam_bubble(handle);
     notify(handle, "Recording failed", &msg);
 }
 
@@ -1668,6 +1669,8 @@ pub fn run() {
                     "cancel-recorder-panel" => {
                         log::info!("[Recorder] pre-record panel cancelled");
                         recorder::panel_window::close_recorder_panel(handle_ref);
+                        // The bubble was a preview — close it on cancel.
+                        recorder::webcam_bubble::close_webcam_bubble(handle_ref);
                     }
 
                     // The unified panel requests current state on mount.
@@ -1679,6 +1682,27 @@ pub fn run() {
                     "quit-app" => {
                         log::info!("[App] Quit requested from panel");
                         handle_ref.exit(0);
+                    }
+
+                    // ── Webcam bubble (visible-in-recording floating window) ──
+                    "webcam-bubble-open" => {
+                        if let Err(e) =
+                            recorder::webcam_bubble::open_webcam_bubble(handle_ref)
+                        {
+                            log::error!("[Bubble] open failed: {e}");
+                        }
+                    }
+                    "webcam-bubble-close" => {
+                        recorder::webcam_bubble::close_webcam_bubble(handle_ref);
+                    }
+                    "webcam-bubble-small" => {
+                        recorder::webcam_bubble::resize_webcam_bubble(handle_ref, "small");
+                    }
+                    "webcam-bubble-medium" => {
+                        recorder::webcam_bubble::resize_webcam_bubble(handle_ref, "medium");
+                    }
+                    "webcam-bubble-large" => {
+                        recorder::webcam_bubble::resize_webcam_bubble(handle_ref, "large");
                     }
 
                     #[cfg(target_os = "macos")]
@@ -1778,6 +1802,8 @@ pub fn run() {
                         }
                         state.set_loom_state(LoomState::Stopping);
                         drop(state);
+                        // Stop → the bubble's job is done; close it.
+                        recorder::webcam_bubble::close_webcam_bubble(handle_ref);
                         tray::update_tray_for_loom(&tray_clone, handle_ref);
 
                         let tray = tray_clone.clone();
