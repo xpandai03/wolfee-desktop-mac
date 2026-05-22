@@ -1,57 +1,32 @@
+//! Menu-bar tray (UX redesign — iteration 2).
+//!
+//! The tray is no longer the app's UI surface — the unified Wolfee
+//! panel (`recorder/panel_window.rs` + `RecorderPanel.tsx`) is.
+//!
+//! - **Left-click** the icon → toggle the unified panel, anchored
+//!   under the icon (`show_menu_on_left_click(false)` + the tray
+//!   click event).
+//! - **Right-click** → a minimal native menu (Open Wolfee, Quit) as
+//!   a safety net.
+//!
+//! State (Copilot session, recording, upload, auth) is no longer
+//! rendered as menu rows — it lives in the panel, fed by the
+//! `wolfee-state` event that `emit_wolfee_state` broadcasts. The
+//! `update_tray_*` functions keep their old signatures (lib.rs calls
+//! them in many places) but now just refresh the menu-bar glyph and
+//! re-broadcast `wolfee-state`.
+
 use tauri::{
     image::Image,
     menu::{Menu, MenuItem},
-    tray::{TrayIcon, TrayIconBuilder},
+    tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager, Runtime,
 };
 
 use crate::copilot::state::{CopilotState, CopilotStateMutex};
-use crate::state::{AppState, LinkingStatus, LoomState, RecordingState, UploadStatus};
+use crate::state::{AppState, LoomState, RecordingState};
 
-fn current_copilot_state<R: Runtime>(app: &AppHandle<R>) -> CopilotState {
-    if let Some(state) = app.try_state::<CopilotStateMutex>() {
-        return state.0.lock().unwrap().clone();
-    }
-    CopilotState::Idle
-}
-
-fn current_linking_status<R: Runtime>(app: &AppHandle<R>) -> LinkingStatus {
-    if let Some(state) = app.try_state::<AppState>() {
-        return *state.linking_status.lock().unwrap();
-    }
-    LinkingStatus::Idle
-}
-
-fn current_upload_status<R: Runtime>(app: &AppHandle<R>) -> UploadStatus {
-    if let Some(state) = app.try_state::<AppState>() {
-        return *state.upload_status.lock().unwrap();
-    }
-    UploadStatus::Idle
-}
-
-fn current_loom_state<R: Runtime>(app: &AppHandle<R>) -> LoomState {
-    if let Some(state) = app.try_state::<AppState>() {
-        return *state.loom_state.lock().unwrap();
-    }
-    LoomState::Idle
-}
-
-fn current_loom_error<R: Runtime>(app: &AppHandle<R>) -> Option<String> {
-    app.try_state::<AppState>()
-        .and_then(|s| s.loom_error.lock().unwrap().clone())
-}
-
-/// Truncate a string for a single-line menu row.
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let kept: String = s.chars().take(max.saturating_sub(1)).collect();
-        format!("{kept}…")
-    }
-}
-
-// Wolfee tray icon (template-style, 44x44 @2x)
+// Wolfee tray icon (template-style, 44x44 @2x).
 const TRAY_ICON_BYTES: &[u8] = include_bytes!("../icons/trayTemplate.png");
 
 fn tray_icon() -> Image<'static> {
@@ -59,71 +34,131 @@ fn tray_icon() -> Image<'static> {
 }
 
 pub fn create_tray<R: Runtime>(app: &AppHandle<R>) -> Result<TrayIcon<R>, tauri::Error> {
-    let icon = tray_icon();
     let tray = TrayIconBuilder::new()
-        .tooltip("Wolfee Desktop")
-        .icon(icon)
+        .tooltip("Wolfee")
+        .icon(tray_icon())
         .icon_as_template(true)
-        .menu(&build_menu(app, RecordingState::Idle, current_copilot_state(app), false)?)
-        .on_menu_event(move |app, event| {
-            handle_menu_event(app, event.id().as_ref());
-        })
+        .menu(&build_minimal_menu(app)?)
+        // Left-click no longer shows the menu — it toggles the panel.
+        // Right-click still shows the menu below.
+        .show_menu_on_left_click(false)
+        .on_menu_event(move |app, event| handle_menu_event(app, event.id().as_ref()))
+        .on_tray_icon_event(|tray, event| handle_tray_icon_event(tray, event))
         .build(app)?;
-
     Ok(tray)
 }
 
+/// Minimal right-click menu — a safety net only. Everything else is
+/// in the panel.
+fn build_minimal_menu<R: Runtime>(app: &AppHandle<R>) -> Result<Menu<R>, tauri::Error> {
+    let menu = Menu::new(app)?;
+    menu.append(&MenuItem::with_id(app, "open", "Open Wolfee", true, None::<&str>)?)?;
+    menu.append(&MenuItem::with_id(app, "sep", "—", false, None::<&str>)?)?;
+    menu.append(&MenuItem::with_id(app, "quit", "Quit Wolfee", true, None::<&str>)?)?;
+    Ok(menu)
+}
+
+fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, id: &str) {
+    match id {
+        "open" => {
+            let _ = app.emit("wolfee-action", "open-wolfee");
+        }
+        "quit" => {
+            log::info!("[Tray] Quit clicked");
+            app.exit(0);
+        }
+        _ => {}
+    }
+}
+
+/// Left-click the tray icon → toggle the unified panel anchored under
+/// the icon. We act on button-Up only so the Down/Up pair of a single
+/// click doesn't toggle twice.
+fn handle_tray_icon_event<R: Runtime>(tray: &TrayIcon<R>, event: TrayIconEvent) {
+    if let TrayIconEvent::Click {
+        button: MouseButton::Left,
+        button_state: MouseButtonState::Up,
+        position,
+        ..
+    } = event
+    {
+        log::info!("[Tray] icon left-clicked — toggling panel");
+        crate::recorder::panel_window::toggle_recorder_panel(tray.app_handle(), position);
+    }
+}
+
+// ── State broadcasting ──────────────────────────────────────────────
+
+/// Map the Copilot state machine to a stable kind string the panel
+/// renders (status text + Start/End button enablement).
+fn copilot_kind(state: &CopilotState) -> &'static str {
+    match state {
+        CopilotState::Idle => "idle",
+        CopilotState::ShowingOverlay => "overlay",
+        CopilotState::StartingSession { .. } => "starting",
+        CopilotState::Listening { .. } => "listening",
+        CopilotState::Reconnecting { .. } => "reconnecting",
+        CopilotState::EndingSession { .. } => "ending",
+    }
+}
+
+fn current_copilot_state<R: Runtime>(app: &AppHandle<R>) -> CopilotState {
+    app.try_state::<CopilotStateMutex>()
+        .map(|s| s.0.lock().unwrap().clone())
+        .unwrap_or(CopilotState::Idle)
+}
+
+fn current_loom_state<R: Runtime>(app: &AppHandle<R>) -> LoomState {
+    app.try_state::<AppState>()
+        .map(|s| *s.loom_state.lock().unwrap())
+        .unwrap_or(LoomState::Idle)
+}
+
+/// Broadcast the full app state to the unified panel. Called whenever
+/// Loom or Copilot state changes (via the `update_tray_*` functions)
+/// and on the panel's `request-wolfee-state`.
+pub fn emit_wolfee_state<R: Runtime>(app: &AppHandle<R>) {
+    let state = app.try_state::<AppState>();
+    let loom = current_loom_state(app);
+    let loom_error = state
+        .as_ref()
+        .and_then(|s| s.loom_error.lock().unwrap().clone());
+    let loom_share = state
+        .as_ref()
+        .and_then(|s| s.loom_share_url.lock().unwrap().clone());
+    let authed = state
+        .as_ref()
+        .map(|s| s.auth_token.lock().unwrap().is_some())
+        .unwrap_or(false);
+
+    let payload = serde_json::json!({
+        "loom": loom.to_string(),
+        "loomError": loom_error,
+        "loomShareUrl": loom_share,
+        "copilot": copilot_kind(&current_copilot_state(app)),
+        "authed": authed,
+    });
+    let _ = app.emit("wolfee-state", payload);
+}
+
+// ── Tray refresh entry points (signatures kept for lib.rs) ──────────
+
+/// Legacy/auth/linking refresh. The native menu is static now, so
+/// this only re-broadcasts state to the panel.
 pub fn update_tray_menu<R: Runtime>(
     tray: &TrayIcon<R>,
     app: &AppHandle<R>,
     state: RecordingState,
     is_authenticated: bool,
 ) {
-    let copilot_state = current_copilot_state(app);
-    if let Ok(menu) = build_menu(app, state, copilot_state, is_authenticated) {
-        let _ = tray.set_menu(Some(menu));
-    }
-
-    // Icon stays as Wolfee wolf — state shown via title text
-
-    // Update tooltip
-    let tooltip = match state {
-        RecordingState::Recording => "Wolfee — Recording...",
-        RecordingState::Stopping => "Wolfee — Saving...",
-        RecordingState::Uploading => "Wolfee — Uploading...",
-        RecordingState::Complete => "Wolfee — Uploaded!",
-        RecordingState::Idle => "Wolfee Desktop",
-    };
-    let _ = tray.set_tooltip(Some(tooltip));
-
-    // Set visible title text next to tray icon (macOS menu bar)
-    let title = match state {
-        RecordingState::Recording => Some("REC"),
-        RecordingState::Stopping => Some("..."),
-        RecordingState::Uploading => Some("UP"),
-        RecordingState::Complete => None,
-        RecordingState::Idle => None,
-    };
-    let _ = tray.set_title(title);
+    let _ = (tray, state, is_authenticated);
+    emit_wolfee_state(app);
 }
 
-/// Rebuild the tray menu and refresh the menu-bar title/tooltip for a
-/// Loom screen-recorder state change. `build_menu` reads the Loom
-/// state straight from `AppState`, so this just re-renders.
-///
-/// During `Uploading` the title is left for the live progress
-/// callback in lib.rs to drive (`⬆ NN%`); every other state sets it
-/// here.
+/// Loom recorder refresh — updates the menu-bar glyph and re-broadcasts
+/// state. During `Uploading` the live percentage is driven separately
+/// by the `wolfee-loom-progress` event from lib.rs.
 pub fn update_tray_for_loom<R: Runtime>(tray: &TrayIcon<R>, app: &AppHandle<R>) {
-    let copilot_state = current_copilot_state(app);
-    let is_authed = app
-        .try_state::<AppState>()
-        .map(|s| s.auth_token.lock().unwrap().is_some())
-        .unwrap_or(false);
-    if let Ok(menu) = build_menu(app, RecordingState::Idle, copilot_state, is_authed) {
-        let _ = tray.set_menu(Some(menu));
-    }
-
     let (title, tooltip): (Option<&str>, &str) = match current_loom_state(app) {
         LoomState::Countdown => (Some("● ···"), "Wolfee — recording starts soon"),
         LoomState::Recording => (Some("● REC"), "Wolfee — recording your screen"),
@@ -131,494 +166,9 @@ pub fn update_tray_for_loom<R: Runtime>(tray: &TrayIcon<R>, app: &AppHandle<R>) 
         LoomState::Uploading => (Some("⬆ 0%"), "Wolfee — uploading recording"),
         LoomState::Complete => (None, "Wolfee — recording uploaded"),
         LoomState::Failed => (None, "Wolfee — recording failed"),
-        LoomState::Idle => (None, "Wolfee Desktop"),
+        LoomState::Idle => (None, "Wolfee"),
     };
     let _ = tray.set_title(title);
     let _ = tray.set_tooltip(Some(tooltip));
-}
-
-fn copilot_status_label(state: &CopilotState) -> &'static str {
-    match state {
-        CopilotState::Idle => "🟢 Copilot: Idle",
-        CopilotState::ShowingOverlay => "🟡 Copilot: Active",
-        // Workstream B (2026-05-05) — Paused variant removed.
-        CopilotState::StartingSession { .. } => "🔄 Copilot: Starting…",
-        CopilotState::Listening { .. } => "🟢 Copilot: Listening",
-        CopilotState::Reconnecting { .. } => "⚠️ Copilot: Reconnecting…",
-        CopilotState::EndingSession { .. } => "🔄 Copilot: Ending…",
-    }
-}
-
-fn build_menu<R: Runtime>(
-    app: &AppHandle<R>,
-    state: RecordingState,
-    copilot_state: CopilotState,
-    is_authenticated: bool,
-) -> Result<Menu<R>, tauri::Error> {
-    let menu = Menu::new(app)?;
-
-    // ─────────────────────────────────────────────
-    // COPILOT SECTION (new — Sub-prompt 1)
-    // Per design doc §2.2 + Decision N7: Copilot is the headline.
-    // ─────────────────────────────────────────────
-    let copilot_status = MenuItem::with_id(
-        app,
-        "copilot_status",
-        copilot_status_label(&copilot_state),
-        false,
-        None::<&str>,
-    )?;
-    menu.append(&copilot_status)?;
-
-    let open_overlay = MenuItem::with_id(
-        app,
-        "copilot_open_overlay",
-        "Open Copilot Overlay  ⌘⌥W",
-        true,
-        None::<&str>,
-    )?;
-    menu.append(&open_overlay)?;
-
-    // ── Session controls (Sub-prompt 2 Phase 5) ───────────────────
-    // Show Start when nothing is in flight (Idle / ShowingOverlay)
-    // and End when a session is live or transitioning. Workstream B
-    // dropped the Paused variant — no separate "Resume" path needed.
-    let session_sep_top = MenuItem::with_id(app, "copilot_session_sep_top", "—", false, None::<&str>)?;
-    menu.append(&session_sep_top)?;
-
-    let in_session = matches!(
-        copilot_state,
-        CopilotState::StartingSession { .. }
-            | CopilotState::Listening { .. }
-            | CopilotState::Reconnecting { .. }
-            | CopilotState::EndingSession { .. }
-    );
-
-    if !in_session {
-        let label = if is_authenticated {
-            "Start Copilot Session"
-        } else {
-            "Start Copilot Session (link first)"
-        };
-        let start_session = MenuItem::with_id(
-            app,
-            "copilot_start_session",
-            label,
-            is_authenticated, // disabled when not authed
-            None::<&str>,
-        )?;
-        menu.append(&start_session)?;
-    } else {
-        // Disable End during transient Starting/Ending so a stale
-        // double-click during transitions can't kick off cascading
-        // teardowns.
-        let enabled = matches!(
-            copilot_state,
-            CopilotState::Listening { .. } | CopilotState::Reconnecting { .. }
-        );
-        let label = if enabled {
-            "End Copilot Session"
-        } else {
-            "End Copilot Session (please wait…)"
-        };
-        let end_session = MenuItem::with_id(
-            app,
-            "copilot_end_session",
-            label,
-            enabled,
-            None::<&str>,
-        )?;
-        menu.append(&end_session)?;
-
-        // Manual suggestion trigger — same path as ⌘⌥G but discoverable
-        // via tray for users who don't memorize hotkeys (PO 2026-05-04
-        // feedback: "the hot keys are also not easy to kind of hit and
-        // memorize"). Enabled only during Listening/Reconnecting.
-        let suggest_enabled = matches!(
-            copilot_state,
-            CopilotState::Listening { .. } | CopilotState::Reconnecting { .. }
-        );
-        let suggest_item = MenuItem::with_id(
-            app,
-            "copilot_generate_suggestion",
-            "Generate Suggestion  ⌘⌥G",
-            suggest_enabled,
-            None::<&str>,
-        )?;
-        menu.append(&suggest_item)?;
-    }
-
-    let session_sep_bottom = MenuItem::with_id(app, "copilot_session_sep_bottom", "—", false, None::<&str>)?;
-    menu.append(&session_sep_bottom)?;
-
-    // Workstream B (2026-05-05) — "Pause Copilot" item removed. It
-    // was a half-implemented placeholder (no audio mute, no UI dim)
-    // that confused users. End Session is the only stop control.
-
-    let setup_copilot =
-        MenuItem::with_id(app, "copilot_setup", "Set Up Copilot…", true, None::<&str>)?;
-    menu.append(&setup_copilot)?;
-
-    // Sub-prompt 6.0 — onboarding tour entry. Always visible so users
-    // can re-open the wizard at any time, even mid-session.
-    let show_tour = MenuItem::with_id(
-        app,
-        "copilot_show_onboarding",
-        "Show Onboarding Tour",
-        true,
-        None::<&str>,
-    )?;
-    menu.append(&show_tour)?;
-
-    // Modes RAG (step 13) — quick access to the web Modes page so users
-    // can manage their bring-your-own knowledge without first opening
-    // the overlay. Always visible. Opens wolfee.io/copilot/modes in
-    // the user's default browser via the existing open-external-url
-    // wolfee-action handler in lib.rs.
-    let manage_modes = MenuItem::with_id(
-        app,
-        "copilot_manage_modes",
-        "Manage Modes…",
-        true,
-        None::<&str>,
-    )?;
-    menu.append(&manage_modes)?;
-
-    let section_sep = MenuItem::with_id(app, "section_sep", "———", false, None::<&str>)?;
-    menu.append(&section_sep)?;
-
-    // ─────────────────────────────────────────────
-    // LOOM SCREEN RECORDER (Phase 1)
-    // Tray-driven: a single "Record Screen" entry that captures the
-    // primary display. The control bar / pre-record panel windows are
-    // deferred — driving from the tray means there is no recorder UI
-    // window to exclude from the capture in the first place.
-    // ─────────────────────────────────────────────
-    let loom_state = current_loom_state(app);
-    match loom_state {
-        LoomState::Idle | LoomState::Complete | LoomState::Failed => {
-            // Opens the pre-record panel. Not gated on auth — the
-            // panel is just setup UI; the `loom-record-screen`
-            // handler prompts to link Wolfee at Start time if needed.
-            let (label, enabled) = if crate::recorder::loom_recorder_available() {
-                ("🎬  Record Screen".to_string(), true)
-            } else {
-                ("Record Screen  (needs macOS 15)".to_string(), false)
-            };
-            let item = MenuItem::with_id(app, "loom_record", &label, enabled, None::<&str>)?;
-            menu.append(&item)?;
-        }
-        LoomState::Countdown => {
-            let item =
-                MenuItem::with_id(app, "loom_starting", "● Recording starting…", false, None::<&str>)?;
-            menu.append(&item)?;
-        }
-        LoomState::Recording => {
-            let item =
-                MenuItem::with_id(app, "loom_stop", "⏹  Stop Recording", true, None::<&str>)?;
-            menu.append(&item)?;
-        }
-        LoomState::Stopping => {
-            let item = MenuItem::with_id(
-                app,
-                "loom_finishing",
-                "● Finishing recording…",
-                false,
-                None::<&str>,
-            )?;
-            menu.append(&item)?;
-        }
-        LoomState::Uploading => {
-            let item = MenuItem::with_id(
-                app,
-                "loom_uploading",
-                "⬆ Uploading recording…",
-                false,
-                None::<&str>,
-            )?;
-            menu.append(&item)?;
-        }
-    }
-
-    // Result rows for the just-finished recording.
-    match loom_state {
-        LoomState::Complete => {
-            let row = MenuItem::with_id(
-                app,
-                "loom_open",
-                "✅ Recording uploaded — open & copy link",
-                true,
-                None::<&str>,
-            )?;
-            menu.append(&row)?;
-            let dismiss =
-                MenuItem::with_id(app, "loom_dismiss", "  Dismiss", true, None::<&str>)?;
-            menu.append(&dismiss)?;
-        }
-        LoomState::Failed => {
-            let err = current_loom_error(app).unwrap_or_else(|| "Recording failed".to_string());
-            let row = MenuItem::with_id(
-                app,
-                "loom_failed",
-                &format!("❌ {}", truncate(&err, 52)),
-                false,
-                None::<&str>,
-            )?;
-            menu.append(&row)?;
-            let dismiss =
-                MenuItem::with_id(app, "loom_dismiss", "  Dismiss", true, None::<&str>)?;
-            menu.append(&dismiss)?;
-        }
-        _ => {}
-    }
-
-    let loom_sep = MenuItem::with_id(app, "loom_sep", "—", false, None::<&str>)?;
-    menu.append(&loom_sep)?;
-
-    // ─────────────────────────────────────────────
-    // NOTES SECTION
-    // Decision N6 (recorder coexistence) deferred to Sub-prompt 6 — recorder
-    // entries appear unchanged below.
-    // ─────────────────────────────────────────────
-
-    // Linking + upload status rows. Surface these BEFORE the auth row so the
-    // user sees what the desktop is doing right now (fixing the Sub-prompt 1
-    // bug-test silent-failure UX). All rows below are non-disruptive — they
-    // only appear when there's actually something to surface.
-    let linking_status = current_linking_status(app);
-    let upload_status = current_upload_status(app);
-
-    let mut needs_status_sep = false;
-
-    match linking_status {
-        LinkingStatus::Idle => {}
-        LinkingStatus::InProgress => {
-            let row = MenuItem::with_id(app, "linking_row", "🔄 Linking…", false, None::<&str>)?;
-            menu.append(&row)?;
-            needs_status_sep = true;
-        }
-        LinkingStatus::JustLinked => {
-            let row = MenuItem::with_id(app, "linking_row", "✅ Linked!", false, None::<&str>)?;
-            menu.append(&row)?;
-            needs_status_sep = true;
-        }
-        LinkingStatus::Failed => {
-            let row = MenuItem::with_id(
-                app,
-                "linking_failed_retry",
-                "❌ Link failed — click to retry",
-                true,
-                None::<&str>,
-            )?;
-            menu.append(&row)?;
-            let dismiss = MenuItem::with_id(
-                app,
-                "linking_failed_dismiss",
-                "  Dismiss",
-                true,
-                None::<&str>,
-            )?;
-            menu.append(&dismiss)?;
-            needs_status_sep = true;
-        }
-    }
-
-    match upload_status {
-        UploadStatus::Idle | UploadStatus::InProgress => {
-            // InProgress is reflected via the existing RecordingState::Uploading
-            // status row below; no need for a duplicate.
-        }
-        UploadStatus::JustUploaded => {
-            let row = MenuItem::with_id(
-                app,
-                "upload_just_uploaded",
-                "✅ Uploaded — open in Wolfee",
-                true,
-                None::<&str>,
-            )?;
-            menu.append(&row)?;
-            needs_status_sep = true;
-        }
-        UploadStatus::SkippedNoAuth => {
-            let row = MenuItem::with_id(
-                app,
-                "upload_skipped_link",
-                "⚠️ Recording saved — link to upload",
-                true,
-                None::<&str>,
-            )?;
-            menu.append(&row)?;
-            let dismiss = MenuItem::with_id(
-                app,
-                "upload_skipped_dismiss",
-                "  Dismiss",
-                true,
-                None::<&str>,
-            )?;
-            menu.append(&dismiss)?;
-            needs_status_sep = true;
-        }
-        UploadStatus::Failed => {
-            let row = MenuItem::with_id(
-                app,
-                "upload_failed_dismiss",
-                "❌ Upload failed — click to dismiss",
-                true,
-                None::<&str>,
-            )?;
-            menu.append(&row)?;
-            needs_status_sep = true;
-        }
-    }
-
-    if needs_status_sep {
-        let status_sep = MenuItem::with_id(app, "status_sep", "—", false, None::<&str>)?;
-        menu.append(&status_sep)?;
-    }
-
-    // Auth row — hide while linking is InProgress (the status row above tells
-    // the user what's happening; a clickable "Link with Wolfee…" would just
-    // double-open the browser).
-    if !is_authenticated && linking_status != LinkingStatus::InProgress {
-        let link = MenuItem::with_id(app, "link", "Link with Wolfee...", true, None::<&str>)?;
-        menu.append(&link)?;
-        let sep = MenuItem::with_id(app, "sep0", "—", false, None::<&str>)?;
-        menu.append(&sep)?;
-    }
-
-    // Sub-prompt 6.0 — Start/Stop Recording entries removed. The
-    // desktop app is Copilot-only at the user-facing layer; the
-    // recorder.rs module is preserved for future re-wiring but is
-    // no longer surfaced in the tray. RecordingState::Recording etc.
-    // still exist in AppState; they're simply not rendered. The
-    // `state` parameter is now unused in build_menu but kept on the
-    // signature so update_tray_menu's call site stays untouched.
-    let _ = state;
-
-    let sep1 = MenuItem::with_id(app, "sep1", "—", false, None::<&str>)?;
-    menu.append(&sep1)?;
-
-    let open_wolfee = MenuItem::with_id(app, "open", "Open Wolfee", true, None::<&str>)?;
-    menu.append(&open_wolfee)?;
-
-    let sep2 = MenuItem::with_id(app, "sep2", "—", false, None::<&str>)?;
-    menu.append(&sep2)?;
-
-    let quit = MenuItem::with_id(app, "quit", "Quit Wolfee", true, None::<&str>)?;
-    menu.append(&quit)?;
-
-    Ok(menu)
-}
-
-fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, id: &str) {
-    match id {
-        // ─── Copilot menu items ───
-        "copilot_open_overlay" => {
-            log::info!("[Tray] Open Copilot Overlay clicked");
-            let _ = app.emit("wolfee-action", "open-copilot-overlay");
-        }
-        "copilot_setup" => {
-            log::info!("[Tray] Set Up Copilot clicked");
-            let _ = app.emit("wolfee-action", "open-copilot-settings");
-        }
-        "copilot_start_session" => {
-            log::info!("[Tray] Start Copilot Session clicked");
-            let _ = app.emit("wolfee-action", "start-copilot-session");
-        }
-        "copilot_end_session" => {
-            log::info!("[Tray] End Copilot Session clicked");
-            let _ = app.emit("wolfee-action", "end-copilot-session");
-        }
-        "copilot_generate_suggestion" => {
-            log::info!("[Tray] Generate Suggestion clicked");
-            let _ = app.emit("wolfee-action", "trigger-copilot-suggestion");
-        }
-        // Sub-prompt 6.0
-        "copilot_show_onboarding" => {
-            log::info!("[Tray] Show Onboarding Tour clicked");
-            let _ = app.emit("wolfee-action", "show-onboarding");
-        }
-        // Modes RAG (step 13) — opens wolfee.io/copilot/modes in the
-        // user's browser via the existing open-external-url action.
-        "copilot_manage_modes" => {
-            log::info!("[Tray] Manage Modes clicked");
-            let _ = app.emit(
-                "wolfee-action",
-                serde_json::json!({
-                    "type": "open-external-url",
-                    "url": "https://wolfee.io/copilot/modes"
-                }),
-            );
-        }
-
-        // ─── Linking / upload status row clicks ───
-        "linking_failed_retry" => {
-            log::info!("[Tray] Link-failed retry clicked");
-            let _ = app.emit("wolfee-action", "clear-linking-status");
-            let _ = app.emit("wolfee-action", "link-account");
-        }
-        "linking_failed_dismiss" => {
-            log::info!("[Tray] Link-failed dismiss clicked");
-            let _ = app.emit("wolfee-action", "clear-linking-status");
-        }
-        "upload_just_uploaded" => {
-            log::info!("[Tray] Just-uploaded row clicked → open meeting");
-            let _ = app.emit("wolfee-action", "clear-upload-status");
-            let _ = app.emit("wolfee-action", "open-meeting");
-        }
-        "upload_skipped_link" => {
-            log::info!("[Tray] Saved-locally row clicked → run link flow");
-            let _ = app.emit("wolfee-action", "clear-upload-status");
-            let _ = app.emit("wolfee-action", "link-account");
-        }
-        "upload_skipped_dismiss" => {
-            log::info!("[Tray] Saved-locally dismiss clicked");
-            let _ = app.emit("wolfee-action", "clear-upload-status");
-        }
-        "upload_failed_dismiss" => {
-            log::info!("[Tray] Upload-failed dismiss clicked");
-            let _ = app.emit("wolfee-action", "clear-upload-status");
-        }
-
-        // ─── Nav items ───
-        // Sub-prompt 6.0 — `start` and `stop` recorder click handlers
-        // removed. Tray UI no longer surfaces them; recorder.rs
-        // remains intact for future re-wiring.
-        "open" => {
-            log::info!("[Tray] Open Wolfee clicked");
-            let _ = app.emit("wolfee-action", "open-wolfee");
-        }
-        "open_meeting" => {
-            log::info!("[Tray] Open Meeting clicked");
-            let _ = app.emit("wolfee-action", "open-meeting");
-        }
-        "link" => {
-            log::info!("[Tray] Link clicked");
-            let _ = app.emit("wolfee-action", "link-account");
-        }
-        "quit" => {
-            log::info!("[Tray] Quit clicked");
-            app.exit(0);
-        }
-
-        // ─── Loom screen recorder (Phase 1) ───
-        "loom_record" => {
-            log::info!("[Tray] Record Screen clicked — opening pre-record panel");
-            let _ = app.emit("wolfee-action", "open-recorder-panel");
-        }
-        "loom_stop" => {
-            log::info!("[Tray] Stop Recording clicked");
-            let _ = app.emit("wolfee-action", "loom-stop-recording");
-        }
-        "loom_open" => {
-            log::info!("[Tray] Open uploaded recording clicked");
-            let _ = app.emit("wolfee-action", "loom-open-recording");
-        }
-        "loom_dismiss" => {
-            log::info!("[Tray] Dismiss Loom status clicked");
-            let _ = app.emit("wolfee-action", "loom-dismiss");
-        }
-
-        _ => {}
-    }
+    emit_wolfee_state(app);
 }

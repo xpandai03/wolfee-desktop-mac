@@ -1670,6 +1670,17 @@ pub fn run() {
                         recorder::panel_window::close_recorder_panel(handle_ref);
                     }
 
+                    // The unified panel requests current state on mount.
+                    "request-wolfee-state" => {
+                        tray::emit_wolfee_state(handle_ref);
+                    }
+
+                    // Panel "More → Quit".
+                    "quit-app" => {
+                        log::info!("[App] Quit requested from panel");
+                        handle_ref.exit(0);
+                    }
+
                     #[cfg(target_os = "macos")]
                     "loom-record-screen" => {
                         log::info!("[Loom] Record Screen requested");
@@ -1831,11 +1842,14 @@ pub fn run() {
                             }
                             tray::update_tray_for_loom(&tray, &handle);
 
-                            // Live upload progress → tray menu-bar title.
+                            // Live upload progress → tray menu-bar title
+                            // + the panel (via the wolfee-loom-progress event).
                             let tray_progress = tray.clone();
+                            let handle_progress = handle.clone();
                             let on_progress = move |pct: u8| {
                                 let t = format!("⬆ {pct}%");
                                 let _ = tray_progress.set_title(Some(t.as_str()));
+                                let _ = handle_progress.emit("wolfee-loom-progress", pct);
                             };
 
                             let upload = recorder::uploader_v2::upload_video(

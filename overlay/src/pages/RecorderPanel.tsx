@@ -1,47 +1,81 @@
-//! Loom-style pre-record panel (recorder UI redesign — iteration 1).
+//! Unified Wolfee panel (UX redesign — iteration 2).
 //!
-//! Rendered into its own Tauri webview window via the `#/recorder`
-//! hash route (see main.tsx). Opened from the tray "Record Screen"
-//! item. The panel collects the recording setup — mode, screen
-//! target, camera, mic — and on "Start recording" hands off to the
-//! existing native capture flow by emitting `wolfee-action:
-//! loom-record-screen`; Rust closes this window and runs the
-//! countdown + capture.
+//! One floating panel, opened by a left-click on the tray icon, with
+//! two peer tabs — **Record** and **Copilot** — plus a disabled
+//! Screenshot tab. The Record tab is the iteration-1 recorder setup,
+//! now also a full lifecycle view (setup → recording → uploading →
+//! done). The Copilot tab surfaces what used to be the tray's Copilot
+//! menu section.
 //!
-//! Iteration 1 scope: the panel + device pickers + live webcam
-//! preview. Camera/mic *selection* is collected here but not yet
-//! plumbed into the capture (the recorder still uses the primary
-//! display + default mic + system audio — which match the panel
-//! defaults). Countdown overlay, recording control bar and webcam
-//! bubble are the next iteration.
+//! State arrives from Rust via the `wolfee-state` event (broadcast by
+//! `tray::emit_wolfee_state`) and `wolfee-loom-progress`. The panel
+//! requests a snapshot on mount. Record and Copilot are mutually
+//! exclusive — each tab's primary action is disabled, with an inline
+//! reason, while the other feature is active.
 
-import { useCallback, useEffect, useRef, useState, type ReactNode, type RefObject } from "react";
-import { emit } from "@tauri-apps/api/event";
 import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type Dispatch,
+  type ReactNode,
+  type RefObject,
+  type SetStateAction,
+} from "react";
+import { emit, listen } from "@tauri-apps/api/event";
+import {
+  BrainCircuit,
   Camera,
   Check,
   ChevronDown,
   HelpCircle,
+  LayoutGrid,
+  LogOut,
   Mic,
   Monitor,
   MoreHorizontal,
-  Smile,
+  Settings,
+  Sparkles,
   StickyNote,
   Video,
   X,
 } from "lucide-react";
 import clsx from "clsx";
 
-type Mode = "screen" | "webcam" | "screenshot";
+type Tab = "record" | "copilot" | "screenshot";
 type Device = { id: string; label: string };
 type DropdownId = "screen" | "camera" | "mic" | "more" | null;
+
+type WolfeeState = {
+  loom: string; // idle | countdown | recording | stopping | uploading | complete | failed
+  loomError: string | null;
+  loomShareUrl: string | null;
+  copilot: string; // idle | overlay | starting | listening | reconnecting | ending
+  authed: boolean;
+};
+
+const DEFAULT_STATE: WolfeeState = {
+  loom: "idle",
+  loomError: null,
+  loomShareUrl: null,
+  copilot: "idle",
+  authed: false,
+};
+
+const LOOM_BUSY = ["countdown", "recording", "stopping", "uploading"];
+const COPILOT_ACTIVE = ["starting", "listening", "reconnecting", "ending"];
 
 function emitAction(payload: unknown) {
   void emit("wolfee-action", payload);
 }
 
 export function RecorderPanel() {
-  const [mode, setMode] = useState<Mode>("screen");
+  const [tab, setTab] = useState<Tab>("record");
+  const [app, setApp] = useState<WolfeeState>(DEFAULT_STATE);
+  const [uploadPct, setUploadPct] = useState(0);
+
+  // Record-tab device state.
   const [cameras, setCameras] = useState<Device[]>([]);
   const [mics, setMics] = useState<Device[]>([]);
   const [cameraId, setCameraId] = useState<string | null>(null);
@@ -56,6 +90,25 @@ export function RecorderPanel() {
   const previewRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
 
+  const loomBusy = LOOM_BUSY.includes(app.loom);
+  const copilotActive = COPILOT_ACTIVE.includes(app.copilot);
+
+  // ── App-state plumbing ────────────────────────────────────────────
+  useEffect(() => {
+    emitAction("request-wolfee-state");
+    let offState: (() => void) | undefined;
+    let offProg: (() => void) | undefined;
+    void listen<WolfeeState>("wolfee-state", (e) => setApp(e.payload)).then((f) => (offState = f));
+    void listen<number>("wolfee-loom-progress", (e) => setUploadPct(e.payload)).then(
+      (f) => (offProg = f),
+    );
+    return () => {
+      offState?.();
+      offProg?.();
+    };
+  }, []);
+
+  // ── Device enumeration + preview (Record tab) ─────────────────────
   const stopPreview = useCallback(() => {
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
@@ -73,7 +126,7 @@ export function RecorderPanel() {
       setMicId((cur) => cur ?? auds[0]?.deviceId ?? null);
       setCameraId((cur) => cur ?? vids[0]?.deviceId ?? null);
     } catch {
-      /* enumeration failure — leave lists empty */
+      /* ignore */
     }
   }, []);
 
@@ -87,9 +140,8 @@ export function RecorderPanel() {
     };
   }, [refreshDevices, stopPreview]);
 
-  // Live webcam preview. Runs whenever the camera is toggled on (or
-  // we're in webcam-only mode, where the camera is mandatory).
-  const wantCamera = cameraOn || mode === "webcam";
+  // Preview only while the setup UI is actually visible.
+  const wantCamera = tab === "record" && cameraOn && app.loom === "idle";
   useEffect(() => {
     let cancelled = false;
     if (!wantCamera) {
@@ -109,7 +161,6 @@ export function RecorderPanel() {
         stopPreview();
         streamRef.current = stream;
         if (previewRef.current) previewRef.current.srcObject = stream;
-        // Labels become available once a camera stream is live.
         void refreshDevices();
       } catch {
         if (!cancelled) setCameraOn(false);
@@ -120,43 +171,36 @@ export function RecorderPanel() {
     };
   }, [wantCamera, cameraId, refreshDevices, stopPreview]);
 
-  const cameraLabel = cameras.find((c) => c.id === cameraId)?.label ?? "No camera detected";
-  const micLabel = mics.find((m) => m.id === micId)?.label ?? "No microphone detected";
-
   function handleStart() {
-    if (starting) return;
+    if (starting || loomBusy || copilotActive) return;
     setStarting(true);
     stopPreview();
-    // Iteration 1: trigger the existing native capture flow. It
-    // records the primary display + mic + system audio — which is
-    // exactly the panel's defaults. Wiring the per-device selections
-    // through is the next iteration.
     emitAction("loom-record-screen");
   }
 
-  function handleCancel() {
+  function handleClose() {
     stopPreview();
     emitAction("cancel-recorder-panel");
   }
 
   return (
     <div
-      className="flex h-screen w-screen items-center justify-center font-sans"
+      className="flex h-screen w-screen items-start justify-center pt-2 font-sans"
       style={{ colorScheme: "light" }}
     >
       <div className="relative w-[324px] overflow-visible rounded-[18px] bg-white text-[#1c1c1e] shadow-[0_14px_44px_rgba(0,0,0,0.30)]">
-        {/* ── Header: mode tabs + close ───────────────────────── */}
+        {/* ── Header: tabs + close ────────────────────────────── */}
         <div
           data-tauri-drag-region
           className="flex items-center justify-between px-3 pb-1.5 pt-3"
         >
           <div className="flex items-center gap-1">
-            <ModeTab icon={Monitor} active={mode === "screen"} onClick={() => setMode("screen")} label="Screen" />
-            <ModeTab icon={Video} active={mode === "webcam"} onClick={() => setMode("webcam")} label="Webcam" />
-            <ModeTab icon={Camera} active={false} disabled label="Screenshot (soon)" />
+            <TabButton icon={Video} label="Record" active={tab === "record"} onClick={() => setTab("record")} />
+            <TabButton icon={BrainCircuit} label="Copilot" active={tab === "copilot"} onClick={() => setTab("copilot")} />
+            <TabButton icon={Camera} label="Screenshot (soon)" active={false} disabled />
           </div>
           <button
-            onClick={handleCancel}
+            onClick={handleClose}
             aria-label="Close"
             className="grid h-7 w-7 place-items-center rounded-lg text-[#8a8a8e] transition-colors hover:bg-[#f0f0f2] hover:text-[#1c1c1e]"
           >
@@ -165,136 +209,39 @@ export function RecorderPanel() {
         </div>
 
         {/* ── Body ────────────────────────────────────────────── */}
-        <div className="space-y-1.5 px-3 pb-2">
-          {mode === "webcam" && (
-            <div className="flex justify-center py-1">
-              <CameraCircle on={wantCamera} videoRef={previewRef} size={132} />
-            </div>
-          )}
-
-          {mode === "screen" && (
-            <DeviceRow
-              icon={Monitor}
-              label="Full screen"
-              open={openDd === "screen"}
-              onClick={() => setOpenDd(openDd === "screen" ? null : "screen")}
-            >
-              <Menu>
-                <MenuItem icon={Monitor} label="Full screen" selected onClick={() => setOpenDd(null)} />
-                <MenuItem icon={Monitor} label="Specific window" hint="Soon" disabled />
-                <MenuItem icon={Monitor} label="Custom size" hint="Soon" disabled />
-                <MenuDivider />
-                <MenuItem
-                  icon={Video}
-                  label="Camera only"
-                  onClick={() => {
-                    setMode("webcam");
-                    setOpenDd(null);
-                  }}
-                />
-              </Menu>
-            </DeviceRow>
-          )}
-
-          <DeviceRow
-            icon={Video}
-            label={wantCamera ? cameraLabel : "Camera"}
-            open={openDd === "camera"}
-            badge={mode === "webcam" ? "on" : cameraOn ? "on" : "off"}
-            onBadgeClick={mode === "webcam" ? undefined : () => setCameraOn((v) => !v)}
-            onClick={() => setOpenDd(openDd === "camera" ? null : "camera")}
-          >
-            <Menu>
-              {mode !== "webcam" && (
-                <MenuItem
-                  icon={Video}
-                  label="No camera"
-                  selected={!cameraOn}
-                  onClick={() => {
-                    setCameraOn(false);
-                    setOpenDd(null);
-                  }}
-                />
-              )}
-              {cameras.length === 0 && <MenuEmpty label="No cameras found" />}
-              {cameras.map((c) => (
-                <MenuItem
-                  key={c.id}
-                  icon={Video}
-                  label={c.label}
-                  selected={wantCamera && cameraId === c.id}
-                  onClick={() => {
-                    setCameraId(c.id);
-                    setCameraOn(true);
-                    setOpenDd(null);
-                  }}
-                />
-              ))}
-            </Menu>
-          </DeviceRow>
-
-          <DeviceRow
-            icon={Mic}
-            label={micOn ? micLabel : "Microphone"}
-            open={openDd === "mic"}
-            badge={micOn ? "on" : "off"}
-            onBadgeClick={() => setMicOn((v) => !v)}
-            onClick={() => setOpenDd(openDd === "mic" ? null : "mic")}
-          >
-            <Menu>
-              {mics.length === 0 && <MenuEmpty label="No microphones found" />}
-              {mics.map((m) => (
-                <MenuItem
-                  key={m.id}
-                  icon={Mic}
-                  label={m.label}
-                  selected={micOn && micId === m.id}
-                  onClick={() => {
-                    setMicId(m.id);
-                    setMicOn(true);
-                    setOpenDd(null);
-                  }}
-                />
-              ))}
-              <MenuDivider />
-              <MenuToggle
-                label="Noise filter"
-                hint="Soon"
-                disabled
-                checked={noiseFilter}
-                onChange={setNoiseFilter}
-              />
-              <MenuToggle
-                label="Record computer sounds"
-                checked={computerSounds}
-                onChange={setComputerSounds}
-              />
-            </Menu>
-          </DeviceRow>
-
-          {mode === "screen" && cameraOn && (
-            <div className="flex items-center gap-2 px-1 pt-0.5">
-              <CameraCircle on videoRef={previewRef} size={52} />
-              <span className="text-[11px] text-[#8a8a8e]">Webcam preview</span>
-            </div>
-          )}
-
-          <button
-            onClick={handleStart}
-            disabled={starting}
-            className={clsx(
-              "mt-1.5 h-[42px] w-full rounded-[11px] text-[14px] font-semibold text-white transition-colors",
-              starting ? "cursor-default bg-[#f0926f]" : "bg-[#fb5b36] hover:bg-[#ea4f2c]",
-            )}
-          >
-            {starting ? "Starting…" : "Start recording"}
-          </button>
-        </div>
+        {tab === "record" ? (
+          <RecordTab
+            app={app}
+            uploadPct={uploadPct}
+            copilotActive={copilotActive}
+            starting={starting}
+            cameras={cameras}
+            mics={mics}
+            cameraId={cameraId}
+            micId={micId}
+            cameraOn={cameraOn}
+            micOn={micOn}
+            computerSounds={computerSounds}
+            noiseFilter={noiseFilter}
+            openDd={openDd}
+            previewRef={previewRef}
+            setCameraId={setCameraId}
+            setMicId={setMicId}
+            setCameraOn={setCameraOn}
+            setMicOn={setMicOn}
+            setComputerSounds={setComputerSounds}
+            setNoiseFilter={setNoiseFilter}
+            setOpenDd={setOpenDd}
+            onStart={handleStart}
+          />
+        ) : (
+          <CopilotTab app={app} loomBusy={loomBusy} />
+        )}
 
         {/* ── Footer ──────────────────────────────────────────── */}
         <div className="mt-1 flex items-stretch border-t border-[#efeff1]">
-          <FooterButton icon={Smile} label="Effects" disabled />
           <FooterButton icon={StickyNote} label="Notes" disabled />
+          <FooterButton icon={Settings} label="Settings" disabled />
           <div className="relative flex-1">
             <FooterButton
               icon={MoreHorizontal}
@@ -303,7 +250,7 @@ export function RecorderPanel() {
               onClick={() => setOpenDd(openDd === "more" ? null : "more")}
             />
             {openDd === "more" && (
-              <div className="absolute bottom-[calc(100%+6px)] right-2 z-50 w-44 overflow-hidden rounded-xl border border-[#ececef] bg-white py-1 shadow-[0_10px_30px_rgba(0,0,0,0.18)]">
+              <div className="absolute bottom-[calc(100%+6px)] right-2 z-50 w-48 overflow-hidden rounded-xl border border-[#ececef] bg-white py-1 shadow-[0_10px_30px_rgba(0,0,0,0.18)]">
                 <MenuItem
                   icon={HelpCircle}
                   label="Help"
@@ -312,56 +259,414 @@ export function RecorderPanel() {
                     setOpenDd(null);
                   }}
                 />
+                <MenuItem icon={Sparkles} label="Check for updates" hint="Soon" disabled />
                 <MenuItem icon={MoreHorizontal} label="About Wolfee" hint="Soon" disabled />
+                <MenuDivider />
+                <MenuItem
+                  icon={LogOut}
+                  label="Quit Wolfee"
+                  onClick={() => emitAction("quit-app")}
+                />
               </div>
             )}
           </div>
         </div>
 
-        {/* Click-away backdrop for any open dropdown. */}
         {openDd && (
-          <div
-            className="fixed inset-0 z-40"
-            onClick={() => setOpenDd(null)}
-            aria-hidden
-          />
+          <div className="fixed inset-0 z-40" onClick={() => setOpenDd(null)} aria-hidden />
         )}
       </div>
     </div>
   );
 }
 
-/* ── Sub-components ───────────────────────────────────────────── */
+/* ── Record tab ───────────────────────────────────────────────── */
+
+type RecordTabProps = {
+  app: WolfeeState;
+  uploadPct: number;
+  copilotActive: boolean;
+  starting: boolean;
+  cameras: Device[];
+  mics: Device[];
+  cameraId: string | null;
+  micId: string | null;
+  cameraOn: boolean;
+  micOn: boolean;
+  computerSounds: boolean;
+  noiseFilter: boolean;
+  openDd: DropdownId;
+  previewRef: RefObject<HTMLVideoElement>;
+  setCameraId: Dispatch<SetStateAction<string | null>>;
+  setMicId: Dispatch<SetStateAction<string | null>>;
+  setCameraOn: Dispatch<SetStateAction<boolean>>;
+  setMicOn: Dispatch<SetStateAction<boolean>>;
+  setComputerSounds: Dispatch<SetStateAction<boolean>>;
+  setNoiseFilter: Dispatch<SetStateAction<boolean>>;
+  setOpenDd: Dispatch<SetStateAction<DropdownId>>;
+  onStart: () => void;
+};
+
+function RecordTab(p: RecordTabProps) {
+  const { app, uploadPct } = p;
+
+  // Active-recording lifecycle views.
+  if (app.loom === "countdown")
+    return <StatusBody tone="accent" title="Recording starts in 3…" sub="Switch to what you want to capture." />;
+  if (app.loom === "recording")
+    return (
+      <StatusBody tone="rec" title="● Recording" sub="Recording your screen.">
+        <BigButton color="rec" label="Stop recording" onClick={() => emitAction("loom-stop-recording")} />
+      </StatusBody>
+    );
+  if (app.loom === "stopping")
+    return <StatusBody tone="muted" title="Finishing recording…" sub="Saving the video file." />;
+  if (app.loom === "uploading")
+    return (
+      <StatusBody tone="accent" title={`Uploading… ${uploadPct}%`} sub="Sending your recording to Wolfee.">
+        <Progress pct={uploadPct} />
+      </StatusBody>
+    );
+  if (app.loom === "complete")
+    return (
+      <StatusBody tone="ok" title="✅ Recording uploaded" sub="The share link is on your clipboard.">
+        <BigButton color="accent" label="Open & copy link" onClick={() => emitAction("loom-open-recording")} />
+        <TextButton label="Done" onClick={() => emitAction("loom-dismiss")} />
+      </StatusBody>
+    );
+  if (app.loom === "failed")
+    return (
+      <StatusBody tone="bad" title="❌ Recording failed" sub={app.loomError ?? "Something went wrong."}>
+        <BigButton color="neutral" label="Dismiss" onClick={() => emitAction("loom-dismiss")} />
+      </StatusBody>
+    );
+
+  // ── Setup view (loom idle) ──
+  const cameraLabel = p.cameras.find((c) => c.id === p.cameraId)?.label ?? "No camera detected";
+  const micLabel = p.mics.find((m) => m.id === p.micId)?.label ?? "No microphone detected";
+  const blocked = p.copilotActive;
+
+  return (
+    <div className="space-y-1.5 px-3 pb-2">
+      <DeviceRow
+        icon={Monitor}
+        label="Full screen"
+        open={p.openDd === "screen"}
+        onClick={() => p.setOpenDd(p.openDd === "screen" ? null : "screen")}
+      >
+        <Menu>
+          <MenuItem icon={Monitor} label="Full screen" selected onClick={() => p.setOpenDd(null)} />
+          <MenuItem icon={Monitor} label="Specific window" hint="Soon" disabled />
+          <MenuItem icon={Monitor} label="Custom size" hint="Soon" disabled />
+        </Menu>
+      </DeviceRow>
+
+      <DeviceRow
+        icon={Video}
+        label={p.cameraOn ? cameraLabel : "Camera"}
+        open={p.openDd === "camera"}
+        badge={p.cameraOn ? "on" : "off"}
+        onBadgeClick={() => p.setCameraOn((v) => !v)}
+        onClick={() => p.setOpenDd(p.openDd === "camera" ? null : "camera")}
+      >
+        <Menu>
+          <MenuItem
+            icon={Video}
+            label="No camera"
+            selected={!p.cameraOn}
+            onClick={() => {
+              p.setCameraOn(() => false);
+              p.setOpenDd(null);
+            }}
+          />
+          {p.cameras.length === 0 && <MenuEmpty label="No cameras found" />}
+          {p.cameras.map((c) => (
+            <MenuItem
+              key={c.id}
+              icon={Video}
+              label={c.label}
+              selected={p.cameraOn && p.cameraId === c.id}
+              onClick={() => {
+                p.setCameraId(c.id);
+                p.setCameraOn(() => true);
+                p.setOpenDd(null);
+              }}
+            />
+          ))}
+        </Menu>
+      </DeviceRow>
+
+      <DeviceRow
+        icon={Mic}
+        label={p.micOn ? micLabel : "Microphone"}
+        open={p.openDd === "mic"}
+        badge={p.micOn ? "on" : "off"}
+        onBadgeClick={() => p.setMicOn((v) => !v)}
+        onClick={() => p.setOpenDd(p.openDd === "mic" ? null : "mic")}
+      >
+        <Menu>
+          {p.mics.length === 0 && <MenuEmpty label="No microphones found" />}
+          {p.mics.map((m) => (
+            <MenuItem
+              key={m.id}
+              icon={Mic}
+              label={m.label}
+              selected={p.micOn && p.micId === m.id}
+              onClick={() => {
+                p.setMicId(m.id);
+                p.setMicOn(() => true);
+                p.setOpenDd(null);
+              }}
+            />
+          ))}
+          <MenuDivider />
+          <MenuToggle label="Noise filter" hint="Soon" disabled checked={p.noiseFilter} onChange={p.setNoiseFilter} />
+          <MenuToggle label="Record computer sounds" checked={p.computerSounds} onChange={p.setComputerSounds} />
+        </Menu>
+      </DeviceRow>
+
+      {p.cameraOn && (
+        <div className="flex items-center gap-2 px-1 pt-0.5">
+          <CameraCircle videoRef={p.previewRef} size={52} />
+          <span className="text-[11px] text-[#8a8a8e]">Webcam preview</span>
+        </div>
+      )}
+
+      <button
+        onClick={p.onStart}
+        disabled={p.starting || blocked}
+        className={clsx(
+          "mt-1.5 h-[42px] w-full rounded-[11px] text-[14px] font-semibold text-white transition-colors",
+          p.starting || blocked ? "cursor-default bg-[#f0926f]" : "bg-[#fb5b36] hover:bg-[#ea4f2c]",
+        )}
+      >
+        {p.starting ? "Starting…" : "Start recording"}
+      </button>
+      {blocked && (
+        <p className="px-1 pt-1 text-center text-[11px] text-[#9a9a9e]">
+          End your Copilot session to record.
+        </p>
+      )}
+    </div>
+  );
+}
+
+/* ── Copilot tab ──────────────────────────────────────────────── */
+
+function CopilotTab({ app, loomBusy }: { app: WolfeeState; loomBusy: boolean }) {
+  const c = app.copilot;
+  const inSession = COPILOT_ACTIVE.includes(c);
+  const transient = c === "starting" || c === "ending";
+
+  const statusText =
+    c === "listening"
+      ? "● Listening"
+      : c === "reconnecting"
+        ? "⚠ Reconnecting…"
+        : c === "starting"
+          ? "Starting session…"
+          : c === "ending"
+            ? "Ending session…"
+            : c === "overlay"
+              ? "Overlay open · idle"
+              : "Idle";
+  const tone: Tone =
+    c === "listening" ? "ok" : c === "reconnecting" ? "bad" : transient ? "muted" : "neutral";
+
+  return (
+    <div className="space-y-1.5 px-3 pb-2">
+      <div className={clsx("rounded-xl px-3 py-3", toneBg(tone))}>
+        <p className="text-[11px] font-semibold uppercase tracking-wide text-[#8a8a8e]">Copilot</p>
+        <p className={clsx("text-[15px] font-semibold", toneText(tone))}>{statusText}</p>
+      </div>
+
+      {!inSession ? (
+        <>
+          <button
+            onClick={() => !loomBusy && emitAction("start-copilot-session")}
+            disabled={loomBusy}
+            className={clsx(
+              "h-[42px] w-full rounded-[11px] text-[14px] font-semibold text-white transition-colors",
+              loomBusy ? "cursor-default bg-[#9bb3e8]" : "bg-[#2f6bff] hover:bg-[#2a60e6]",
+            )}
+          >
+            Start Copilot session
+          </button>
+          {loomBusy && (
+            <p className="px-1 text-center text-[11px] text-[#9a9a9e]">Stop your recording first.</p>
+          )}
+        </>
+      ) : (
+        <button
+          onClick={() => !transient && emitAction("end-copilot-session")}
+          disabled={transient}
+          className={clsx(
+            "h-[42px] w-full rounded-[11px] text-[14px] font-semibold transition-colors",
+            transient
+              ? "cursor-default bg-[#f1f1f3] text-[#a0a0a5]"
+              : "bg-[#f1f1f3] text-[#1c1c1e] hover:bg-[#e8e8ec]",
+          )}
+        >
+          {transient ? "Please wait…" : "End Copilot session"}
+        </button>
+      )}
+
+      <LinkRow icon={Monitor} label="Open Copilot overlay" hint="⌘⌥W" onClick={() => emitAction("open-copilot-overlay")} />
+      <LinkRow icon={Settings} label="Set up Copilot" onClick={() => emitAction("open-copilot-settings")} />
+      <LinkRow
+        icon={LayoutGrid}
+        label="Manage Modes"
+        onClick={() => emitAction({ type: "open-external-url", url: "https://wolfee.io/copilot/modes" })}
+      />
+      <LinkRow icon={Sparkles} label="Onboarding tour" onClick={() => emitAction("show-onboarding")} />
+    </div>
+  );
+}
+
+/* ── Shared bits ──────────────────────────────────────────────── */
 
 type IconType = typeof Monitor;
+type Tone = "neutral" | "accent" | "rec" | "ok" | "bad" | "muted";
 
-function ModeTab({
+function toneBg(t: Tone): string {
+  return {
+    neutral: "bg-[#f4f4f6]",
+    accent: "bg-[#eef2fe]",
+    rec: "bg-[#fdecea]",
+    ok: "bg-[#e9f7ee]",
+    bad: "bg-[#fdeceb]",
+    muted: "bg-[#f4f4f6]",
+  }[t];
+}
+function toneText(t: Tone): string {
+  return {
+    neutral: "text-[#1c1c1e]",
+    accent: "text-[#2f6bff]",
+    rec: "text-[#e0402a]",
+    ok: "text-[#1faa4f]",
+    bad: "text-[#e0402a]",
+    muted: "text-[#6b6b70]",
+  }[t];
+}
+
+function StatusBody({
+  tone,
+  title,
+  sub,
+  children,
+}: {
+  tone: Tone;
+  title: string;
+  sub: string;
+  children?: ReactNode;
+}) {
+  return (
+    <div className="space-y-2 px-3 pb-3 pt-1">
+      <div className={clsx("rounded-xl px-3 py-4 text-center", toneBg(tone))}>
+        <p className={clsx("text-[16px] font-semibold", toneText(tone))}>{title}</p>
+        <p className="mt-0.5 text-[12px] text-[#8a8a8e]">{sub}</p>
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function Progress({ pct }: { pct: number }) {
+  return (
+    <div className="h-2 w-full overflow-hidden rounded-full bg-[#ececef]">
+      <div
+        className="h-full rounded-full bg-[#2f6bff] transition-all"
+        style={{ width: `${Math.max(0, Math.min(100, pct))}%` }}
+      />
+    </div>
+  );
+}
+
+function BigButton({
+  color,
+  label,
+  onClick,
+}: {
+  color: "accent" | "rec" | "neutral";
+  label: string;
+  onClick: () => void;
+}) {
+  const cls = {
+    accent: "bg-[#2f6bff] hover:bg-[#2a60e6] text-white",
+    rec: "bg-[#fb5b36] hover:bg-[#ea4f2c] text-white",
+    neutral: "bg-[#f1f1f3] hover:bg-[#e8e8ec] text-[#1c1c1e]",
+  }[color];
+  return (
+    <button
+      onClick={onClick}
+      className={clsx("h-[42px] w-full rounded-[11px] text-[14px] font-semibold transition-colors", cls)}
+    >
+      {label}
+    </button>
+  );
+}
+
+function TextButton({ label, onClick }: { label: string; onClick: () => void }) {
+  return (
+    <button
+      onClick={onClick}
+      className="h-8 w-full text-[12.5px] font-medium text-[#8a8a8e] transition-colors hover:text-[#1c1c1e]"
+    >
+      {label}
+    </button>
+  );
+}
+
+function TabButton({
   icon: Icon,
+  label,
   active,
   disabled,
   onClick,
-  label,
 }: {
   icon: IconType;
+  label: string;
   active: boolean;
   disabled?: boolean;
   onClick?: () => void;
-  label: string;
 }) {
   return (
     <button
       onClick={onClick}
       disabled={disabled}
       title={label}
-      aria-label={label}
       className={clsx(
-        "grid h-8 w-9 place-items-center rounded-[9px] transition-colors",
+        "flex h-8 items-center gap-1.5 rounded-[9px] px-2.5 text-[12.5px] font-semibold transition-colors",
         active && "bg-[#2f6bff] text-white",
         !active && !disabled && "text-[#6b6b70] hover:bg-[#f0f0f2]",
         disabled && "cursor-not-allowed text-[#c4c4c8]",
       )}
     >
-      <Icon size={17} />
+      <Icon size={15} />
+      {!disabled && <span>{label}</span>}
+    </button>
+  );
+}
+
+function LinkRow({
+  icon: Icon,
+  label,
+  hint,
+  onClick,
+}: {
+  icon: IconType;
+  label: string;
+  hint?: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className="flex h-[40px] w-full items-center gap-2.5 rounded-xl bg-[#f4f4f6] px-3 text-left transition-colors hover:bg-[#ededf0]"
+    >
+      <Icon size={16} className="shrink-0 text-[#3a3a3e]" />
+      <span className="flex-1 truncate text-[13px] font-medium">{label}</span>
+      {hint && <span className="text-[10.5px] font-semibold text-[#a8a8ad]">{hint}</span>}
     </button>
   );
 }
@@ -421,7 +726,7 @@ function DeviceRow({
   );
 }
 
-function Menu({ children }: { children: React.ReactNode }) {
+function Menu({ children }: { children: ReactNode }) {
   return (
     <div className="absolute left-0 right-0 top-[calc(100%+4px)] z-50 overflow-hidden rounded-xl border border-[#ececef] bg-white py-1 shadow-[0_12px_32px_rgba(0,0,0,0.20)]">
       {children}
@@ -512,26 +817,15 @@ function MenuToggle({
   );
 }
 
-function CameraCircle({
-  on,
-  videoRef,
-  size,
-}: {
-  on: boolean;
-  videoRef: RefObject<HTMLVideoElement>;
-  size: number;
-}) {
+function CameraCircle({ videoRef, size }: { videoRef: RefObject<HTMLVideoElement>; size: number }) {
   return (
-    <div
-      className="overflow-hidden rounded-full bg-[#e9e9ec]"
-      style={{ width: size, height: size }}
-    >
+    <div className="overflow-hidden rounded-full bg-[#e9e9ec]" style={{ width: size, height: size }}>
       <video
         ref={videoRef}
         autoPlay
         muted
         playsInline
-        className={clsx("h-full w-full object-cover", !on && "hidden")}
+        className="h-full w-full object-cover"
         style={{ transform: "scaleX(-1)" }}
       />
     </div>
