@@ -117,7 +117,17 @@ fn current_loom_state<R: Runtime>(app: &AppHandle<R>) -> LoomState {
 /// Broadcast the full app state to the unified panel. Called whenever
 /// Loom or Copilot state changes (via the `update_tray_*` functions)
 /// and on the panel's `request-wolfee-state`.
-pub fn emit_wolfee_state<R: Runtime>(app: &AppHandle<R>) {
+/// Build + emit the `wolfee-state` payload using a caller-supplied
+/// `authed` flag — so this never locks `auth_token` itself.
+///
+/// This is load-bearing. Callers routinely invoke `update_tray_menu`
+/// with `state.auth_token.lock().unwrap().is_some()` as the 4th
+/// argument. Rust keeps that temporary `MutexGuard` alive until the
+/// end of the *statement*, so the lock is still held during the call.
+/// Re-locking the same non-reentrant `std::sync::Mutex` on the same
+/// thread inside here would deadlock — which is exactly what froze the
+/// `link-account` handler before it could spawn the link poller.
+fn emit_wolfee_state_inner<R: Runtime>(app: &AppHandle<R>, authed: bool) {
     let state = app.try_state::<AppState>();
     let loom = current_loom_state(app);
     let loom_error = state
@@ -126,10 +136,6 @@ pub fn emit_wolfee_state<R: Runtime>(app: &AppHandle<R>) {
     let loom_share = state
         .as_ref()
         .and_then(|s| s.loom_share_url.lock().unwrap().clone());
-    let authed = state
-        .as_ref()
-        .map(|s| s.auth_token.lock().unwrap().is_some())
-        .unwrap_or(false);
 
     let payload = serde_json::json!({
         "loom": loom.to_string(),
@@ -139,6 +145,16 @@ pub fn emit_wolfee_state<R: Runtime>(app: &AppHandle<R>) {
         "authed": authed,
     });
     let _ = app.emit("wolfee-state", payload);
+}
+
+pub fn emit_wolfee_state<R: Runtime>(app: &AppHandle<R>) {
+    // Standalone callers (request-wolfee-state, tray click) do not
+    // hold the auth lock, so reading it here is safe.
+    let authed = app
+        .try_state::<AppState>()
+        .map(|s| s.auth_token.lock().unwrap().is_some())
+        .unwrap_or(false);
+    emit_wolfee_state_inner(app, authed);
 }
 
 // ── Tray refresh entry points (signatures kept for lib.rs) ──────────
@@ -151,8 +167,12 @@ pub fn update_tray_menu<R: Runtime>(
     state: RecordingState,
     is_authenticated: bool,
 ) {
-    let _ = (tray, state, is_authenticated);
-    emit_wolfee_state(app);
+    let _ = (tray, state);
+    // Use the caller-supplied auth flag — the caller usually still
+    // holds the auth_token MutexGuard while calling this (it's the
+    // 4th argument), so re-locking it via emit_wolfee_state would
+    // deadlock the thread. This was the link-poll-never-starts bug.
+    emit_wolfee_state_inner(app, is_authenticated);
 }
 
 /// Loom recorder refresh — updates the menu-bar glyph and re-broadcasts
