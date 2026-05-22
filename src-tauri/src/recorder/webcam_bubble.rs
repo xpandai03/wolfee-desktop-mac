@@ -1,18 +1,17 @@
-//! Floating webcam bubble window (recorder — iteration 3).
+//! Floating webcam bubble window (recorder — iterations 3 & 4).
 //!
-//! A frameless, transparent, always-on-top circular window showing the
-//! presenter's camera. Unlike the panel and (future) control bar, the
-//! bubble is **deliberately NOT content-protected** — it must appear
-//! in ScreenCaptureKit's output so viewers see the presenter's face in
-//! the recorded video, exactly like Loom's bubble.
+//! A frameless, transparent, always-on-top window showing the
+//! presenter's camera. Deliberately **NOT content-protected** — it
+//! must appear in ScreenCaptureKit's output so viewers see the
+//! presenter's face, like Loom's bubble.
 //!
-//!   panel / control bar → `set_content_protected(true)` → hidden from capture
-//!   webcam bubble        → no content protection         → captured ✅
+//! Three sizes (iteration 4):
+//!   - small  — 200 px circle  (discreet, screen-focused recordings)
+//!   - medium — 400 px circle  (default; clearly visible face)
+//!   - large  — fills the display (talking-head / video messages)
 //!
-//! The bubble is opened when the user turns the camera on in the
-//! panel, persists through recording after the panel closes, and is
-//! destroyed on stop / cancel / camera-off. It is the only window
-//! that calls `getUserMedia`, so there is no camera contention.
+//! The window is destroyed on stop / cancel / camera-off. It is the
+//! only window that calls `getUserMedia`, so there's no contention.
 
 use tauri::{
     AppHandle, LogicalSize, Manager, PhysicalPosition, Runtime, WebviewUrl, WebviewWindowBuilder,
@@ -23,18 +22,18 @@ pub const WEBCAM_BUBBLE_LABEL: &str = "webcam-bubble";
 /// Transparent margin around the circle so its drop shadow has room.
 const MARGIN: f64 = 14.0;
 
-/// Circle diameter (logical px) for each size.
-fn bubble_px(size: &str) -> f64 {
+/// Circle diameter (logical px) for the floating sizes. `large` is
+/// handled separately — it fills the display.
+fn bubble_diameter(size: &str) -> f64 {
     match size {
-        "small" => 120.0,
-        "large" => 320.0,
-        _ => 200.0, // medium (default)
+        "small" => 200.0,
+        _ => 400.0, // medium (default)
     }
 }
 
-/// Window side length = circle + shadow margin on both sides.
-fn window_px(size: &str) -> f64 {
-    bubble_px(size) + MARGIN * 2.0
+/// Window side length for a floating (small/medium) bubble.
+fn floating_window_px(size: &str) -> f64 {
+    bubble_diameter(size) + MARGIN * 2.0
 }
 
 /// Open the webcam bubble (default: medium, bottom-left). Idempotent.
@@ -44,7 +43,7 @@ pub fn open_webcam_bubble<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         return Ok(());
     }
 
-    let win = window_px("medium");
+    let win = floating_window_px("medium");
     let window = WebviewWindowBuilder::new(
         app,
         WEBCAM_BUBBLE_LABEL,
@@ -58,7 +57,7 @@ pub fn open_webcam_bubble<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     .skip_taskbar(true)
     .resizable(false)
     .shadow(false)
-    .focused(false) // never steal focus from what the user is presenting
+    .focused(false)
     .inner_size(win, win)
     .visible(false)
     .build()?;
@@ -83,17 +82,32 @@ pub fn close_webcam_bubble<R: Runtime>(app: &AppHandle<R>) {
     }
 }
 
-/// Resize the bubble (small/medium/large), keeping its center fixed so
-/// it grows/shrinks in place rather than from a corner.
+/// Resize the bubble. `small`/`medium` stay floating circles (center
+/// fixed so they grow/shrink in place); `large` fills the display.
 pub fn resize_webcam_bubble<R: Runtime>(app: &AppHandle<R>, size: &str) {
     let Some(window) = app.get_webview_window(WEBCAM_BUBBLE_LABEL) else {
         return;
     };
-    let win_logical = window_px(size);
+
+    if size == "large" {
+        if let Ok(Some(m)) = window.primary_monitor() {
+            let scale = m.scale_factor();
+            let msize = m.size();
+            let mpos = m.position();
+            let _ = window.set_size(LogicalSize::new(
+                f64::from(msize.width) / scale,
+                f64::from(msize.height) / scale,
+            ));
+            let _ = window.set_position(PhysicalPosition { x: mpos.x, y: mpos.y });
+        }
+        log::info!("[Bubble] resized to large (fullscreen)");
+        return;
+    }
+
+    // small / medium — keep the bubble's center fixed.
+    let win_logical = floating_window_px(size);
     let scale = window.scale_factor().unwrap_or(2.0);
     let new_phys = (win_logical * scale) as i32;
-
-    // Capture the old center before resizing.
     let center = match (window.outer_position(), window.outer_size()) {
         (Ok(pos), Ok(sz)) => Some((
             pos.x + sz.width as i32 / 2,
@@ -101,7 +115,6 @@ pub fn resize_webcam_bubble<R: Runtime>(app: &AppHandle<R>, size: &str) {
         )),
         _ => None,
     };
-
     if let Err(e) = window.set_size(LogicalSize::new(win_logical, win_logical)) {
         log::warn!("[Bubble] resize failed: {e}");
         return;

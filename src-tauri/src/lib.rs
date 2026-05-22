@@ -132,6 +132,8 @@ fn finish_loom_failure<R: tauri::Runtime>(
     }
     tray::update_tray_for_loom(tray, handle);
     recorder::webcam_bubble::close_webcam_bubble(handle);
+    recorder::recording_ui::close_countdown(handle);
+    recorder::recording_ui::close_control_bar(handle);
     notify(handle, "Recording failed", &msg);
 }
 
@@ -1758,14 +1760,11 @@ pub fn run() {
                             // this just nudges the TCC prompt early. Non-fatal.
                             let _ = copilot::audio::permissions::ensure_microphone().await;
 
-                            // 3-2-1 countdown. Phase 1 uses a notification + delay
-                            // rather than a dedicated countdown window.
-                            notify(
-                                &handle,
-                                "Recording starts in 3 seconds…",
-                                "Switch to whatever you want to capture.",
-                            );
+                            // 3-2-1 countdown overlay (content-protected,
+                            // hidden from the recording).
+                            recorder::recording_ui::open_countdown(&handle);
                             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                            recorder::recording_ui::close_countdown(&handle);
 
                             let path = recorder::screen_capture::new_recording_path();
                             let started = tokio::task::spawn_blocking(move || {
@@ -1780,6 +1779,7 @@ pub fn run() {
                                     state.set_loom_state(LoomState::Recording);
                                     drop(state);
                                     tray::update_tray_for_loom(&tray, &handle);
+                                    recorder::recording_ui::open_control_bar(&handle);
                                     log::info!("[Loom] recording live");
                                 }
                                 Ok(Err(e)) => finish_loom_failure(&handle, &tray, e),
@@ -1802,8 +1802,9 @@ pub fn run() {
                         }
                         state.set_loom_state(LoomState::Stopping);
                         drop(state);
-                        // Stop → the bubble's job is done; close it.
+                        // Stop → tear down the in-recording UI.
                         recorder::webcam_bubble::close_webcam_bubble(handle_ref);
+                        recorder::recording_ui::close_control_bar(handle_ref);
                         tray::update_tray_for_loom(&tray_clone, handle_ref);
 
                         let tray = tray_clone.clone();
@@ -1902,12 +1903,15 @@ pub fn run() {
                                     tray::update_tray_for_loom(&tray, &handle);
                                     notify(
                                         &handle,
-                                        "Recording uploaded ✅",
-                                        &format!(
-                                            "Link copied to clipboard:\n{}",
-                                            share.share_url
-                                        ),
+                                        "Recording uploaded!",
+                                        "Link copied to clipboard.",
                                     );
+                                    // Open the videos page so the user can watch
+                                    // it process and grab the share link.
+                                    open_url(&format!(
+                                        "{}/videos",
+                                        backend_url.trim_end_matches('/')
+                                    ));
                                     // Upload succeeded — the local file is no
                                     // longer needed.
                                     let _ = std::fs::remove_file(&result.file_path);
@@ -1937,6 +1941,80 @@ pub fn run() {
                                     );
                                 }
                             }
+                        });
+                    }
+
+                    // Control bar "Discard" — stop, delete the file, no upload.
+                    #[cfg(target_os = "macos")]
+                    "loom-discard-recording" => {
+                        log::info!("[Loom] Discard requested");
+                        let state: tauri::State<'_, AppState> = handle_ref.state();
+                        if state.loom_state() != LoomState::Recording {
+                            return;
+                        }
+                        state.set_loom_state(LoomState::Stopping);
+                        drop(state);
+                        recorder::webcam_bubble::close_webcam_bubble(handle_ref);
+                        recorder::recording_ui::close_control_bar(handle_ref);
+                        tray::update_tray_for_loom(&tray_clone, handle_ref);
+
+                        let tray = tray_clone.clone();
+                        let handle = handle_ref.clone();
+                        let loom_rec = loom_recorder.clone();
+                        spawn_async("loom-discard", move || async move {
+                            if let Some(rec) = loom_rec.lock().await.take() {
+                                if let Ok(Ok(r)) =
+                                    tokio::task::spawn_blocking(move || rec.stop()).await
+                                {
+                                    let _ = std::fs::remove_file(&r.file_path);
+                                }
+                            }
+                            {
+                                let state: tauri::State<'_, AppState> = handle.state();
+                                state.set_loom_state(LoomState::Idle);
+                            }
+                            tray::update_tray_for_loom(&tray, &handle);
+                            notify(
+                                &handle,
+                                "Recording discarded",
+                                "The recording was deleted — nothing was uploaded.",
+                            );
+                        });
+                    }
+
+                    // Control bar "Restart" — discard the current take, then
+                    // re-run the whole flow (countdown → capture → control bar).
+                    #[cfg(target_os = "macos")]
+                    "loom-restart-recording" => {
+                        log::info!("[Loom] Restart requested");
+                        let state: tauri::State<'_, AppState> = handle_ref.state();
+                        if state.loom_state() != LoomState::Recording {
+                            return;
+                        }
+                        state.set_loom_state(LoomState::Stopping);
+                        drop(state);
+                        recorder::recording_ui::close_control_bar(handle_ref);
+                        tray::update_tray_for_loom(&tray_clone, handle_ref);
+
+                        let tray = tray_clone.clone();
+                        let handle = handle_ref.clone();
+                        let loom_rec = loom_recorder.clone();
+                        spawn_async("loom-restart", move || async move {
+                            if let Some(rec) = loom_rec.lock().await.take() {
+                                if let Ok(Ok(r)) =
+                                    tokio::task::spawn_blocking(move || rec.stop()).await
+                                {
+                                    let _ = std::fs::remove_file(&r.file_path);
+                                }
+                            }
+                            {
+                                let state: tauri::State<'_, AppState> = handle.state();
+                                state.set_loom_state(LoomState::Idle);
+                            }
+                            tray::update_tray_for_loom(&tray, &handle);
+                            // Re-trigger the full record flow. The webcam
+                            // bubble (if on) is left up and carries over.
+                            let _ = handle.emit("wolfee-action", "loom-record-screen");
                         });
                     }
 

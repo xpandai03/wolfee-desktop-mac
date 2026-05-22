@@ -130,13 +130,18 @@ impl ScreenRecorder {
         // 1. Pick the primary display. Phase 1 records the primary
         //    display only; multi-display selection lands with the
         //    pre-record panel (deferred — see the test plan).
-        let content = SCShareableContent::get()
-            .map_err(|e| format!("Could not list displays (screen-recording permission?): {e}"))?;
+        let content = SCShareableContent::get().map_err(|e| {
+            format!(
+                "Screen recording is blocked. Enable Wolfee under System Settings → \
+                 Privacy & Security → Screen Recording, then quit and reopen Wolfee. ({e})"
+            )
+        })?;
         let displays = content.displays();
-        let display = displays
-            .into_iter()
-            .next()
-            .ok_or_else(|| "No displays available to record.".to_string())?;
+        let display = displays.into_iter().next().ok_or_else(|| {
+            "No display available to capture. If you just granted screen-recording \
+             permission, quit and reopen Wolfee, then try again."
+                .to_string()
+        })?;
 
         // 2. Derive an aspect-correct capture size, ~1080p tall. The
         //    width/height *ratio* is unit-independent, so this is

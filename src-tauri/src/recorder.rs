@@ -15,6 +15,8 @@ pub mod uploader_v2;
 pub mod panel_window;
 // Floating webcam bubble — visible in the recording (not content-protected).
 pub mod webcam_bubble;
+// Countdown overlay + recording control bar — content-protected.
+pub mod recording_ui;
 
 /// Whether the Loom screen recorder can run on this OS/build. macOS
 /// 15+ only; always `false` off macOS. Safe to call from any module.

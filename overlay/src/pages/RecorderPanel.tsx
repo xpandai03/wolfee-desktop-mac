@@ -86,15 +86,26 @@ export function RecorderPanel() {
   const copilotActive = COPILOT_ACTIVE.includes(app.copilot);
 
   // ── App-state plumbing ────────────────────────────────────────────
+  // Register the listeners BEFORE requesting a snapshot — otherwise the
+  // `wolfee-state` reply can arrive before `listen` is wired up and be
+  // missed, leaving the panel showing a stale "idle" (so a recording
+  // in progress would wrongly render the setup view instead of Stop).
   useEffect(() => {
-    emitAction("request-wolfee-state");
     let offState: (() => void) | undefined;
     let offProg: (() => void) | undefined;
-    void listen<WolfeeState>("wolfee-state", (e) => setApp(e.payload)).then((f) => (offState = f));
-    void listen<number>("wolfee-loom-progress", (e) => setUploadPct(e.payload)).then(
-      (f) => (offProg = f),
-    );
+    let disposed = false;
+    void (async () => {
+      offState = await listen<WolfeeState>("wolfee-state", (e) => setApp(e.payload));
+      offProg = await listen<number>("wolfee-loom-progress", (e) => setUploadPct(e.payload));
+      if (disposed) {
+        offState();
+        offProg();
+        return;
+      }
+      emitAction("request-wolfee-state");
+    })();
     return () => {
+      disposed = true;
       offState?.();
       offProg?.();
     };
