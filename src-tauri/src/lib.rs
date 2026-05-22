@@ -135,6 +135,15 @@ fn finish_loom_failure<R: tauri::Runtime>(
     recorder::recording_ui::close_countdown(handle);
     recorder::recording_ui::close_control_bar(handle);
     notify(handle, "Recording failed", &msg);
+    // Notifications can be silently suppressed on a fresh install, so
+    // also reopen the panel — its Record tab renders the failure with
+    // the full message so the user always sees what went wrong.
+    {
+        let h = handle.clone();
+        let _ = handle.run_on_main_thread(move || {
+            let _ = recorder::panel_window::open_recorder_panel(&h);
+        });
+    }
 }
 
 /// Tauri-managed wrapper around the active session's intelligence
@@ -1745,26 +1754,49 @@ pub fn run() {
                         let handle = handle_ref.clone();
                         let loom_rec = loom_recorder.clone();
                         spawn_async("loom-record", move || async move {
-                            // Permissions first — fail fast before the countdown.
-                            if let Err(e) =
-                                copilot::audio::permissions::ensure_screen_recording().await
-                            {
+                            log::info!("[recorder] Start recording triggered");
+
+                            // CRITICAL: screen recording must already be
+                            // EFFECTIVE for this running process. A grant made
+                            // in the current session does not take effect
+                            // until Wolfee is restarted — attempting a capture
+                            // then fails inside ScreenCaptureKit. So we only
+                            // proceed when `preflight()` is already true, and
+                            // otherwise prompt + ask the user to restart.
+                            use copilot::audio::permissions::{
+                                probe_screen_recording, PermissionProbe,
+                            };
+                            if probe_screen_recording() != PermissionProbe::Granted {
+                                log::warn!(
+                                    "[recorder] screen-recording permission NOT effective \
+                                     for this process — prompting + asking to restart"
+                                );
+                                // Surface the macOS TCC prompt for next time.
+                                let _ =
+                                    copilot::audio::permissions::ensure_screen_recording().await;
                                 finish_loom_failure(
                                     &handle,
                                     &tray,
-                                    format!("Screen-recording permission is required: {e}"),
+                                    "Screen recording permission is needed. Turn on \
+                                     \u{201c}Wolfee Desktop\u{201d} under System Settings \u{2192} \
+                                     Privacy & Security \u{2192} Screen Recording, then QUIT \
+                                     and REOPEN Wolfee and try again."
+                                        .to_string(),
                                 );
                                 return;
                             }
-                            // Mic is folded into the recording by ScreenCaptureKit;
-                            // this just nudges the TCC prompt early. Non-fatal.
+                            log::info!("[recorder] screen-recording permission OK");
+
+                            // Mic folds into the recording via ScreenCaptureKit.
                             let _ = copilot::audio::permissions::ensure_microphone().await;
 
                             // 3-2-1 countdown overlay (content-protected,
-                            // hidden from the recording).
+                            // click-through, hidden from the recording).
+                            log::info!("[recorder] countdown shown");
                             recorder::recording_ui::open_countdown(&handle);
                             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                             recorder::recording_ui::close_countdown(&handle);
+                            log::info!("[recorder] countdown complete \u{2014} starting capture");
 
                             let path = recorder::screen_capture::new_recording_path();
                             let started = tokio::task::spawn_blocking(move || {
@@ -1778,23 +1810,30 @@ pub fn run() {
                                     let state: tauri::State<'_, AppState> = handle.state();
                                     state.set_loom_state(LoomState::Recording);
                                     drop(state);
+                                    log::info!("[recorder] LoomState \u{2192} Recording");
                                     tray::update_tray_for_loom(&tray, &handle);
                                     recorder::recording_ui::open_control_bar(&handle);
-                                    log::info!("[Loom] recording live");
+                                    log::info!("[recorder] control bar opened — recording live");
                                 }
-                                Ok(Err(e)) => finish_loom_failure(&handle, &tray, e),
-                                Err(e) => finish_loom_failure(
-                                    &handle,
-                                    &tray,
-                                    format!("recorder thread panicked: {e}"),
-                                ),
+                                Ok(Err(e)) => {
+                                    log::error!("[recorder] capture failed to start: {e}");
+                                    finish_loom_failure(&handle, &tray, e);
+                                }
+                                Err(e) => {
+                                    log::error!("[recorder] capture thread panicked: {e}");
+                                    finish_loom_failure(
+                                        &handle,
+                                        &tray,
+                                        format!("Recorder crashed while starting: {e}"),
+                                    );
+                                }
                             }
                         });
                     }
 
                     #[cfg(target_os = "macos")]
                     "loom-stop-recording" => {
-                        log::info!("[Loom] Stop Recording requested");
+                        log::info!("[recorder] Stop triggered");
                         let state: tauri::State<'_, AppState> = handle_ref.state();
                         if state.loom_state() != LoomState::Recording {
                             log::info!("[Loom] ignoring stop — state {}", state.loom_state());
@@ -1908,6 +1947,7 @@ pub fn run() {
                                     );
                                     // Open the videos page so the user can watch
                                     // it process and grab the share link.
+                                    log::info!("[recorder] upload complete — opening videos page");
                                     open_url(&format!(
                                         "{}/videos",
                                         backend_url.trim_end_matches('/')

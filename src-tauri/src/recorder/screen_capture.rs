@@ -137,6 +137,7 @@ impl ScreenRecorder {
             )
         })?;
         let displays = content.displays();
+        log::info!("[recorder] SCShareableContent OK — {} display(s)", displays.len());
         let display = displays.into_iter().next().ok_or_else(|| {
             "No display available to capture. If you just granted screen-recording \
              permission, quit and reopen Wolfee, then try again."
@@ -199,6 +200,10 @@ impl ScreenRecorder {
             .ok_or_else(|| {
                 "Failed to create the recording output — macOS 15+ is required.".to_string()
             })?;
+        log::info!(
+            "[recorder] SCRecordingOutput configured — output={}",
+            output_path.display()
+        );
 
         // 6. Build the stream, attach the recording output, go.
         let stream = SCStream::new(&filter, &config);
@@ -209,7 +214,10 @@ impl ScreenRecorder {
             .start_capture()
             .map_err(|e| format!("start_capture failed: {e}"))?;
 
-        log::info!("[Loom] screen recording started → {}", output_path.display());
+        log::info!(
+            "[recorder] SCRecordingOutput started — capturing to {}",
+            output_path.display()
+        );
         Ok(Self {
             stream,
             recording_output,

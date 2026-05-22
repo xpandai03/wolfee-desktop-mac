@@ -71,6 +71,11 @@ fn build_countdown<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     if let Err(e) = window.set_content_protected(true) {
         log::warn!("[Countdown] set_content_protected failed: {e}");
     }
+    // Purely visual: clicks pass straight through to whatever is behind,
+    // so the countdown can never be dismissed or interrupted by a click.
+    if let Err(e) = window.set_ignore_cursor_events(true) {
+        log::warn!("[Countdown] set_ignore_cursor_events failed: {e}");
+    }
     center(&window, COUNTDOWN_SIZE, COUNTDOWN_SIZE);
     window.show()?;
     Ok(())
