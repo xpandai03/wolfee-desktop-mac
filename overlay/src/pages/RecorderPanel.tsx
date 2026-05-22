@@ -448,6 +448,7 @@ function CopilotTab({ app, loomBusy }: { app: WolfeeState; loomBusy: boolean }) 
   const c = app.copilot;
   const inSession = COPILOT_ACTIVE.includes(c);
   const transient = c === "starting" || c === "ending";
+  const canSuggest = c === "listening" || c === "reconnecting";
 
   const statusText =
     c === "listening"
@@ -471,7 +472,28 @@ function CopilotTab({ app, loomBusy }: { app: WolfeeState; loomBusy: boolean }) 
         <p className={clsx("text-[15px] font-semibold", toneText(tone))}>{statusText}</p>
       </div>
 
-      {!inSession ? (
+      {!app.authed ? (
+        // Copilot needs a linked account (it mints a Deepgram token via
+        // the backend). The backend's start-copilot-session handler
+        // returns silently when unlinked — so surface linking here
+        // rather than showing a Start button that does nothing.
+        <>
+          <div className="rounded-xl bg-[#fdf3e6] px-3 py-2.5">
+            <p className="text-[12.5px] font-semibold text-[#9a6a16]">
+              Link your Wolfee account
+            </p>
+            <p className="mt-0.5 text-[11.5px] text-[#8a8a8e]">
+              Copilot needs a linked account for live meeting transcription.
+            </p>
+          </div>
+          <button
+            onClick={() => emitAction("link-account")}
+            className="h-[42px] w-full rounded-[11px] bg-[#2f6bff] text-[14px] font-semibold text-white transition-colors hover:bg-[#2a60e6]"
+          >
+            Link Account
+          </button>
+        </>
+      ) : !inSession ? (
         <>
           <button
             onClick={() => !loomBusy && emitAction("start-copilot-session")}
@@ -488,18 +510,32 @@ function CopilotTab({ app, loomBusy }: { app: WolfeeState; loomBusy: boolean }) 
           )}
         </>
       ) : (
-        <button
-          onClick={() => !transient && emitAction("end-copilot-session")}
-          disabled={transient}
-          className={clsx(
-            "h-[42px] w-full rounded-[11px] text-[14px] font-semibold transition-colors",
-            transient
-              ? "cursor-default bg-[#f1f1f3] text-[#a0a0a5]"
-              : "bg-[#f1f1f3] text-[#1c1c1e] hover:bg-[#e8e8ec]",
-          )}
-        >
-          {transient ? "Please wait…" : "End Copilot session"}
-        </button>
+        <>
+          <button
+            onClick={() => !transient && emitAction("end-copilot-session")}
+            disabled={transient}
+            className={clsx(
+              "h-[42px] w-full rounded-[11px] text-[14px] font-semibold transition-colors",
+              transient
+                ? "cursor-default bg-[#f1f1f3] text-[#a0a0a5]"
+                : "bg-[#f1f1f3] text-[#1c1c1e] hover:bg-[#e8e8ec]",
+            )}
+          >
+            {transient ? "Please wait…" : "End Copilot session"}
+          </button>
+          <button
+            onClick={() => canSuggest && emitAction("trigger-copilot-suggestion")}
+            disabled={!canSuggest}
+            className={clsx(
+              "h-[38px] w-full rounded-[11px] text-[13px] font-semibold transition-colors",
+              canSuggest
+                ? "bg-[#eef2fe] text-[#2f6bff] hover:bg-[#e3e9fd]"
+                : "cursor-default bg-[#f1f1f3] text-[#a0a0a5]",
+            )}
+          >
+            Generate suggestion · ⌘⌥G
+          </button>
+        </>
       )}
 
       <LinkRow icon={Monitor} label="Open Copilot overlay" hint="⌘⌥W" onClick={() => emitAction("open-copilot-overlay")} />
