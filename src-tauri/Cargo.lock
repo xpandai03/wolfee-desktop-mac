@@ -6909,7 +6909,7 @@ dependencies = [
 
 [[package]]
 name = "wolfee-desktop"
-version = "0.8.14"
+version = "0.8.15"
 dependencies = [
  "bytes",
  "chrono",
