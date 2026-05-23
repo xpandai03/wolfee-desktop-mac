@@ -1,6 +1,6 @@
 {
   "name": "wolfee-desktop",
-  "version": "0.8.15",
+  "version": "0.8.16",
   "description": "Wolfee Desktop Recorder — invisible meeting recorder",
   "scripts": {
     "tauri": "tauri",
