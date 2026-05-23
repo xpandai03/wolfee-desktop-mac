@@ -101,6 +101,26 @@ export function RecorderPanel() {
       return "";
     }
   });
+  // Phase 2 — active-paragraph font size (24 / 28 / 32). Persisted.
+  const [teleprompterFontSize, setTeleprompterFontSize] = useState<number>(() => {
+    try {
+      const raw = localStorage.getItem("wolfee.recorder.teleprompter.fontSize");
+      const n = raw ? parseInt(raw, 10) : NaN;
+      return n === 24 || n === 28 || n === 32 ? n : 28;
+    } catch {
+      return 28;
+    }
+  });
+  // Phase 3 — whether auto-scroll starts ON when the recording begins.
+  // The overlay's footer pill lets the user flip it mid-recording, but
+  // many users will want it on every time without thinking.
+  const [teleprompterAutoDefault, setTeleprompterAutoDefault] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem("wolfee.recorder.teleprompter.autoDefault") === "1";
+    } catch {
+      return false;
+    }
+  });
   useEffect(() => {
     try {
       localStorage.setItem(
@@ -114,6 +134,22 @@ export function RecorderPanel() {
       localStorage.setItem("wolfee.recorder.teleprompter.draft", teleprompterScript);
     } catch { /* private mode — no-op */ }
   }, [teleprompterScript]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        "wolfee.recorder.teleprompter.fontSize",
+        String(teleprompterFontSize),
+      );
+    } catch { /* private mode — no-op */ }
+  }, [teleprompterFontSize]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        "wolfee.recorder.teleprompter.autoDefault",
+        teleprompterAutoDefault ? "1" : "0",
+      );
+    } catch { /* private mode — no-op */ }
+  }, [teleprompterAutoDefault]);
 
   const loomBusy = LOOM_BUSY.includes(app.loom);
   const copilotActive = COPILOT_ACTIVE.includes(app.copilot);
@@ -185,6 +221,11 @@ export function RecorderPanel() {
       emitAction({
         type: "teleprompter-start",
         script: teleprompterScript,
+        fontSize: teleprompterFontSize,
+        autoScroll: teleprompterAutoDefault,
+        // wpm uses the AppState default (130) unless the user has
+        // changed it in a previous session — the Rust side keeps
+        // the last set value.
       });
     }
     setStarting(true);
@@ -248,6 +289,10 @@ export function RecorderPanel() {
             setTeleprompterOn={setTeleprompterOn}
             teleprompterScript={teleprompterScript}
             setTeleprompterScript={setTeleprompterScript}
+            teleprompterFontSize={teleprompterFontSize}
+            setTeleprompterFontSize={setTeleprompterFontSize}
+            teleprompterAutoDefault={teleprompterAutoDefault}
+            setTeleprompterAutoDefault={setTeleprompterAutoDefault}
           />
         ) : (
           <CopilotTab app={app} loomBusy={loomBusy} />
@@ -318,6 +363,11 @@ type RecordTabProps = {
   setTeleprompterOn: Dispatch<SetStateAction<boolean>>;
   teleprompterScript: string;
   setTeleprompterScript: Dispatch<SetStateAction<string>>;
+  // Phase 2 + 3 Teleprompter
+  teleprompterFontSize: number;
+  setTeleprompterFontSize: Dispatch<SetStateAction<number>>;
+  teleprompterAutoDefault: boolean;
+  setTeleprompterAutoDefault: Dispatch<SetStateAction<boolean>>;
 };
 
 function RecordTab(p: RecordTabProps) {
@@ -535,6 +585,49 @@ function RecordTab(p: RecordTabProps) {
                   </span>
                 )}
               </span>
+            </div>
+
+            {/* Phase 2/3 — display + pacing controls. The overlay's
+                footer pill also flips Manual/Auto mid-recording; this
+                is just the default for the next "Start recording". */}
+            <div className="mt-2.5 flex items-center justify-between gap-2 border-t border-[#2a2a2c] pt-2.5">
+              <div className="flex items-center gap-1.5 text-[10.5px] text-[#8a8a8e]">
+                <span>Size</span>
+                <div className="flex overflow-hidden rounded-md bg-[#0e0e10] ring-1 ring-[#2a2a2c]">
+                  {([
+                    { size: 24, label: "S" },
+                    { size: 28, label: "M" },
+                    { size: 32, label: "L" },
+                  ] as const).map(({ size, label }) => (
+                    <button
+                      key={size}
+                      type="button"
+                      onClick={() => p.setTeleprompterFontSize(size)}
+                      className={clsx(
+                        "h-5 w-6 text-[10.5px] font-semibold transition-colors",
+                        p.teleprompterFontSize === size
+                          ? "bg-[#2f6bff]/30 text-[#cfdcff]"
+                          : "text-[#9a9a9e] hover:bg-[#1c1c1e]",
+                      )}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => p.setTeleprompterAutoDefault((v) => !v)}
+                className={clsx(
+                  "flex items-center gap-1 rounded-md px-2 py-0.5 text-[10.5px] font-semibold transition-colors",
+                  p.teleprompterAutoDefault
+                    ? "bg-[#2f6bff]/25 text-[#9fb6ff]"
+                    : "bg-[#0e0e10] text-[#9a9a9e] ring-1 ring-[#2a2a2c] hover:text-[#c0c0c4]",
+                )}
+                title="When on, the teleprompter advances paragraphs automatically. You can flip Manual/Auto mid-recording from the overlay."
+              >
+                Auto-scroll {p.teleprompterAutoDefault ? "On" : "Off"}
+              </button>
             </div>
           </div>
         )}

@@ -1,87 +1,168 @@
 /**
- * Phase 1 Teleprompter view.
+ * Teleprompter view — Phase 1 (script overlay) + Phase 2 (smooth
+ * scroll, font-size control) + Phase 3 (time-based auto-scroll).
  *
- * Renders the user's script in the existing content-protected
- * Copilot overlay during a recording. The window is already
- * invisible to ScreenCaptureKit, so this text is visible to the
- * user but never to anyone watching the recording.
+ * Visual:
+ *   - Active paragraph at `fontSize` px (24 / 28 / 32), font-semibold.
+ *   - Surrounding paragraphs at fontSize-6 px, dimmed.
+ *   - 5-paragraph render window around lineIdx so 2000-word scripts
+ *     paint cheaply.
+ *   - CSS opacity / transform transitions on the active swap give a
+ *     gentle slide-up feel without disorienting the reader.
  *
- * Manual scroll only in Phase 1 — wheel over the view, or
- * ⌘⌥↑/↓ globally (the global hotkey emits
- * `copilot-teleprompter-scroll` → reducer SCROLL_TELEPROMPTER).
- * Phase 3 will add Deepgram-driven auto-scroll.
+ * Scroll:
+ *   - Wheel over the view → onScroll(±1, "user") → reducer advances
+ *     AND disables auto.
+ *   - Global ⌘⌥↑/↓ hotkey (Rust → SCROLL_TELEPROMPTER source="user")
+ *     does the same.
+ *   - Footer "Manual ⇄ Auto" pill toggles autoScroll.
+ *   - When auto: a setTimeout per paragraph, duration =
+ *     wordCount / wpm * 60 s. Fires SCROLL_TELEPROMPTER source="auto"
+ *     so it doesn't disable itself. Pauses if the page isn't visible.
  *
- * Visual contract:
- *   - 28 px font, line-height 1.4 for the active paragraph.
- *   - 24 px and dimmed (~50% opacity) for surrounding paragraphs.
- *   - Renders a 5-paragraph window centred on `lineIdx` so even a
- *     very long script doesn't paint the whole DOM at once.
- *   - "Line N of M" footer, right-aligned, tiny.
+ * Footer:
+ *   - "Manual ⌘⌥↑/↓" or "Auto · NNN wpm · −/+" (when auto).
+ *   - "Line N of M".
  */
-import { useRef } from "react";
+import { useEffect, useRef } from "react";
 import clsx from "clsx";
 
 type Props = {
   paragraphs: string[];
   lineIdx: number;
-  onScroll: (delta: number) => void;
+  fontSize: number;
+  autoScroll: boolean;
+  wpm: number;
+  onScroll: (delta: number, source: "user" | "auto") => void;
+  onToggleAuto: () => void;
+  onSetWpm: (wpm: number) => void;
 };
 
-export function TeleprompterView({ paragraphs, lineIdx, onScroll }: Props) {
-  // Wheel accumulator — fires one paragraph step per ~30 px of vertical
-  // wheel delta. Without this a trackpad swipe would race through the
-  // whole script.
+const WIN_SIZE = 5;
+const WHEEL_STEP = 30; // px of cumulative wheel delta per paragraph step.
+const MIN_PARAGRAPH_MS = 1200; // floor so single-word paragraphs aren't sub-second
+const MAX_PARAGRAPH_MS = 30_000; // ceiling so a giant paragraph doesn't hang
+
+function wordCount(s: string): number {
+  return s.trim().split(/\s+/).filter(Boolean).length;
+}
+
+export function TeleprompterView({
+  paragraphs,
+  lineIdx,
+  fontSize,
+  autoScroll,
+  wpm,
+  onScroll,
+  onToggleAuto,
+  onSetWpm,
+}: Props) {
+  const total = paragraphs.length;
+  const activeFontSize = fontSize;
+  const dimFontSize = Math.max(16, fontSize - 6);
+
+  // ── Wheel accumulator (Phase 1, polished) ────────────────────────
   const accum = useRef(0);
   const handleWheel = (e: React.WheelEvent<HTMLDivElement>) => {
     accum.current += e.deltaY;
-    if (accum.current > 30) {
-      onScroll(1);
+    if (accum.current > WHEEL_STEP) {
+      onScroll(1, "user");
       accum.current = 0;
-    } else if (accum.current < -30) {
-      onScroll(-1);
+    } else if (accum.current < -WHEEL_STEP) {
+      onScroll(-1, "user");
       accum.current = 0;
     }
   };
 
-  // Render a 5-paragraph window around the active line. Fixed-size
-  // window keeps layout stable as the user scrolls.
-  const total = paragraphs.length;
-  const winSize = 5;
-  let start = Math.max(0, lineIdx - 1);
-  let end = Math.min(total, start + winSize);
-  // If we're near the end, pull the start back so we still show
-  // `winSize` rows when there's room for them.
-  start = Math.max(0, end - winSize);
+  // ── Phase 3 auto-advance timer ───────────────────────────────────
+  // One timer per (lineIdx, autoScroll, wpm, paragraphs) — restarts
+  // whenever any of those change. Word count of the CURRENT paragraph
+  // determines duration so short paragraphs flow fast and long ones
+  // get the room they need. visibilityState gating keeps a hidden
+  // overlay from racing through the script while the user is in
+  // another window.
+  useEffect(() => {
+    if (!autoScroll) return;
+    if (lineIdx >= total - 1) return; // already at the last paragraph
 
+    const text = paragraphs[lineIdx] ?? "";
+    const words = Math.max(1, wordCount(text));
+    const seconds = (words / wpm) * 60;
+    const ms = Math.max(
+      MIN_PARAGRAPH_MS,
+      Math.min(MAX_PARAGRAPH_MS, seconds * 1000),
+    );
+
+    // Track elapsed time so a visibility change pauses + resumes
+    // without losing accumulated reading time.
+    let remaining = ms;
+    let startedAt = 0;
+    let handle: number | null = null;
+
+    const start = () => {
+      startedAt = Date.now();
+      handle = window.setTimeout(() => {
+        onScroll(1, "auto");
+      }, remaining);
+    };
+    const stop = () => {
+      if (handle != null) {
+        window.clearTimeout(handle);
+        handle = null;
+        remaining -= Date.now() - startedAt;
+      }
+    };
+    const onVisChange = () => {
+      if (document.visibilityState === "visible") {
+        if (remaining > 0) start();
+      } else {
+        stop();
+      }
+    };
+
+    if (document.visibilityState === "visible") start();
+    document.addEventListener("visibilitychange", onVisChange);
+    return () => {
+      stop();
+      document.removeEventListener("visibilitychange", onVisChange);
+    };
+  }, [autoScroll, lineIdx, wpm, paragraphs, total, onScroll]);
+
+  // ── 5-paragraph window centred on lineIdx ────────────────────────
+  let start = Math.max(0, lineIdx - 1);
+  let end = Math.min(total, start + WIN_SIZE);
+  start = Math.max(0, end - WIN_SIZE);
   const visible: Array<{ idx: number; text: string } | null> = [];
   for (let i = start; i < end; i++) {
     visible.push({ idx: i, text: paragraphs[i] });
   }
-  // Pad with nulls to keep the box from collapsing on short scripts.
-  while (visible.length < winSize) visible.push(null);
+  while (visible.length < WIN_SIZE) visible.push(null);
 
   return (
     <div
       onWheel={handleWheel}
       className="select-none px-6 py-5"
-      // Stop the wheel from bubbling up to the window — without this
-      // the wheel also nudges the overlay's scroll position which we
-      // don't want during teleprompter mode.
       style={{ touchAction: "none" }}
     >
       <div className="space-y-4">
         {visible.map((p, i) =>
           p === null ? (
-            <div key={`pad-${i}`} className="h-7" aria-hidden />
+            <div
+              key={`pad-${i}`}
+              style={{ height: dimFontSize * 1.4 }}
+              aria-hidden
+            />
           ) : (
             <p
               key={p.idx}
               className={clsx(
-                "leading-[1.4] transition-colors duration-150",
+                // Smooth swap on lineIdx change.
+                "leading-[1.4] transition-all duration-200 ease-out",
                 p.idx === lineIdx
-                  ? "text-[28px] font-semibold text-zinc-50"
-                  : "text-[22px] text-zinc-500/80",
+                  ? "font-semibold text-zinc-50"
+                  : "text-zinc-500/80",
               )}
+              style={{ fontSize: p.idx === lineIdx ? activeFontSize : dimFontSize }}
             >
               {p.idx === lineIdx && (
                 <span className="mr-2 text-zinc-400">▸</span>
@@ -91,8 +172,51 @@ export function TeleprompterView({ paragraphs, lineIdx, onScroll }: Props) {
           ),
         )}
       </div>
-      <div className="mt-5 flex items-center justify-between text-[11px] text-zinc-600">
-        <span className="opacity-70">⌘⌥↑/↓ to scroll · invisible to viewers</span>
+
+      {/* ── Footer: Manual/Auto · WPM · Line N of M ──────────────── */}
+      <div className="mt-5 flex items-center justify-between text-[11px] text-zinc-500">
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={onToggleAuto}
+            className={clsx(
+              "rounded-full px-2 py-0.5 font-medium transition-colors",
+              autoScroll
+                ? "bg-blue-500/25 text-blue-200"
+                : "bg-zinc-800/70 text-zinc-300 hover:bg-zinc-700/70",
+            )}
+            title={
+              autoScroll
+                ? "Auto-scroll on — paragraphs advance at the WPM rate. Click to switch to manual."
+                : "Manual scroll — wheel or ⌘⌥↑/↓ to advance. Click to enable auto-scroll."
+            }
+          >
+            {autoScroll ? "Auto" : "Manual"}
+          </button>
+          {autoScroll ? (
+            <span className="flex items-center gap-1 tabular-nums">
+              <button
+                type="button"
+                onClick={() => onSetWpm(wpm - 10)}
+                className="h-5 w-5 rounded bg-zinc-800/70 text-zinc-300 hover:bg-zinc-700/70"
+                aria-label="Slower"
+              >
+                −
+              </button>
+              <span className="w-12 text-center">{wpm} wpm</span>
+              <button
+                type="button"
+                onClick={() => onSetWpm(wpm + 10)}
+                className="h-5 w-5 rounded bg-zinc-800/70 text-zinc-300 hover:bg-zinc-700/70"
+                aria-label="Faster"
+              >
+                +
+              </button>
+            </span>
+          ) : (
+            <span className="opacity-70">⌘⌥↑/↓ to scroll · invisible to viewers</span>
+          )}
+        </div>
         <span className="tabular-nums">
           Line {Math.min(lineIdx + 1, total)} of {total}
         </span>

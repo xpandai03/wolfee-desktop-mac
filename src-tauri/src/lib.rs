@@ -554,12 +554,40 @@ fn handle_structured_action(
                 log::info!("[Teleprompter] ignoring empty script");
                 return;
             }
+            // Phase 2 + 3 — pull display + pacing prefs from the
+            // payload. All optional; missing values keep whatever's
+            // already in AppState (so a returning user gets their
+            // last font size + last WPM without the panel resending).
+            let font_size = payload
+                .get("fontSize")
+                .and_then(|v| v.as_i64())
+                .map(|n| n as i32);
+            let auto_scroll = payload.get("autoScroll").and_then(|v| v.as_bool());
+            let wpm = payload
+                .get("wpm")
+                .and_then(|v| v.as_i64())
+                .map(|n| n as i32);
             log::info!(
-                "[Teleprompter] script staged ({} chars)",
-                script.len()
+                "[Teleprompter] script staged ({} chars, font={:?}, auto={:?}, wpm={:?})",
+                script.len(),
+                font_size,
+                auto_scroll,
+                wpm,
             );
             let app_state: tauri::State<'_, AppState> = handle.state();
             *app_state.teleprompter_script.lock().unwrap() = Some(script);
+            if let Some(f) = font_size {
+                // Clamp to allowed set (24/28/32) — reducer also
+                // clamps, this is just defensive.
+                let f = if f <= 26 { 24 } else if f <= 30 { 28 } else { 32 };
+                *app_state.teleprompter_font_size.lock().unwrap() = f;
+            }
+            if let Some(a) = auto_scroll {
+                *app_state.teleprompter_auto_scroll.lock().unwrap() = a;
+            }
+            if let Some(w) = wpm {
+                *app_state.teleprompter_wpm.lock().unwrap() = w.clamp(80, 220);
+            }
         }
 
         "submit-copilot-context" => {
@@ -1501,6 +1529,9 @@ pub fn run() {
         loom_error: Mutex::new(None),
         loom_pending_upload: Mutex::new(None),
         teleprompter_script: Mutex::new(None),
+        teleprompter_font_size: Mutex::new(28),
+        teleprompter_auto_scroll: Mutex::new(false),
+        teleprompter_wpm: Mutex::new(130),
     };
 
     let backend_url = auth_config.backend_url.clone();
@@ -1946,20 +1977,31 @@ pub fn run() {
                                     // Copilot-Idle here, so the teleprompter
                                     // takes over the same content-protected window
                                     // with no conflict.
-                                    let script_opt: Option<String> = {
+                                    let tele_cfg: Option<(String, i32, bool, i32)> = {
                                         let state: tauri::State<'_, AppState> = handle.state();
-                                        let cloned =
+                                        let script =
                                             state.teleprompter_script.lock().unwrap().clone();
-                                        cloned
+                                        let font_size =
+                                            *state.teleprompter_font_size.lock().unwrap();
+                                        let auto_scroll =
+                                            *state.teleprompter_auto_scroll.lock().unwrap();
+                                        let wpm = *state.teleprompter_wpm.lock().unwrap();
+                                        script.map(|s| (s, font_size, auto_scroll, wpm))
                                     };
-                                    if let Some(script) = script_opt {
+                                    if let Some((script, font_size, auto_scroll, wpm)) = tele_cfg
+                                    {
                                         log::info!(
-                                            "[Teleprompter] opening overlay ({} chars)",
+                                            "[Teleprompter] opening overlay ({} chars, font={font_size}, auto={auto_scroll}, wpm={wpm})",
                                             script.len()
                                         );
                                         let _ = handle.emit(
                                             "copilot-teleprompter-open",
-                                            serde_json::json!({ "script": script }),
+                                            serde_json::json!({
+                                                "script": script,
+                                                "fontSize": font_size,
+                                                "autoScroll": auto_scroll,
+                                                "wpm": wpm,
+                                            }),
                                         );
                                         if let Err(e) = copilot::window::show_overlay(&handle) {
                                             log::warn!(

@@ -690,9 +690,18 @@ export function overlayReducer(
         .split(/\n\s*\n/)
         .map((p) => p.trim())
         .filter((p) => p.length > 0);
+      const fontSize = clampFontSize(action.fontSize);
+      const wpm = clampWpm(action.wpm);
       return {
         ...state,
-        teleprompter: { script: action.script, paragraphs, lineIdx: 0 },
+        teleprompter: {
+          script: action.script,
+          paragraphs,
+          lineIdx: 0,
+          fontSize,
+          autoScroll: !!action.autoScroll,
+          wpm,
+        },
       };
     }
 
@@ -708,16 +717,56 @@ export function overlayReducer(
         0,
         Math.min(max, state.teleprompter.lineIdx + action.delta),
       );
-      if (next === state.teleprompter.lineIdx) return state;
+      // User scroll (default) flips autoScroll off — the human just
+      // took manual control; respect that. The auto-advance timer
+      // passes source="auto" so it doesn't disable itself.
+      const userInitiated = action.source !== "auto";
+      const autoScroll =
+        userInitiated && state.teleprompter.autoScroll ? false : state.teleprompter.autoScroll;
+      if (next === state.teleprompter.lineIdx && autoScroll === state.teleprompter.autoScroll) {
+        return state;
+      }
       return {
         ...state,
-        teleprompter: { ...state.teleprompter, lineIdx: next },
+        teleprompter: { ...state.teleprompter, lineIdx: next, autoScroll },
       };
+    }
+
+    case "TOGGLE_TELEPROMPTER_AUTO": {
+      if (!state.teleprompter) return state;
+      return {
+        ...state,
+        teleprompter: {
+          ...state.teleprompter,
+          autoScroll: !state.teleprompter.autoScroll,
+        },
+      };
+    }
+
+    case "SET_TELEPROMPTER_WPM": {
+      if (!state.teleprompter) return state;
+      const wpm = clampWpm(action.wpm);
+      if (wpm === state.teleprompter.wpm) return state;
+      return { ...state, teleprompter: { ...state.teleprompter, wpm } };
     }
 
     default:
       return state;
   }
+}
+
+function clampFontSize(v: number | undefined): number {
+  // Three sizes, default 28. Anything out of range snaps to the nearest.
+  const allowed = [24, 28, 32];
+  if (typeof v !== "number" || !Number.isFinite(v)) return 28;
+  return allowed.reduce((best, x) =>
+    Math.abs(x - v) < Math.abs(best - v) ? x : best,
+  );
+}
+
+function clampWpm(v: number | undefined): number {
+  if (typeof v !== "number" || !Number.isFinite(v)) return 130;
+  return Math.max(80, Math.min(220, Math.round(v)));
 }
 
 // ── helpers ──────────────────────────────────────────────────────

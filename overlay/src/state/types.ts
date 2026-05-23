@@ -371,6 +371,14 @@ export interface OverlayState {
     script: string;
     paragraphs: string[];
     lineIdx: number;
+    // Phase 2 — visual.
+    fontSize: number;            // 24 | 28 | 32 (px), default 28
+    // Phase 3 — time-based auto-scroll. When true, a timer in the
+    // view advances `lineIdx` based on the current paragraph's word
+    // count and `wpm`. User wheel / hotkey scroll flips this off
+    // (an explicit override) — the footer pill flips it back on.
+    autoScroll: boolean;
+    wpm: number;                 // 80–220, default 130
   } | null;
 }
 
@@ -432,9 +440,21 @@ export type Action =
   | { type: "PAIRING_COMPLETE" }
   | { type: "SET_PERMISSION_STATUS"; payload: OnboardingPermissionStatus }
   // Phase 1 Teleprompter (Rust → overlay events drive these)
-  | { type: "SHOW_TELEPROMPTER"; script: string }
+  | {
+      type: "SHOW_TELEPROMPTER";
+      script: string;
+      // All optional — defaults applied in the reducer.
+      fontSize?: number;
+      autoScroll?: boolean;
+      wpm?: number;
+    }
   | { type: "HIDE_TELEPROMPTER" }
-  | { type: "SCROLL_TELEPROMPTER"; delta: number };
+  // delta ±1 / ±5. source="user" (wheel, ⌘⌥↑/↓) flips autoScroll OFF;
+  // source="auto" (the in-view timer) leaves autoScroll alone.
+  | { type: "SCROLL_TELEPROMPTER"; delta: number; source?: "user" | "auto" }
+  // Phase 3 controls — fired from the in-overlay footer pill / stepper.
+  | { type: "TOGGLE_TELEPROMPTER_AUTO" }
+  | { type: "SET_TELEPROMPTER_WPM"; wpm: number };
 
 export const initialOverlayState: OverlayState = {
   uiPhase: "Idle",

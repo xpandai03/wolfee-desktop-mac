@@ -152,6 +152,17 @@ pub struct AppState {
     /// stop / discard / failure so a subsequent recording doesn't
     /// inherit a stale script.
     pub teleprompter_script: Mutex<Option<String>>,
+    /// Phase 2 — active-paragraph font size in px (24 / 28 / 32).
+    /// Set from the panel's segmented control; persists across
+    /// recordings (preference, not session state).
+    pub teleprompter_font_size: Mutex<i32>,
+    /// Phase 3 — whether the overlay's auto-scroll timer is on by
+    /// default when a recording starts. The footer pill can flip it
+    /// mid-recording; this is just the starting value.
+    pub teleprompter_auto_scroll: Mutex<bool>,
+    /// Phase 3 — reading-pace words per minute for the auto-scroll
+    /// timer. Range 80–220, default 130.
+    pub teleprompter_wpm: Mutex<i32>,
 }
 
 impl AppState {

@@ -425,25 +425,38 @@ export default function CopilotOverlay() {
       //   copilot-teleprompter-scroll  { delta }    from the global hotkeys
       // The reducer's SCROLL_TELEPROMPTER ignores when not in teleprompter
       // mode so the global hotkeys are safe to leave armed.
-      teleprompterOpenUnlisten = await listen<{ script: string }>(
-        "copilot-teleprompter-open",
-        (event) => {
-          dispatch({ type: "SHOW_TELEPROMPTER", script: event.payload.script });
-          // Auto-expand if the user is in strip mode — they enabled the
-          // teleprompter for a reason, they shouldn't also have to press
-          // ⌘⌥W to see it.
-          if (modeRef.current !== "expanded") {
-            void emit("wolfee-action", "expand-overlay");
-          }
-        },
-      );
+      teleprompterOpenUnlisten = await listen<{
+        script: string;
+        fontSize?: number;
+        autoScroll?: boolean;
+        wpm?: number;
+      }>("copilot-teleprompter-open", (event) => {
+        dispatch({
+          type: "SHOW_TELEPROMPTER",
+          script: event.payload.script,
+          fontSize: event.payload.fontSize,
+          autoScroll: event.payload.autoScroll,
+          wpm: event.payload.wpm,
+        });
+        // Auto-expand if the user is in strip mode — they enabled the
+        // teleprompter for a reason, they shouldn't also have to press
+        // ⌘⌥W to see it.
+        if (modeRef.current !== "expanded") {
+          void emit("wolfee-action", "expand-overlay");
+        }
+      });
       teleprompterCloseUnlisten = await listen("copilot-teleprompter-close", () => {
         dispatch({ type: "HIDE_TELEPROMPTER" });
       });
       teleprompterScrollUnlisten = await listen<{ delta: number }>(
         "copilot-teleprompter-scroll",
         (event) => {
-          dispatch({ type: "SCROLL_TELEPROMPTER", delta: event.payload.delta });
+          // Global hotkey is user input → flips autoScroll off.
+          dispatch({
+            type: "SCROLL_TELEPROMPTER",
+            delta: event.payload.delta,
+            source: "user",
+          });
         },
       );
 
@@ -825,7 +838,14 @@ export default function CopilotOverlay() {
     <TeleprompterView
       paragraphs={overlayState.teleprompter.paragraphs}
       lineIdx={overlayState.teleprompter.lineIdx}
-      onScroll={(delta) => dispatch({ type: "SCROLL_TELEPROMPTER", delta })}
+      fontSize={overlayState.teleprompter.fontSize}
+      autoScroll={overlayState.teleprompter.autoScroll}
+      wpm={overlayState.teleprompter.wpm}
+      onScroll={(delta, source) =>
+        dispatch({ type: "SCROLL_TELEPROMPTER", delta, source })
+      }
+      onToggleAuto={() => dispatch({ type: "TOGGLE_TELEPROMPTER_AUTO" })}
+      onSetWpm={(wpm) => dispatch({ type: "SET_TELEPROMPTER_WPM", wpm })}
     />
   ) : showOnboarding ? (
     <OnboardingWizard
