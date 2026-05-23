@@ -1996,21 +1996,22 @@ pub fn run() {
                                             "[Teleprompter] opening overlay ({} chars, font={font_size}, auto={auto_scroll}, wpm={wpm})",
                                             script.len()
                                         );
-                                        // Resize FIRST so the React side never
-                                        // sees a strip-sized window — the
-                                        // expand-overlay roundtrip we used in
-                                        // 0.8.13/14 raced the emit and left
-                                        // some users staring at a 600x44 strip.
+                                        // SINGLE call: set_size → reposition
+                                        // → show, in that order. 0.8.15
+                                        // shipped two separate calls
+                                        // (resize_for_teleprompter +
+                                        // show_overlay) and show_overlay
+                                        // unconditionally calls
+                                        // set_strip_mode(), reverting the
+                                        // resize back to 600x44 — that's
+                                        // why the window opened tiny on
+                                        // every test. Fixed with one
+                                        // dedicated entry point.
                                         if let Err(e) =
-                                            copilot::window::resize_for_teleprompter(&handle)
+                                            copilot::window::show_for_teleprompter(&handle)
                                         {
                                             log::warn!(
-                                                "[Teleprompter] resize_for_teleprompter failed: {e}"
-                                            );
-                                        }
-                                        if let Err(e) = copilot::window::show_overlay(&handle) {
-                                            log::warn!(
-                                                "[Teleprompter] show_overlay failed: {e}"
+                                                "[Teleprompter] show_for_teleprompter failed: {e}"
                                             );
                                         }
                                         let _ = handle.emit(

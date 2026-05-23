@@ -11,12 +11,12 @@ const STRIP_WIDTH: f64 = 600.0;
 const STRIP_HEIGHT: f64 = 44.0;
 const EXPANDED_WIDTH: f64 = 600.0;
 const EXPANDED_HEIGHT: f64 = 520.0;
-// Dedicated teleprompter band — comfortable for 5 paragraphs of 28 px
-// text + footer at the default font size; not so tall that the user's
-// webcam preview is obscured. 600 wide keeps the position math
-// identical to strip/expanded so the top-center landing is stable.
-const TELEPROMPTER_WIDTH: f64 = 600.0;
-const TELEPROMPTER_HEIGHT: f64 = 320.0;
+// Dedicated teleprompter band — sized for readability without
+// requiring the user to drag the window. 700 wide × 350 tall fits
+// 5 paragraphs at the default 28 px font + Manual/Auto + WPM footer
+// comfortably, with the active paragraph centred vertically.
+const TELEPROMPTER_WIDTH: f64 = 700.0;
+const TELEPROMPTER_HEIGHT: f64 = 350.0;
 const TOP_MARGIN: f64 = 24.0;
 
 pub fn create_overlay_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
@@ -233,22 +233,31 @@ pub fn collapse_overlay<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     Ok(())
 }
 
-/// Resize the overlay window into teleprompter mode (~600×320) and
-/// re-center it top-center. Called BEFORE emitting
-/// `copilot-teleprompter-open` so the React side never sees a
-/// strip-sized window. Idempotent.
-pub fn resize_for_teleprompter<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
+/// All-in-one: resize the overlay to teleprompter dimensions
+/// (700×350), re-anchor it top-center, and `show()`. This is the
+/// SINGLE entry point — do NOT call `show_overlay()` from the
+/// teleprompter flow, because `show_overlay()` runs
+/// `set_strip_mode()` first (overlay's normal show-restores-to-strip
+/// invariant), which would overwrite the size we just set.
+pub fn show_for_teleprompter<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     let window = match app.get_webview_window(OVERLAY_LABEL) {
         Some(w) => w,
         None => {
-            log::warn!("[Copilot] resize_for_teleprompter: window not found");
+            log::warn!("[Teleprompter] show_for_teleprompter: window not found");
             return Ok(());
         }
     };
+
+    // 1. Set the dimensions FIRST so the OS animates the show at the
+    //    final size, not at strip size.
     window.set_size(LogicalSize::new(TELEPROMPTER_WIDTH, TELEPROMPTER_HEIGHT))?;
-    // Re-anchor to top-center for a stable, predictable landing the
-    // first time someone enables the teleprompter. Subsequent drags
-    // are preserved by the OS until the next resize call.
+    log::info!(
+        "[Teleprompter] window set to {}x{}",
+        TELEPROMPTER_WIDTH, TELEPROMPTER_HEIGHT
+    );
+
+    // 2. Anchor top-center for a predictable landing. Subsequent
+    //    user drags persist for the rest of the recording.
     if let Ok(Some(m)) = window.primary_monitor() {
         let scale = m.scale_factor();
         let mpos = m.position();
@@ -258,10 +267,19 @@ pub fn resize_for_teleprompter<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<
         let y = mpos.y + (TOP_MARGIN * scale) as i32;
         let _ = window.set_position(PhysicalPosition { x, y });
     }
-    log::info!(
-        "[Teleprompter] overlay resized to {}x{} top-center",
-        TELEPROMPTER_WIDTH, TELEPROMPTER_HEIGHT
-    );
+
+    // 3. Show. No set_focus — overlay stays non-focus-stealing.
+    window.show()?;
+
+    // 4. Verify and surface the actual size for debugging. This is
+    //    PhysicalSize on macOS (Retina ×2), so on a 2x display the
+    //    expected numbers are 1400×700.
+    if let Ok(sz) = window.inner_size() {
+        log::info!(
+            "[Teleprompter] window inner_size AFTER show: {}x{} (physical px)",
+            sz.width, sz.height
+        );
+    }
     Ok(())
 }
 

@@ -38,7 +38,6 @@ type Props = {
   onSetWpm: (wpm: number) => void;
 };
 
-const WIN_SIZE = 5;
 const WHEEL_STEP = 30; // px of cumulative wheel delta per paragraph step.
 const MIN_PARAGRAPH_MS = 1200; // floor so single-word paragraphs aren't sub-second
 const MAX_PARAGRAPH_MS = 30_000; // ceiling so a giant paragraph doesn't hang
@@ -66,9 +65,11 @@ export function TeleprompterView({
   const handleWheel = (e: React.WheelEvent<HTMLDivElement>) => {
     accum.current += e.deltaY;
     if (accum.current > WHEEL_STEP) {
+      console.log(`[teleprompter] wheel down → scroll +1 (accum=${accum.current.toFixed(0)}px)`);
       onScroll(1, "user");
       accum.current = 0;
     } else if (accum.current < -WHEEL_STEP) {
+      console.log(`[teleprompter] wheel up → scroll -1 (accum=${accum.current.toFixed(0)}px)`);
       onScroll(-1, "user");
       accum.current = 0;
     }
@@ -148,49 +149,59 @@ export function TeleprompterView({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoScroll, lineIdx, wpm, paragraphs, total]);
 
-  // ── 5-paragraph window centred on lineIdx ────────────────────────
-  let start = Math.max(0, lineIdx - 1);
-  let end = Math.min(total, start + WIN_SIZE);
-  start = Math.max(0, end - WIN_SIZE);
+  // ── 5-paragraph window with ACTIVE PARAGRAPH ALWAYS CENTRED ──────
+  // The visible window has 5 slots, slot 2 is always the active one.
+  // Slots 0/1 = previous two paragraphs (or empty pads near the top);
+  // slots 3/4 = next two paragraphs (or empty pads near the end).
+  // This way the highlighted current line never moves vertically; the
+  // text scrolls "through" it — the classic teleprompter feel.
   const visible: Array<{ idx: number; text: string } | null> = [];
-  for (let i = start; i < end; i++) {
-    visible.push({ idx: i, text: paragraphs[i] });
+  for (let offset = -2; offset <= 2; offset++) {
+    const idx = lineIdx + offset;
+    if (idx >= 0 && idx < total) {
+      visible.push({ idx, text: paragraphs[idx] });
+    } else {
+      visible.push(null);
+    }
   }
-  while (visible.length < WIN_SIZE) visible.push(null);
 
   return (
     <div
       onWheel={handleWheel}
-      className="select-none px-6 py-5"
+      className="flex h-full flex-col select-none px-6 py-4"
       style={{ touchAction: "none" }}
     >
-      <div className="space-y-4">
-        {visible.map((p, i) =>
-          p === null ? (
+      {/* Script paragraphs — center column, active is the middle row.
+          flex-1 makes this region fill the window so the footer pins
+          to the bottom; items-stretch + per-row min-height keeps the
+          spacing predictable as fontSize changes. */}
+      <div className="flex flex-1 flex-col justify-center gap-3">
+        {visible.map((p, i) => {
+          const isActive = p?.idx === lineIdx;
+          return p === null ? (
             <div
               key={`pad-${i}`}
-              style={{ height: dimFontSize * 1.4 }}
+              style={{ minHeight: dimFontSize * 1.4 }}
               aria-hidden
             />
           ) : (
             <p
               key={p.idx}
               className={clsx(
-                // Smooth swap on lineIdx change.
-                "leading-[1.4] transition-all duration-200 ease-out",
-                p.idx === lineIdx
-                  ? "font-semibold text-zinc-50"
-                  : "text-zinc-500/80",
+                // Color + size transition gives the swap a clear,
+                // visible feel even though the slot itself doesn't move.
+                "leading-[1.4] transition-all duration-300 ease-out",
+                isActive
+                  ? "font-semibold text-white opacity-100"
+                  : "text-zinc-500 opacity-50",
               )}
-              style={{ fontSize: p.idx === lineIdx ? activeFontSize : dimFontSize }}
+              style={{ fontSize: isActive ? activeFontSize : dimFontSize }}
             >
-              {p.idx === lineIdx && (
-                <span className="mr-2 text-zinc-400">▸</span>
-              )}
+              {isActive && <span className="mr-2 text-zinc-300">▸</span>}
               {p.text}
             </p>
-          ),
-        )}
+          );
+        })}
       </div>
 
       {/* ── Footer: Manual/Auto · WPM · Line N of M ──────────────── */}

@@ -711,8 +711,12 @@ export function overlayReducer(
     case "SCROLL_TELEPROMPTER": {
       // No-op when not in teleprompter mode — the global hotkey fires
       // regardless of focus, so the reducer is responsible for ignoring.
-      if (!state.teleprompter) return state;
-      const max = Math.max(0, state.teleprompter.paragraphs.length - 1);
+      if (!state.teleprompter) {
+        console.log("[teleprompter] scroll ignored — teleprompter not active");
+        return state;
+      }
+      const total = state.teleprompter.paragraphs.length;
+      const max = Math.max(0, total - 1);
       const next = Math.max(
         0,
         Math.min(max, state.teleprompter.lineIdx + action.delta),
@@ -724,7 +728,19 @@ export function overlayReducer(
       const autoScroll =
         userInitiated && state.teleprompter.autoScroll ? false : state.teleprompter.autoScroll;
       if (next === state.teleprompter.lineIdx && autoScroll === state.teleprompter.autoScroll) {
+        console.log(
+          `[teleprompter] scroll no-op — already at paragraph ${next + 1}/${total} (delta=${action.delta}, source=${action.source ?? "user"})`,
+        );
         return state;
+      }
+      if (userInitiated) {
+        console.log(
+          `[teleprompter] scroll ${action.delta > 0 ? "DOWN" : "UP"} — now paragraph ${next + 1}/${total}${autoScroll !== state.teleprompter.autoScroll ? " (auto-scroll disabled by manual override)" : ""}`,
+        );
+      } else {
+        console.log(
+          `[teleprompter] auto-advance — now paragraph ${next + 1}/${total}`,
+        );
       }
       return {
         ...state,
