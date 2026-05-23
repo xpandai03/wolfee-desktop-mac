@@ -8,6 +8,7 @@ import { ExpandedPanel } from "@/components/ExpandedPanel";
 import { FooterHint } from "@/components/FooterHint";
 import { OnboardingWizard } from "@/components/onboarding/OnboardingWizard";
 import { SessionCompleteCard } from "@/components/SessionCompleteCard";
+import { TeleprompterView } from "@/components/TeleprompterView";
 import { checkForUpdatesSilently } from "@/updater";
 import {
   activeThreadMessages,
@@ -240,6 +241,9 @@ export default function CopilotOverlay() {
     let newThreadUnlisten: UnlistenFn | undefined;
     let finalizedUnlisten: UnlistenFn | undefined;
     let requestEndUnlisten: UnlistenFn | undefined;
+    let teleprompterOpenUnlisten: UnlistenFn | undefined;
+    let teleprompterCloseUnlisten: UnlistenFn | undefined;
+    let teleprompterScrollUnlisten: UnlistenFn | undefined;
     let sessionFailedUnlisten: UnlistenFn | undefined;
     let onboardingFlagUnlisten: UnlistenFn | undefined;
     let onboardingShowUnlisten: UnlistenFn | undefined;
@@ -415,6 +419,34 @@ export default function CopilotOverlay() {
         handleStopRef.current();
       });
 
+      // Phase 1 Teleprompter — Rust drives these three events:
+      //   copilot-teleprompter-open    { script }   on capture-start Ok
+      //   copilot-teleprompter-close   ()           on stop / discard / fail
+      //   copilot-teleprompter-scroll  { delta }    from the global hotkeys
+      // The reducer's SCROLL_TELEPROMPTER ignores when not in teleprompter
+      // mode so the global hotkeys are safe to leave armed.
+      teleprompterOpenUnlisten = await listen<{ script: string }>(
+        "copilot-teleprompter-open",
+        (event) => {
+          dispatch({ type: "SHOW_TELEPROMPTER", script: event.payload.script });
+          // Auto-expand if the user is in strip mode — they enabled the
+          // teleprompter for a reason, they shouldn't also have to press
+          // ⌘⌥W to see it.
+          if (modeRef.current !== "expanded") {
+            void emit("wolfee-action", "expand-overlay");
+          }
+        },
+      );
+      teleprompterCloseUnlisten = await listen("copilot-teleprompter-close", () => {
+        dispatch({ type: "HIDE_TELEPROMPTER" });
+      });
+      teleprompterScrollUnlisten = await listen<{ delta: number }>(
+        "copilot-teleprompter-scroll",
+        (event) => {
+          dispatch({ type: "SCROLL_TELEPROMPTER", delta: event.payload.delta });
+        },
+      );
+
       // Sub-prompt 6.0 — onboarding wizard boot flow (replaces SP5.0
       // welcome). Rust replies with `onboarding-flag-loaded` carrying
       // {completed, last_step}. If completed=false on a fresh user,
@@ -523,6 +555,9 @@ export default function CopilotOverlay() {
       newThreadUnlisten?.();
       finalizedUnlisten?.();
       requestEndUnlisten?.();
+      teleprompterOpenUnlisten?.();
+      teleprompterCloseUnlisten?.();
+      teleprompterScrollUnlisten?.();
       sessionFailedUnlisten?.();
       onboardingFlagUnlisten?.();
       onboardingShowUnlisten?.();
@@ -766,8 +801,12 @@ export default function CopilotOverlay() {
   // sacred) → SessionComplete → Welcome. Permission is highest because
   // a missing-mic mid-session blocker must override even the recap.
   const showSessionComplete = overlayState.lastFinalizedSession !== null;
+  // Phase 1 Teleprompter — active during a recording. Above the
+  // Copilot session UI in precedence (mutual exclusion guarantees
+  // no Copilot session is live), below safety-critical surfaces.
+  const showTeleprompter = overlayState.teleprompter !== null;
   // Sub-prompt 6.0 — onboarding wizard supersedes legacy welcome.
-  // Precedence: Permission (Phase 6 sacred) > SessionComplete > Onboarding.
+  // Precedence: Permission (Phase 6 sacred) > SessionComplete > Teleprompter > Onboarding.
   const showOnboarding = overlayState.onboardingOpen;
   const expandedPanelBodyOverride = showPermissionModal ? (
     <PermissionModal
@@ -781,6 +820,12 @@ export default function CopilotOverlay() {
       onViewRecap={handleViewRecap}
       onStartNew={handleStartNewSession}
       onDismiss={handleDismissSessionComplete}
+    />
+  ) : showTeleprompter && overlayState.teleprompter ? (
+    <TeleprompterView
+      paragraphs={overlayState.teleprompter.paragraphs}
+      lineIdx={overlayState.teleprompter.lineIdx}
+      onScroll={(delta) => dispatch({ type: "SCROLL_TELEPROMPTER", delta })}
     />
   ) : showOnboarding ? (
     <OnboardingWizard
@@ -801,7 +846,7 @@ export default function CopilotOverlay() {
           post-session takeover card is visible so the two UIs don't
           fight. The card owns the full window during its lifetime;
           on dismiss the window itself is hidden by the effect above. */}
-      {!showSessionComplete && (
+      {!showSessionComplete && !showTeleprompter && (
         <Strip
           mode={overlayState.mode}
           uiPhase={overlayState.uiPhase}

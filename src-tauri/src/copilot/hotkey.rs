@@ -108,6 +108,37 @@ pub fn register<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error
     )?;
     log::info!("[Copilot] Registered hotkey ⌘+⇧+N (new chat thread)");
 
+    // ⌘⌥↑ / ⌘⌥↓ — Phase 1 Teleprompter scroll. Emits
+    // `copilot-teleprompter-scroll` with delta ±1; the overlay's
+    // reducer clamps to [0, paragraphs.length-1]. These are no-ops
+    // when the overlay isn't in teleprompter mode (the reducer
+    // ignores SCROLL_TELEPROMPTER while `teleprompter` is null).
+    //
+    // ⌘⌥ matches the established Wolfee modifier (⌘⌥W / ⌘⌥G); arrows
+    // are free here because the window-nudge family uses ⌃ not ⌘⌥.
+    register_teleprompter_scroll(app, Code::ArrowDown, 1)?;
+    register_teleprompter_scroll(app, Code::ArrowUp, -1)?;
+    log::info!("[Copilot] Registered hotkey ⌘⌥↑/↓ (teleprompter scroll)");
+
+    Ok(())
+}
+
+fn register_teleprompter_scroll<R: Runtime>(
+    app: &AppHandle<R>,
+    arrow: Code,
+    delta: i32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let shortcut = Shortcut::new(Some(Modifiers::SUPER | Modifiers::ALT), arrow);
+    let app_handle = app.clone();
+    app.global_shortcut().on_shortcut(shortcut, move |_app, _shortcut, event| {
+        if event.state() == ShortcutState::Pressed {
+            use tauri::Emitter;
+            let _ = app_handle.emit(
+                "copilot-teleprompter-scroll",
+                serde_json::json!({ "delta": delta }),
+            );
+        }
+    })?;
     Ok(())
 }
 

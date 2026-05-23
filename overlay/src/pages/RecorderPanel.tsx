@@ -30,6 +30,7 @@ import {
   Mic,
   Monitor,
   MoreHorizontal,
+  ScrollText,
   Settings,
   Sparkles,
   StickyNote,
@@ -81,6 +82,38 @@ export function RecorderPanel() {
   const [noiseFilter, setNoiseFilter] = useState(false);
   const [openDd, setOpenDd] = useState<DropdownId>(null);
   const [starting, setStarting] = useState(false);
+
+  // Phase 1 Teleprompter — toggle + script draft. Persisted in
+  // localStorage so an accidental panel close doesn't lose work.
+  // Cleared once the recording starts (the script lives in Rust state
+  // from that point until Stop/Discard/failure).
+  const [teleprompterOn, setTeleprompterOn] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem("wolfee.recorder.teleprompter.enabled") === "1";
+    } catch {
+      return false;
+    }
+  });
+  const [teleprompterScript, setTeleprompterScript] = useState<string>(() => {
+    try {
+      return localStorage.getItem("wolfee.recorder.teleprompter.draft") ?? "";
+    } catch {
+      return "";
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        "wolfee.recorder.teleprompter.enabled",
+        teleprompterOn ? "1" : "0",
+      );
+    } catch { /* private mode — no-op */ }
+  }, [teleprompterOn]);
+  useEffect(() => {
+    try {
+      localStorage.setItem("wolfee.recorder.teleprompter.draft", teleprompterScript);
+    } catch { /* private mode — no-op */ }
+  }, [teleprompterScript]);
 
   const loomBusy = LOOM_BUSY.includes(app.loom);
   const copilotActive = COPILOT_ACTIVE.includes(app.copilot);
@@ -145,6 +178,15 @@ export function RecorderPanel() {
 
   function handleStart() {
     if (starting || loomBusy || copilotActive) return;
+    // Phase 1 Teleprompter — stage script before the loom-record-screen
+    // arm fires. The Rust handler reads it once the capture is live
+    // and emits copilot-teleprompter-open to the overlay.
+    if (teleprompterOn && teleprompterScript.trim()) {
+      emitAction({
+        type: "teleprompter-start",
+        script: teleprompterScript,
+      });
+    }
     setStarting(true);
     // The bubble persists into the recording (Rust does not close it
     // on loom-record-screen).
@@ -202,6 +244,10 @@ export function RecorderPanel() {
             setNoiseFilter={setNoiseFilter}
             setOpenDd={setOpenDd}
             onStart={handleStart}
+            teleprompterOn={teleprompterOn}
+            setTeleprompterOn={setTeleprompterOn}
+            teleprompterScript={teleprompterScript}
+            setTeleprompterScript={setTeleprompterScript}
           />
         ) : (
           <CopilotTab app={app} loomBusy={loomBusy} />
@@ -267,6 +313,11 @@ type RecordTabProps = {
   setNoiseFilter: Dispatch<SetStateAction<boolean>>;
   setOpenDd: Dispatch<SetStateAction<DropdownId>>;
   onStart: () => void;
+  // Phase 1 Teleprompter
+  teleprompterOn: boolean;
+  setTeleprompterOn: Dispatch<SetStateAction<boolean>>;
+  teleprompterScript: string;
+  setTeleprompterScript: Dispatch<SetStateAction<string>>;
 };
 
 function RecordTab(p: RecordTabProps) {
@@ -423,12 +474,86 @@ function RecordTab(p: RecordTabProps) {
         </div>
       )}
 
+      {/* ── Phase 1 Teleprompter — toggle + script textarea ── */}
+      <div className="rounded-[12px] border border-[#2a2a2c] bg-[#1c1c1e] overflow-hidden">
+        <button
+          type="button"
+          onClick={() => p.setTeleprompterOn((v) => !v)}
+          className="flex h-9 w-full items-center justify-between px-3 transition-colors hover:bg-[#252527]"
+        >
+          <span className="flex items-center gap-2 text-[13px] text-[#e8e8ec]">
+            <ScrollText className="h-3.5 w-3.5 text-[#9a9a9e]" />
+            Teleprompter
+          </span>
+          <span
+            className={clsx(
+              "rounded-full px-2 py-0.5 text-[10.5px] font-semibold",
+              p.teleprompterOn
+                ? "bg-[#2f6bff]/25 text-[#9fb6ff]"
+                : "bg-[#2a2a2c] text-[#9a9a9e]",
+            )}
+          >
+            {p.teleprompterOn ? "On" : "Off"}
+          </span>
+        </button>
+        {p.teleprompterOn && (
+          <div className="border-t border-[#2a2a2c] p-3">
+            <textarea
+              value={p.teleprompterScript}
+              onChange={(e) => p.setTeleprompterScript(e.target.value)}
+              placeholder="Type or paste your script — invisible to viewers during the recording."
+              className="block w-full resize-y rounded-[8px] border border-[#2a2a2c] bg-[#0e0e10] px-2.5 py-2 text-[12px] leading-snug text-[#e8e8ec] placeholder-[#5a5a5e] focus:border-[#3a3a3e] focus:outline-none"
+              style={{ minHeight: 88, maxHeight: 260 }}
+              rows={4}
+              maxLength={50000}
+            />
+            <div className="mt-2 flex items-center justify-between text-[10.5px] text-[#8a8a8e]">
+              <button
+                type="button"
+                onClick={async () => {
+                  try {
+                    const text = await navigator.clipboard.readText();
+                    if (text) p.setTeleprompterScript(text);
+                  } catch { /* permission denied / private mode — no-op */ }
+                }}
+                className="transition-colors hover:text-[#c0c0c4]"
+              >
+                📋 Paste from clipboard
+              </button>
+              <span className="tabular-nums">
+                {p.teleprompterScript.trim().split(/\s+/).filter(Boolean).length} words
+                {p.teleprompterScript.trim() && (
+                  <span className="text-[#5a5a5e]">
+                    {" "}
+                    · ~{Math.max(
+                      1,
+                      Math.round(
+                        p.teleprompterScript.trim().split(/\s+/).filter(Boolean).length / 130,
+                      ),
+                    )}{" "}
+                    min read
+                  </span>
+                )}
+              </span>
+            </div>
+          </div>
+        )}
+      </div>
+
       <button
         onClick={p.onStart}
-        disabled={p.starting || blocked}
+        disabled={
+          p.starting ||
+          blocked ||
+          (p.teleprompterOn && !p.teleprompterScript.trim())
+        }
         className={clsx(
           "mt-1.5 h-[42px] w-full rounded-[11px] text-[14px] font-semibold text-white transition-colors",
-          p.starting || blocked ? "cursor-default bg-[#f0926f]" : "bg-[#fb5b36] hover:bg-[#ea4f2c]",
+          p.starting ||
+          blocked ||
+          (p.teleprompterOn && !p.teleprompterScript.trim())
+            ? "cursor-default bg-[#f0926f]"
+            : "bg-[#fb5b36] hover:bg-[#ea4f2c]",
         )}
       >
         {p.starting ? "Starting…" : "Start recording"}
@@ -436,6 +561,11 @@ function RecordTab(p: RecordTabProps) {
       {blocked && (
         <p className="px-1 pt-1 text-center text-[11px] text-[#9a9a9e]">
           End your Copilot session to record.
+        </p>
+      )}
+      {!blocked && p.teleprompterOn && !p.teleprompterScript.trim() && (
+        <p className="px-1 pt-1 text-center text-[11px] text-[#9a9a9e]">
+          Add a script for the teleprompter, or turn it off.
         </p>
       )}
     </div>

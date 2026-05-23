@@ -128,8 +128,12 @@ fn finish_loom_failure<R: tauri::Runtime>(
     {
         let state: tauri::State<'_, AppState> = handle.state();
         *state.loom_error.lock().unwrap() = Some(msg.clone());
+        // Phase 1 Teleprompter — clear staged script on any failure
+        // so a subsequent recording starts without a stale teleprompter.
+        *state.teleprompter_script.lock().unwrap() = None;
         state.set_loom_state(LoomState::Failed);
     }
+    let _ = handle.emit("copilot-teleprompter-close", ());
     tray::update_tray_for_loom(tray, handle);
     recorder::webcam_bubble::close_webcam_bubble(handle);
     recorder::recording_ui::close_countdown(handle);
@@ -533,6 +537,31 @@ fn handle_structured_action(
         // ─────────────────────────────────────────
         // SUBMIT CONTEXT → start session with paste-in fields
         // ─────────────────────────────────────────
+        // ─────────────────────────────────────────
+        // TELEPROMPTER — stage script for the upcoming recording
+        // ─────────────────────────────────────────
+        // The panel's RecordTab emits this right before `loom-record-screen`
+        // when the Teleprompter toggle is on. We just stash the script;
+        // the actual "open the overlay in teleprompter mode" event fires
+        // from the loom-record-screen arm once the capture is live.
+        "teleprompter-start" => {
+            let script = payload
+                .get("script")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            if script.trim().is_empty() {
+                log::info!("[Teleprompter] ignoring empty script");
+                return;
+            }
+            log::info!(
+                "[Teleprompter] script staged ({} chars)",
+                script.len()
+            );
+            let app_state: tauri::State<'_, AppState> = handle.state();
+            *app_state.teleprompter_script.lock().unwrap() = Some(script);
+        }
+
         "submit-copilot-context" => {
             log::info!("[Copilot] Context submitted — starting session");
 
@@ -1471,6 +1500,7 @@ pub fn run() {
         loom_share_url: Mutex::new(None),
         loom_error: Mutex::new(None),
         loom_pending_upload: Mutex::new(None),
+        teleprompter_script: Mutex::new(None),
     };
 
     let backend_url = auth_config.backend_url.clone();
@@ -1908,6 +1938,35 @@ pub fn run() {
                                     tray::update_tray_for_loom(&tray, &handle);
                                     recorder::recording_ui::open_control_bar(&handle);
                                     log::info!("[recorder] control bar opened — recording live");
+
+                                    // Phase 1 Teleprompter — if the panel staged a
+                                    // script before Start, open the overlay in
+                                    // teleprompter mode now that capture is live.
+                                    // Mutual exclusion guarantees the overlay is
+                                    // Copilot-Idle here, so the teleprompter
+                                    // takes over the same content-protected window
+                                    // with no conflict.
+                                    let script_opt: Option<String> = {
+                                        let state: tauri::State<'_, AppState> = handle.state();
+                                        let cloned =
+                                            state.teleprompter_script.lock().unwrap().clone();
+                                        cloned
+                                    };
+                                    if let Some(script) = script_opt {
+                                        log::info!(
+                                            "[Teleprompter] opening overlay ({} chars)",
+                                            script.len()
+                                        );
+                                        let _ = handle.emit(
+                                            "copilot-teleprompter-open",
+                                            serde_json::json!({ "script": script }),
+                                        );
+                                        if let Err(e) = copilot::window::show_overlay(&handle) {
+                                            log::warn!(
+                                                "[Teleprompter] show_overlay failed: {e}"
+                                            );
+                                        }
+                                    }
                                 }
                                 Ok(Err(e)) => {
                                     log::error!("[recorder] capture failed to start: {e}");
@@ -1934,7 +1993,12 @@ pub fn run() {
                             return;
                         }
                         state.set_loom_state(LoomState::Stopping);
+                        // Phase 1 Teleprompter — tear down the script view and
+                        // clear the staged script so the next recording starts
+                        // clean. (Restart has its own path that preserves it.)
+                        *state.teleprompter_script.lock().unwrap() = None;
                         drop(state);
+                        let _ = handle_ref.emit("copilot-teleprompter-close", ());
                         // Stop → tear down the in-recording UI.
                         recorder::webcam_bubble::close_webcam_bubble(handle_ref);
                         recorder::recording_ui::close_control_bar(handle_ref);
@@ -2088,7 +2152,10 @@ pub fn run() {
                             return;
                         }
                         state.set_loom_state(LoomState::Stopping);
+                        // Phase 1 Teleprompter — tear down + clear.
+                        *state.teleprompter_script.lock().unwrap() = None;
                         drop(state);
+                        let _ = handle_ref.emit("copilot-teleprompter-close", ());
                         recorder::webcam_bubble::close_webcam_bubble(handle_ref);
                         recorder::recording_ui::close_control_bar(handle_ref);
                         tray::update_tray_for_loom(&tray_clone, handle_ref);

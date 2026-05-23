@@ -145,6 +145,13 @@ pub struct AppState {
     /// upload. Set when a recording stops with no auth token; cleared
     /// once the upload completes (or is dismissed).
     pub loom_pending_upload: Mutex<Option<PendingUpload>>,
+    /// Phase 1 Teleprompter — the user's script, staged by the panel
+    /// before they click Start Recording. The `loom-record-screen`
+    /// arm reads this after `ScreenRecorder::start` returns Ok and
+    /// emits `copilot-teleprompter-open` to the overlay. Cleared on
+    /// stop / discard / failure so a subsequent recording doesn't
+    /// inherit a stale script.
+    pub teleprompter_script: Mutex<Option<String>>,
 }
 
 impl AppState {

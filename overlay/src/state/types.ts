@@ -358,6 +358,20 @@ export interface OverlayState {
   failureToast: string | null;
   /** Brief "Copied ✓" footer flash — auto-clears after 1.2s. */
   copiedFlashAt: number | null;
+  /**
+   * Phase 1 Teleprompter — set while a recording is live and the user
+   * had the toggle on. Pre-split paragraphs are kept so each render
+   * can map by index without re-splitting. `lineIdx` is the active
+   * paragraph; scroll wheel + ⌘⌥↑/↓ advance it.
+   *
+   * `null` when no teleprompter is active — the regular Copilot
+   * strip/expanded body renders instead.
+   */
+  teleprompter: {
+    script: string;
+    paragraphs: string[];
+    lineIdx: number;
+  } | null;
 }
 
 // ── Reducer actions ──────────────────────────────────────────────
@@ -416,7 +430,11 @@ export type Action =
   | { type: "COMPLETE_ONBOARDING" }
   | { type: "SET_PAIRING_POLLING"; polling: boolean }
   | { type: "PAIRING_COMPLETE" }
-  | { type: "SET_PERMISSION_STATUS"; payload: OnboardingPermissionStatus };
+  | { type: "SET_PERMISSION_STATUS"; payload: OnboardingPermissionStatus }
+  // Phase 1 Teleprompter (Rust → overlay events drive these)
+  | { type: "SHOW_TELEPROMPTER"; script: string }
+  | { type: "HIDE_TELEPROMPTER" }
+  | { type: "SCROLL_TELEPROMPTER"; delta: number };
 
 export const initialOverlayState: OverlayState = {
   uiPhase: "Idle",
@@ -446,4 +464,5 @@ export const initialOverlayState: OverlayState = {
   showingStartedAtMs: null,
   failureToast: null,
   copiedFlashAt: null,
+  teleprompter: null,
 };

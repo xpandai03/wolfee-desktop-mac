@@ -681,6 +681,40 @@ export function overlayReducer(
       return next;
     }
 
+    // ── Phase 1 Teleprompter ───────────────────────────────────
+    case "SHOW_TELEPROMPTER": {
+      // Pre-split into paragraphs (double newline) so render can map
+      // by index. Single-newline lines stay together as one paragraph
+      // — feels closer to "what the user typed" than line-by-line.
+      const paragraphs = action.script
+        .split(/\n\s*\n/)
+        .map((p) => p.trim())
+        .filter((p) => p.length > 0);
+      return {
+        ...state,
+        teleprompter: { script: action.script, paragraphs, lineIdx: 0 },
+      };
+    }
+
+    case "HIDE_TELEPROMPTER":
+      return { ...state, teleprompter: null };
+
+    case "SCROLL_TELEPROMPTER": {
+      // No-op when not in teleprompter mode — the global hotkey fires
+      // regardless of focus, so the reducer is responsible for ignoring.
+      if (!state.teleprompter) return state;
+      const max = Math.max(0, state.teleprompter.paragraphs.length - 1);
+      const next = Math.max(
+        0,
+        Math.min(max, state.teleprompter.lineIdx + action.delta),
+      );
+      if (next === state.teleprompter.lineIdx) return state;
+      return {
+        ...state,
+        teleprompter: { ...state.teleprompter, lineIdx: next },
+      };
+    }
+
     default:
       return state;
   }
