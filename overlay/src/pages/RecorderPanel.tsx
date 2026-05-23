@@ -214,6 +214,16 @@ export function RecorderPanel() {
 
   function handleStart() {
     if (starting || loomBusy || copilotActive) return;
+    // Defensive bubble re-emit: if the user has the camera on, fire
+    // webcam-bubble-open again right before Start. The bubble *should*
+    // already be open from when the user toggled it, but if anything
+    // (a stray cancel, an earlier close, a focus-event glitch) tore
+    // it down between toggling and Start, this brings it back. Rust's
+    // open handler is idempotent (`get_webview_window(...).show()` on
+    // an existing window).
+    if (cameraOn) {
+      emitAction("webcam-bubble-open");
+    }
     // Phase 1 Teleprompter — stage script before the loom-record-screen
     // arm fires. The Rust handler reads it once the capture is live
     // and emits copilot-teleprompter-open to the overlay.

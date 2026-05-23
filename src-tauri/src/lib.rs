@@ -134,6 +134,7 @@ fn finish_loom_failure<R: tauri::Runtime>(
         state.set_loom_state(LoomState::Failed);
     }
     let _ = handle.emit("copilot-teleprompter-close", ());
+    let _ = copilot::window::collapse_overlay(handle);
     tray::update_tray_for_loom(tray, handle);
     recorder::webcam_bubble::close_webcam_bubble(handle);
     recorder::recording_ui::close_countdown(handle);
@@ -1851,6 +1852,7 @@ pub fn run() {
 
                     // ── Webcam bubble (visible-in-recording floating window) ──
                     "webcam-bubble-open" => {
+                        log::info!("[Bubble] open requested via wolfee-action");
                         if let Err(e) =
                             recorder::webcam_bubble::open_webcam_bubble(handle_ref)
                         {
@@ -1994,6 +1996,23 @@ pub fn run() {
                                             "[Teleprompter] opening overlay ({} chars, font={font_size}, auto={auto_scroll}, wpm={wpm})",
                                             script.len()
                                         );
+                                        // Resize FIRST so the React side never
+                                        // sees a strip-sized window — the
+                                        // expand-overlay roundtrip we used in
+                                        // 0.8.13/14 raced the emit and left
+                                        // some users staring at a 600x44 strip.
+                                        if let Err(e) =
+                                            copilot::window::resize_for_teleprompter(&handle)
+                                        {
+                                            log::warn!(
+                                                "[Teleprompter] resize_for_teleprompter failed: {e}"
+                                            );
+                                        }
+                                        if let Err(e) = copilot::window::show_overlay(&handle) {
+                                            log::warn!(
+                                                "[Teleprompter] show_overlay failed: {e}"
+                                            );
+                                        }
                                         let _ = handle.emit(
                                             "copilot-teleprompter-open",
                                             serde_json::json!({
@@ -2003,11 +2022,6 @@ pub fn run() {
                                                 "wpm": wpm,
                                             }),
                                         );
-                                        if let Err(e) = copilot::window::show_overlay(&handle) {
-                                            log::warn!(
-                                                "[Teleprompter] show_overlay failed: {e}"
-                                            );
-                                        }
                                     }
                                 }
                                 Ok(Err(e)) => {
@@ -2041,6 +2055,10 @@ pub fn run() {
                         *state.teleprompter_script.lock().unwrap() = None;
                         drop(state);
                         let _ = handle_ref.emit("copilot-teleprompter-close", ());
+                        // Shrink the overlay back to strip so the next time
+                        // the user opens it (Copilot or whatever) it's not
+                        // weirdly tall.
+                        let _ = copilot::window::collapse_overlay(handle_ref);
                         // Stop → tear down the in-recording UI.
                         recorder::webcam_bubble::close_webcam_bubble(handle_ref);
                         recorder::recording_ui::close_control_bar(handle_ref);
@@ -2198,6 +2216,7 @@ pub fn run() {
                         *state.teleprompter_script.lock().unwrap() = None;
                         drop(state);
                         let _ = handle_ref.emit("copilot-teleprompter-close", ());
+                        let _ = copilot::window::collapse_overlay(handle_ref);
                         recorder::webcam_bubble::close_webcam_bubble(handle_ref);
                         recorder::recording_ui::close_control_bar(handle_ref);
                         tray::update_tray_for_loom(&tray_clone, handle_ref);

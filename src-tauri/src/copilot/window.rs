@@ -11,6 +11,12 @@ const STRIP_WIDTH: f64 = 600.0;
 const STRIP_HEIGHT: f64 = 44.0;
 const EXPANDED_WIDTH: f64 = 600.0;
 const EXPANDED_HEIGHT: f64 = 520.0;
+// Dedicated teleprompter band — comfortable for 5 paragraphs of 28 px
+// text + footer at the default font size; not so tall that the user's
+// webcam preview is obscured. 600 wide keeps the position math
+// identical to strip/expanded so the top-center landing is stable.
+const TELEPROMPTER_WIDTH: f64 = 600.0;
+const TELEPROMPTER_HEIGHT: f64 = 320.0;
 const TOP_MARGIN: f64 = 24.0;
 
 pub fn create_overlay_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
@@ -224,6 +230,38 @@ pub fn collapse_overlay<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     };
     set_strip_mode(&window)?;
     log::debug!("[Copilot] overlay collapsed to {}x{}", STRIP_WIDTH, STRIP_HEIGHT);
+    Ok(())
+}
+
+/// Resize the overlay window into teleprompter mode (~600×320) and
+/// re-center it top-center. Called BEFORE emitting
+/// `copilot-teleprompter-open` so the React side never sees a
+/// strip-sized window. Idempotent.
+pub fn resize_for_teleprompter<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
+    let window = match app.get_webview_window(OVERLAY_LABEL) {
+        Some(w) => w,
+        None => {
+            log::warn!("[Copilot] resize_for_teleprompter: window not found");
+            return Ok(());
+        }
+    };
+    window.set_size(LogicalSize::new(TELEPROMPTER_WIDTH, TELEPROMPTER_HEIGHT))?;
+    // Re-anchor to top-center for a stable, predictable landing the
+    // first time someone enables the teleprompter. Subsequent drags
+    // are preserved by the OS until the next resize call.
+    if let Ok(Some(m)) = window.primary_monitor() {
+        let scale = m.scale_factor();
+        let mpos = m.position();
+        let msize = m.size();
+        let w_px = (TELEPROMPTER_WIDTH * scale) as i32;
+        let x = mpos.x + ((msize.width as i32) - w_px) / 2;
+        let y = mpos.y + (TOP_MARGIN * scale) as i32;
+        let _ = window.set_position(PhysicalPosition { x, y });
+    }
+    log::info!(
+        "[Teleprompter] overlay resized to {}x{} top-center",
+        TELEPROMPTER_WIDTH, TELEPROMPTER_HEIGHT
+    );
     Ok(())
 }
 

@@ -431,6 +431,9 @@ export default function CopilotOverlay() {
         autoScroll?: boolean;
         wpm?: number;
       }>("copilot-teleprompter-open", (event) => {
+        console.log(
+          `[teleprompter] open event received — script=${event.payload.script.length} chars, font=${event.payload.fontSize}, auto=${event.payload.autoScroll}, wpm=${event.payload.wpm}`,
+        );
         dispatch({
           type: "SHOW_TELEPROMPTER",
           script: event.payload.script,
@@ -438,14 +441,14 @@ export default function CopilotOverlay() {
           autoScroll: event.payload.autoScroll,
           wpm: event.payload.wpm,
         });
-        // Auto-expand if the user is in strip mode — they enabled the
-        // teleprompter for a reason, they shouldn't also have to press
-        // ⌘⌥W to see it.
-        if (modeRef.current !== "expanded") {
-          void emit("wolfee-action", "expand-overlay");
-        }
+        // Window is resized to teleprompter size by the Rust side
+        // BEFORE this event fires (see lib.rs loom-record-screen
+        // Ok-branch), so we don't fire `expand-overlay` here — that
+        // raced the open in 0.8.13/14 and left the user staring at
+        // a strip-sized window with the teleprompter rendered inside.
       });
       teleprompterCloseUnlisten = await listen("copilot-teleprompter-close", () => {
+        console.log("[teleprompter] close event received");
         dispatch({ type: "HIDE_TELEPROMPTER" });
       });
       teleprompterScrollUnlisten = await listen<{ delta: number }>(
@@ -834,19 +837,6 @@ export default function CopilotOverlay() {
       onStartNew={handleStartNewSession}
       onDismiss={handleDismissSessionComplete}
     />
-  ) : showTeleprompter && overlayState.teleprompter ? (
-    <TeleprompterView
-      paragraphs={overlayState.teleprompter.paragraphs}
-      lineIdx={overlayState.teleprompter.lineIdx}
-      fontSize={overlayState.teleprompter.fontSize}
-      autoScroll={overlayState.teleprompter.autoScroll}
-      wpm={overlayState.teleprompter.wpm}
-      onScroll={(delta, source) =>
-        dispatch({ type: "SCROLL_TELEPROMPTER", delta, source })
-      }
-      onToggleAuto={() => dispatch({ type: "TOGGLE_TELEPROMPTER_AUTO" })}
-      onSetWpm={(wpm) => dispatch({ type: "SET_TELEPROMPTER_WPM", wpm })}
-    />
   ) : showOnboarding ? (
     <OnboardingWizard
       state={overlayState}
@@ -866,6 +856,26 @@ export default function CopilotOverlay() {
           post-session takeover card is visible so the two UIs don't
           fight. The card owns the full window during its lifetime;
           on dismiss the window itself is hidden by the effect above. */}
+      {/* Teleprompter takes over the whole window when active. The
+          Rust side has already resized to TELEPROMPTER_WIDTH x
+          TELEPROMPTER_HEIGHT (600x320) before this renders. */}
+      {showTeleprompter && overlayState.teleprompter ? (
+        <div className="flex h-full w-full flex-col rounded-2xl bg-zinc-950/85 backdrop-blur ring-1 ring-zinc-800/60">
+          <TeleprompterView
+            paragraphs={overlayState.teleprompter.paragraphs}
+            lineIdx={overlayState.teleprompter.lineIdx}
+            fontSize={overlayState.teleprompter.fontSize}
+            autoScroll={overlayState.teleprompter.autoScroll}
+            wpm={overlayState.teleprompter.wpm}
+            onScroll={(delta, source) =>
+              dispatch({ type: "SCROLL_TELEPROMPTER", delta, source })
+            }
+            onToggleAuto={() => dispatch({ type: "TOGGLE_TELEPROMPTER_AUTO" })}
+            onSetWpm={(wpm) => dispatch({ type: "SET_TELEPROMPTER_WPM", wpm })}
+          />
+        </div>
+      ) : null}
+
       {!showSessionComplete && !showTeleprompter && (
         <Strip
           mode={overlayState.mode}
@@ -891,7 +901,7 @@ export default function CopilotOverlay() {
       )}
 
       <AnimatePresence initial={false}>
-        {overlayState.mode === "expanded" && (
+        {overlayState.mode === "expanded" && !showTeleprompter && (
           <ExpandedPanel
             key="panel"
             activeTab={overlayState.activeTab}

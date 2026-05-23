@@ -75,15 +75,27 @@ export function TeleprompterView({
   };
 
   // ── Phase 3 auto-advance timer ───────────────────────────────────
-  // One timer per (lineIdx, autoScroll, wpm, paragraphs) — restarts
-  // whenever any of those change. Word count of the CURRENT paragraph
-  // determines duration so short paragraphs flow fast and long ones
-  // get the room they need. visibilityState gating keeps a hidden
-  // overlay from racing through the script while the user is in
-  // another window.
+  // CRITICAL: `onScroll` is recreated every render of the parent (it's
+  // an inline arrow that closes over `dispatch`). The parent re-renders
+  // every TICK (250 ms). If we depended on `onScroll` in the effect's
+  // deps, the effect would tear down and re-create the timer every
+  // 250 ms — the timer (≥ 1.2 s) would never fire. So we stash
+  // onScroll in a ref that's kept up to date but doesn't trigger
+  // re-runs of the effect.
+  const onScrollRef = useRef(onScroll);
   useEffect(() => {
-    if (!autoScroll) return;
-    if (lineIdx >= total - 1) return; // already at the last paragraph
+    onScrollRef.current = onScroll;
+  });
+
+  useEffect(() => {
+    if (!autoScroll) {
+      console.log("[teleprompter] auto-scroll OFF — timer not armed");
+      return;
+    }
+    if (lineIdx >= total - 1) {
+      console.log("[teleprompter] auto-scroll at last paragraph — timer not armed");
+      return;
+    }
 
     const text = paragraphs[lineIdx] ?? "";
     const words = Math.max(1, wordCount(text));
@@ -92,9 +104,10 @@ export function TeleprompterView({
       MIN_PARAGRAPH_MS,
       Math.min(MAX_PARAGRAPH_MS, seconds * 1000),
     );
+    console.log(
+      `[teleprompter] auto-scroll ARMED — paragraph ${lineIdx + 1}/${total}, ${words} words @ ${wpm} wpm → ${ms} ms`,
+    );
 
-    // Track elapsed time so a visibility change pauses + resumes
-    // without losing accumulated reading time.
     let remaining = ms;
     let startedAt = 0;
     let handle: number | null = null;
@@ -102,7 +115,8 @@ export function TeleprompterView({
     const start = () => {
       startedAt = Date.now();
       handle = window.setTimeout(() => {
-        onScroll(1, "auto");
+        console.log(`[teleprompter] auto-advance fired (${ms} ms target)`);
+        onScrollRef.current(1, "auto");
       }, remaining);
     };
     const stop = () => {
@@ -114,8 +128,12 @@ export function TeleprompterView({
     };
     const onVisChange = () => {
       if (document.visibilityState === "visible") {
-        if (remaining > 0) start();
+        if (remaining > 0) {
+          console.log(`[teleprompter] visible — resume (${remaining} ms left)`);
+          start();
+        }
       } else {
+        console.log("[teleprompter] hidden — pause");
         stop();
       }
     };
@@ -126,7 +144,9 @@ export function TeleprompterView({
       stop();
       document.removeEventListener("visibilitychange", onVisChange);
     };
-  }, [autoScroll, lineIdx, wpm, paragraphs, total, onScroll]);
+    // Deliberately omit `onScroll` — see comment above.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoScroll, lineIdx, wpm, paragraphs, total]);
 
   // ── 5-paragraph window centred on lineIdx ────────────────────────
   let start = Math.max(0, lineIdx - 1);
