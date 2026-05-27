@@ -7,7 +7,6 @@ import { Strip } from "@/components/Strip";
 import { ExpandedPanel } from "@/components/ExpandedPanel";
 import { FooterHint } from "@/components/FooterHint";
 import { OnboardingWizard } from "@/components/onboarding/OnboardingWizard";
-import { SessionCompleteCard } from "@/components/SessionCompleteCard";
 import { TeleprompterView } from "@/components/TeleprompterView";
 import { checkForUpdatesSilently } from "@/updater";
 import {
@@ -380,14 +379,14 @@ export default function CopilotOverlay() {
         });
       });
 
-      // Sub-prompt 4.8 — Rust signals after a session was successfully
-      // finalized + pushed. Track the id so the "View on Web" link
-      // can deep-link to the recap. Auto-open browser is handled
-      // Rust-side based on user preferences.
-      // Sub-prompt 5.0 — payload now also carries duration_ms +
-      // mode_used_name for the post-session takeover card. We
-      // dispatch SESSION_FINALIZED to open the card; the reducer
-      // owns the 8s auto-dismiss.
+      // Rust signals after a session was successfully finalized + pushed.
+      // The dispatch still resets in-session UI state (transcript, uiPhase).
+      // We then hide the overlay immediately — the recap auto-opens in the
+      // user's browser via the Rust handler (gated on the
+      // `copilot_auto_open_browser` preference). The old in-overlay
+      // SessionCompleteCard takeover was removed because it was being
+      // clipped when the overlay was in strip mode and was redundant with
+      // the browser auto-open.
       finalizedUnlisten = await listen<{
         session_id: string;
         share_slug: string | null;
@@ -403,18 +402,14 @@ export default function CopilotOverlay() {
           durationMs: event.payload.duration_ms ?? null,
           modeName: event.payload.mode_used_name ?? null,
         });
-        // Auto-expand so the takeover is visible. If user happens to
-        // be in strip mode we promote them; otherwise no-op.
-        if (modeRef.current !== "expanded") {
-          void emit("wolfee-action", "expand-overlay");
-        }
+        void getCurrentWebviewWindow().hide();
       });
 
       // The panel's "End Copilot session" button can't run finalize
       // itself (it doesn't hold the transcript). Its Rust handler
       // re-emits copilot-request-end here so the overlay runs the
       // exact same stop sequence as its own Stop button — finalize +
-      // push, then end — which is what produces the SessionCompleteCard.
+      // push, then end.
       requestEndUnlisten = await listen("copilot-request-end", () => {
         handleStopRef.current();
       });
@@ -536,6 +531,10 @@ export default function CopilotOverlay() {
       }>("copilot-session-failed", (event) => {
         console.warn("[Copilot] session finalize failed:", event.payload);
         setFinalizeFailureReason(event.payload.reason || "unknown error");
+        // Expand so the banner is visible if the user was in strip mode.
+        if (modeRef.current !== "expanded") {
+          void emit("wolfee-action", "expand-overlay");
+        }
       });
 
       // Sub-prompt 4.7 — ⌘⇧N hotkey from Rust dispatches NEW_THREAD
@@ -591,26 +590,6 @@ export default function CopilotOverlay() {
     return () => window.clearTimeout(t);
   }, [finalizeFailureReason]);
 
-  // Strip-cleanup fix — when the SessionCompleteCard dismisses (manual
-  // ✕, View recap, or 8s auto-dismiss in TICK), hide the whole overlay
-  // window so the now-stale strip doesn't linger after a session ends.
-  // Start-new-session bypasses the hide via suppressHideOnDismissRef
-  // so the user doesn't see a flicker before Rust shows the overlay
-  // again for the new session.
-  const suppressHideOnDismissRef = useRef(false);
-  const prevLastFinalizedSessionRef = useRef(overlayState.lastFinalizedSession);
-  useEffect(() => {
-    const prev = prevLastFinalizedSessionRef.current;
-    prevLastFinalizedSessionRef.current = overlayState.lastFinalizedSession;
-    if (prev !== null && overlayState.lastFinalizedSession === null) {
-      if (suppressHideOnDismissRef.current) {
-        suppressHideOnDismissRef.current = false;
-        return;
-      }
-      void getCurrentWebviewWindow().hide();
-    }
-  }, [overlayState.lastFinalizedSession]);
-
   // ── Strip control handlers ─────────────────────────────────────
   // 0.7.4 — Strip Play button. Same Tauri action the tray's Start
   // Copilot Session item emits, so the strip and the tray are
@@ -622,19 +601,6 @@ export default function CopilotOverlay() {
     void emit("wolfee-action", "start-copilot-session");
   };
   const handleStop = () => {
-    // 0.7.6 — grow the strip the instant the user hits Stop. Before
-    // 0.7.6 the panel only expanded once `copilot-session-finalized`
-    // arrived (after the backend finalize round-trip), so users sat
-    // in a 44-px strip for several seconds with no visual feedback
-    // and the eventual SessionCompleteCard ("View recap on web…") was
-    // effectively hidden inside the still-tiny window. Surfacing the
-    // expanded panel synchronously gives an immediate state change;
-    // the SessionCompleteCard then mounts in an already-visible panel
-    // once finalize completes (see `copilot-session-finalized`
-    // listener above).
-    if (modeRef.current !== "expanded") {
-      void emit("wolfee-action", "expand-overlay");
-    }
     // Sub-prompt 4.8 — push transcript + chat threads + auto-suggestions
     // to backend BEFORE the session-end teardown so the post-session
     // web view has all the artifacts. mode_used_id is tracked Rust-side
@@ -704,31 +670,6 @@ export default function CopilotOverlay() {
     void emit("wolfee-action", action);
   };
 
-  // Sub-prompt 5.0 — SessionCompleteCard CTAs.
-  const handleViewRecap = () => {
-    const sid =
-      overlayState.lastFinalizedSession?.sessionId ??
-      lastFinalizedSessionId.current;
-    if (sid) {
-      void emit("wolfee-action", {
-        type: "open-external-url",
-        url: `${WOLFEE_WEB_BASE}/copilot/sessions/${sid}`,
-      });
-    }
-    dispatch({ type: "DISMISS_SESSION_COMPLETE" });
-  };
-  const handleStartNewSession = () => {
-    // Strip-cleanup fix — Start-new dismisses the card but should NOT
-    // hide the overlay; Rust will reuse the same window for the new
-    // session. Suppress the dismiss-driven hide effect for this one
-    // transition.
-    suppressHideOnDismissRef.current = true;
-    dispatch({ type: "DISMISS_SESSION_COMPLETE" });
-    void emit("wolfee-action", "start-copilot-session");
-  };
-  const handleDismissSessionComplete = () => {
-    dispatch({ type: "DISMISS_SESSION_COMPLETE" });
-  };
   const handleViewOnWeb = () => {
     // Sub-prompt 4.8 — opens the user's session list. If we just
     // finalized a session, point straight at it; otherwise the list.
@@ -813,29 +754,15 @@ export default function CopilotOverlay() {
   const hasActiveSession = overlayState.fullTranscript.length > 0;
   const isAiStreaming = overlayState.streamingAiResponseId !== null;
   const showPermissionModal = permissionNeeded !== null;
-  // Sub-prompt 5.0 — bodyOverride precedence: Permission (Phase 6
-  // sacred) → SessionComplete → Welcome. Permission is highest because
-  // a missing-mic mid-session blocker must override even the recap.
-  const showSessionComplete = overlayState.lastFinalizedSession !== null;
-  // Phase 1 Teleprompter — active during a recording. Above the
-  // Copilot session UI in precedence (mutual exclusion guarantees
-  // no Copilot session is live), below safety-critical surfaces.
+  // bodyOverride precedence: Permission (Phase 6 sacred) → Teleprompter →
+  // Onboarding. Permission is highest because a missing-mic mid-session
+  // blocker must override anything else.
   const showTeleprompter = overlayState.teleprompter !== null;
-  // Sub-prompt 6.0 — onboarding wizard supersedes legacy welcome.
-  // Precedence: Permission (Phase 6 sacred) > SessionComplete > Teleprompter > Onboarding.
   const showOnboarding = overlayState.onboardingOpen;
   const expandedPanelBodyOverride = showPermissionModal ? (
     <PermissionModal
       payload={permissionNeeded!}
       onDismiss={() => setPermissionNeeded(null)}
-    />
-  ) : showSessionComplete ? (
-    <SessionCompleteCard
-      durationMs={overlayState.lastFinalizedSession?.durationMs ?? null}
-      modeName={overlayState.lastFinalizedSession?.modeName ?? null}
-      onViewRecap={handleViewRecap}
-      onStartNew={handleStartNewSession}
-      onDismiss={handleDismissSessionComplete}
     />
   ) : showOnboarding ? (
     <OnboardingWizard
@@ -852,10 +779,6 @@ export default function CopilotOverlay() {
     // and the ContextWindow page draw their own bg-zinc-950/70 +
     // backdrop-blur). Wrapper just sizes the layout.
     <div className="w-screen h-screen flex flex-col text-zinc-100 select-none overflow-hidden">
-      {/* Strip-cleanup fix — hide the in-session strip while the
-          post-session takeover card is visible so the two UIs don't
-          fight. The card owns the full window during its lifetime;
-          on dismiss the window itself is hidden by the effect above. */}
       {/* Teleprompter takes over the whole window when active. The
           Rust side has already resized to TELEPROMPTER_WIDTH x
           TELEPROMPTER_HEIGHT (600x320) before this renders. */}
@@ -876,7 +799,7 @@ export default function CopilotOverlay() {
         </div>
       ) : null}
 
-      {!showSessionComplete && !showTeleprompter && (
+      {!showTeleprompter && (
         <Strip
           mode={overlayState.mode}
           uiPhase={overlayState.uiPhase}
