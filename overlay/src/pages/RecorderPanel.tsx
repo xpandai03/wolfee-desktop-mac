@@ -20,10 +20,12 @@ import {
 } from "react";
 import { emit, listen } from "@tauri-apps/api/event";
 import {
+  AppWindow,
   BrainCircuit,
   Camera,
   Check,
   ChevronDown,
+  Crop,
   HelpCircle,
   LayoutGrid,
   LogOut,
@@ -42,6 +44,18 @@ import clsx from "clsx";
 type Tab = "record" | "copilot" | "screenshot";
 type Device = { id: string; label: string };
 type DropdownId = "screen" | "camera" | "mic" | "more" | null;
+
+// ── Phase 1 source picker ──
+type CaptureKind = "full_screen" | "window" | "region" | "camera_only";
+type DisplayInfo = { id: number; name: string; width: number; height: number };
+type WindowInfo = { id: number; title: string; app_name: string; app_bundle_id: string };
+type CaptureSources = { displays: DisplayInfo[]; windows: WindowInfo[]; error?: string };
+// Mirror of Rust's `recorder::CaptureTarget` (serde tag = "kind").
+type CaptureTarget =
+  | { kind: "full_screen"; display_id: number }
+  | { kind: "window"; window_id: number }
+  | { kind: "region"; display_id: number; rect: { x: number; y: number; width: number; height: number } }
+  | { kind: "camera_only" };
 
 type WolfeeState = {
   loom: string; // idle | countdown | recording | stopping | uploading | complete | failed
@@ -82,6 +96,15 @@ export function RecorderPanel() {
   const [noiseFilter, setNoiseFilter] = useState(false);
   const [openDd, setOpenDd] = useState<DropdownId>(null);
   const [starting, setStarting] = useState(false);
+
+  // ── Phase 1 source picker ──
+  const [sources, setSources] = useState<CaptureSources>({ displays: [], windows: [] });
+  const [sourcesLoading, setSourcesLoading] = useState(false);
+  const [sourceKind, setSourceKind] = useState<CaptureKind>("full_screen");
+  const [sourceLabel, setSourceLabel] = useState("Full screen");
+  // Track the concrete pick so the right row shows a checkmark.
+  const [selectedDisplayId, setSelectedDisplayId] = useState<number | null>(null);
+  const [selectedWindowId, setSelectedWindowId] = useState<number | null>(null);
 
   // Phase 1 Teleprompter — toggle + script draft. Persisted in
   // localStorage so an accidental panel close doesn't lose work.
@@ -212,6 +235,103 @@ export function RecorderPanel() {
     emitAction(on ? "webcam-bubble-open" : "webcam-bubble-close");
   }
 
+  // ── Source picker plumbing ────────────────────────────────────────
+  // Sources arrive via `capture-sources`; the region drag-select result
+  // via `recorder-region-result`; the currently-staged target (restored
+  // on open) via `capture-target`.
+  useEffect(() => {
+    let offSources: (() => void) | undefined;
+    let offRegion: (() => void) | undefined;
+    let offTarget: (() => void) | undefined;
+    let disposed = false;
+    void (async () => {
+      offSources = await listen<CaptureSources>("capture-sources", (e) => {
+        setSources({
+          displays: e.payload.displays ?? [],
+          windows: e.payload.windows ?? [],
+        });
+        setSourcesLoading(false);
+      });
+      offRegion = await listen<{
+        cancelled: boolean;
+        rect?: { width: number; height: number };
+      }>("recorder-region-result", (e) => {
+        if (!e.payload.cancelled && e.payload.rect) {
+          setSourceKind("region");
+          setSourceLabel(
+            `Custom region (${Math.round(e.payload.rect.width)}×${Math.round(
+              e.payload.rect.height,
+            )})`,
+          );
+          setSelectedWindowId(null);
+        }
+      });
+      offTarget = await listen<{ target: CaptureTarget | null }>("capture-target", (e) => {
+        const t = e.payload.target;
+        if (!t) return; // null → default full screen; keep the default label
+        if (t.kind === "full_screen") {
+          setSourceKind("full_screen");
+          setSelectedDisplayId(t.display_id);
+          setSourceLabel("Full screen");
+        } else if (t.kind === "window") {
+          setSourceKind("window");
+          setSelectedWindowId(t.window_id);
+          setSourceLabel("Selected window");
+        } else if (t.kind === "region") {
+          setSourceKind("region");
+          setSelectedDisplayId(t.display_id);
+          setSourceLabel(
+            `Custom region (${Math.round(t.rect.width)}×${Math.round(t.rect.height)})`,
+          );
+        } else if (t.kind === "camera_only") {
+          setSourceKind("camera_only");
+          setSourceLabel("Camera only");
+        }
+      });
+      if (disposed) {
+        offSources();
+        offRegion();
+        offTarget();
+        return;
+      }
+      // Restore the staged target so the label reflects what will record.
+      emitAction("request-capture-target");
+    })();
+    return () => {
+      disposed = true;
+      offSources?.();
+      offRegion?.();
+      offTarget?.();
+    };
+  }, []);
+
+  const requestSources = useCallback(() => {
+    setSourcesLoading(true);
+    emitAction("request-capture-sources");
+  }, []);
+
+  // Stage a target in Rust (persisted) and reflect it in the picker.
+  function pickSource(target: CaptureTarget | null, kind: CaptureKind, label: string) {
+    setSourceKind(kind);
+    setSourceLabel(label);
+    setSelectedDisplayId(
+      target && (target.kind === "full_screen" || target.kind === "region")
+        ? target.display_id
+        : null,
+    );
+    setSelectedWindowId(target && target.kind === "window" ? target.window_id : null);
+    // Camera-only needs the bubble on screen — it's the capture source.
+    if (kind === "camera_only" && !cameraOn) applyCamera(true);
+    emitAction({ type: "recorder-config", target });
+  }
+
+  // "Custom region…" → open the drag-select overlay. The target is
+  // staged by Rust's `region-selected` handler and echoed back via
+  // `recorder-region-result`.
+  function pickRegion() {
+    emitAction("open-region-selector");
+  }
+
   function handleStart() {
     if (starting || loomBusy || copilotActive) return;
     // Defensive bubble re-emit: if the user has the camera on, fire
@@ -287,6 +407,15 @@ export function RecorderPanel() {
             computerSounds={computerSounds}
             noiseFilter={noiseFilter}
             openDd={openDd}
+            sources={sources}
+            sourcesLoading={sourcesLoading}
+            sourceKind={sourceKind}
+            sourceLabel={sourceLabel}
+            selectedDisplayId={selectedDisplayId}
+            selectedWindowId={selectedWindowId}
+            onRequestSources={requestSources}
+            onPickSource={pickSource}
+            onPickRegion={pickRegion}
             setCameraId={setCameraId}
             setMicId={setMicId}
             applyCamera={applyCamera}
@@ -360,6 +489,16 @@ type RecordTabProps = {
   computerSounds: boolean;
   noiseFilter: boolean;
   openDd: DropdownId;
+  // Phase 1 source picker
+  sources: CaptureSources;
+  sourcesLoading: boolean;
+  sourceKind: CaptureKind;
+  sourceLabel: string;
+  selectedDisplayId: number | null;
+  selectedWindowId: number | null;
+  onRequestSources: () => void;
+  onPickSource: (target: CaptureTarget | null, kind: CaptureKind, label: string) => void;
+  onPickRegion: () => void;
   setCameraId: Dispatch<SetStateAction<string | null>>;
   setMicId: Dispatch<SetStateAction<string | null>>;
   applyCamera: (on: boolean) => void;
@@ -451,15 +590,98 @@ function RecordTab(p: RecordTabProps) {
       </div>
 
       <DeviceRow
-        icon={Monitor}
-        label="Full screen"
+        icon={sourceIcon(p.sourceKind)}
+        label={p.sourceLabel}
         open={p.openDd === "screen"}
-        onClick={() => p.setOpenDd(p.openDd === "screen" ? null : "screen")}
+        onClick={() => {
+          const opening = p.openDd !== "screen";
+          p.setOpenDd(opening ? "screen" : null);
+          if (opening) p.onRequestSources();
+        }}
       >
         <Menu>
-          <MenuItem icon={Monitor} label="Full screen" selected onClick={() => p.setOpenDd(null)} />
-          <MenuItem icon={Monitor} label="Specific window" hint="Soon" disabled />
-          <MenuItem icon={Monitor} label="Custom size" hint="Soon" disabled />
+          {/* Full screen — one row per display when multi-monitor. */}
+          {p.sources.displays.length > 1 ? (
+            p.sources.displays.map((d) => (
+              <MenuItem
+                key={d.id}
+                icon={Monitor}
+                label={`Full screen — ${d.name}`}
+                selected={p.sourceKind === "full_screen" && p.selectedDisplayId === d.id}
+                onClick={() => {
+                  p.onPickSource(
+                    { kind: "full_screen", display_id: d.id },
+                    "full_screen",
+                    `Full screen — ${d.name}`,
+                  );
+                  p.setOpenDd(null);
+                }}
+              />
+            ))
+          ) : (
+            <MenuItem
+              icon={Monitor}
+              label="Full screen"
+              selected={p.sourceKind === "full_screen"}
+              onClick={() => {
+                const d = p.sources.displays[0];
+                p.onPickSource(
+                  d ? { kind: "full_screen", display_id: d.id } : null,
+                  "full_screen",
+                  "Full screen",
+                );
+                p.setOpenDd(null);
+              }}
+            />
+          )}
+
+          <MenuDivider />
+
+          {/* Specific window — scrollable list, app name as subtitle. */}
+          <div className="max-h-44 overflow-y-auto">
+            {p.sourcesLoading && <MenuEmpty label="Loading windows…" />}
+            {!p.sourcesLoading && p.sources.windows.length === 0 && (
+              <MenuEmpty label="No windows found" />
+            )}
+            {p.sources.windows.map((w) => (
+              <MenuItem
+                key={w.id}
+                icon={AppWindow}
+                label={w.title || w.app_name || "Untitled window"}
+                sub={w.title ? w.app_name : undefined}
+                selected={p.sourceKind === "window" && p.selectedWindowId === w.id}
+                onClick={() => {
+                  p.onPickSource(
+                    { kind: "window", window_id: w.id },
+                    "window",
+                    w.title || w.app_name || "Selected window",
+                  );
+                  p.setOpenDd(null);
+                }}
+              />
+            ))}
+          </div>
+
+          <MenuDivider />
+
+          <MenuItem
+            icon={Crop}
+            label="Custom region…"
+            selected={p.sourceKind === "region"}
+            onClick={() => {
+              p.onPickRegion();
+              p.setOpenDd(null);
+            }}
+          />
+          <MenuItem
+            icon={Video}
+            label="Camera only"
+            selected={p.sourceKind === "camera_only"}
+            onClick={() => {
+              p.onPickSource({ kind: "camera_only" }, "camera_only", "Camera only");
+              p.setOpenDd(null);
+            }}
+          />
         </Menu>
       </DeviceRow>
 
@@ -998,6 +1220,7 @@ function MenuItem({
   icon: Icon,
   label,
   hint,
+  sub,
   selected,
   disabled,
   onClick,
@@ -1005,6 +1228,8 @@ function MenuItem({
   icon: IconType;
   label: string;
   hint?: string;
+  /** Optional second line (normal case) — used for a window's app name. */
+  sub?: string;
   selected?: boolean;
   disabled?: boolean;
   onClick?: () => void;
@@ -1019,11 +1244,28 @@ function MenuItem({
       )}
     >
       <Icon size={15} className="shrink-0 opacity-80" />
-      <span className="flex-1 truncate font-medium">{label}</span>
+      <span className="flex-1 min-w-0">
+        <span className="block truncate font-medium">{label}</span>
+        {sub && <span className="block truncate text-[10.5px] text-[#a0a0a5]">{sub}</span>}
+      </span>
       {hint && <span className="text-[10px] font-semibold uppercase text-[#bdbdc2]">{hint}</span>}
-      {selected && <Check size={15} className="text-[#2f6bff]" />}
+      {selected && <Check size={15} className="shrink-0 text-[#2f6bff]" />}
     </button>
   );
+}
+
+/** Icon for the source row, reflecting the chosen capture kind. */
+function sourceIcon(kind: CaptureKind): IconType {
+  switch (kind) {
+    case "window":
+      return AppWindow;
+    case "region":
+      return Crop;
+    case "camera_only":
+      return Video;
+    default:
+      return Monitor;
+  }
 }
 
 function MenuEmpty({ label }: { label: string }) {

@@ -6,6 +6,7 @@ import { RecorderPanel } from "./pages/RecorderPanel";
 import { WebcamBubble } from "./pages/WebcamBubble";
 import { Countdown } from "./pages/Countdown";
 import { ControlBar } from "./pages/ControlBar";
+import { RegionSelector } from "./pages/RegionSelector";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import "./index.css";
 
@@ -26,6 +27,8 @@ const Page = hash.startsWith("#/context") ? (
   <Countdown />
 ) : hash.startsWith("#/control-bar") ? (
   <ControlBar />
+) : hash.startsWith("#/region-selector") ? (
+  <RegionSelector />
 ) : (
   <CopilotOverlay />
 );
