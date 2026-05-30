@@ -591,6 +591,76 @@ fn handle_structured_action(
             }
         }
 
+        // ─────────────────────────────────────────
+        // PHASE 1 SOURCE PICKER — stage the capture target
+        // ─────────────────────────────────────────
+        // The panel emits this when the user picks Full screen / a
+        // specific window / a display / Camera only. We stash the
+        // target (and persist it); `loom-record-screen` reads it when
+        // the user clicks Start. Mirrors the teleprompter-start staging
+        // pattern. `target: null` resets to primary full screen.
+        "recorder-config" => {
+            let app_state: tauri::State<'_, AppState> = handle.state();
+            let raw = payload.get("target");
+            let target: Option<recorder::CaptureTarget> = match raw {
+                None => None,
+                Some(v) if v.is_null() => None,
+                Some(v) => match serde_json::from_value::<recorder::CaptureTarget>(v.clone()) {
+                    Ok(t) => Some(t),
+                    Err(e) => {
+                        // A present-but-unparseable target must not silently
+                        // fall back to full screen — surface and ignore.
+                        log::warn!("[recorder] recorder-config: bad target {v:?}: {e}");
+                        return;
+                    }
+                },
+            };
+            log::info!("[recorder] capture target staged: {target:?}");
+            app_state.set_capture_target(target);
+        }
+
+        // Result from the custom-region drag-select overlay. The
+        // selector reports the rect in display-local logical points
+        // (origin = display top-left); on macOS logical points == SCK
+        // `content_rect` points, so no Retina conversion is needed here
+        // (see region_selector.rs). We attach the display_id the
+        // selector was opened on and stage a Region target.
+        "region-selected" => {
+            #[cfg(target_os = "macos")]
+            {
+                let rect = payload
+                    .get("rect")
+                    .and_then(|r| serde_json::from_value::<recorder::RegionRect>(r.clone()).ok());
+                // Trust the display_id the selector was opened on; it
+                // echoes it back so multi-display picks stay correct.
+                let display_id = payload
+                    .get("display_id")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as u32)
+                    .or_else(recorder::sources::primary_display_id);
+                match (display_id, rect) {
+                    (Some(display_id), Some(rect)) => {
+                        let app_state: tauri::State<'_, AppState> = handle.state();
+                        app_state.set_capture_target(Some(recorder::CaptureTarget::Region {
+                            display_id,
+                            rect,
+                        }));
+                        log::info!("[recorder] region staged on display {display_id}: {rect:?}");
+                        recorder::region_selector::close_region_selector(&handle);
+                        let _ = handle.emit(
+                            "recorder-region-result",
+                            serde_json::json!({
+                                "cancelled": false,
+                                "display_id": display_id,
+                                "rect": rect,
+                            }),
+                        );
+                    }
+                    _ => log::warn!("[recorder] region-selected missing rect/display_id"),
+                }
+            }
+        }
+
         "submit-copilot-context" => {
             log::info!("[Copilot] Context submitted — starting session");
 
@@ -1516,6 +1586,7 @@ pub fn run() {
         log::warn!("══════════════════════════════════════════");
     }
 
+    let recorder_prefs = recorder::load_recorder_prefs();
     let app_state = AppState {
         recording_state: Mutex::new(RecordingState::Idle),
         auth_token: Mutex::new(auth_config.auth_token.clone()),
@@ -1533,6 +1604,11 @@ pub fn run() {
         teleprompter_font_size: Mutex::new(28),
         teleprompter_auto_scroll: Mutex::new(false),
         teleprompter_wpm: Mutex::new(130),
+        // Phase 1 source picker — restore last-used target + per-display
+        // custom regions from disk so the picker remembers the user's
+        // choice across restarts (Q3).
+        last_capture_target: Mutex::new(recorder_prefs.last_target),
+        custom_region_per_display: Mutex::new(recorder_prefs.regions),
     };
 
     let backend_url = auth_config.backend_url.clone();
@@ -1872,6 +1948,59 @@ pub fn run() {
                         recorder::webcam_bubble::resize_webcam_bubble(handle_ref, "large");
                     }
 
+                    // Panel asks for the currently-staged capture target on
+                    // open so it can restore the picker label (e.g. a region
+                    // remembered across restarts). Cross-platform — the
+                    // target type carries no macOS dependency.
+                    "request-capture-target" => {
+                        let state: tauri::State<'_, AppState> = handle_ref.state();
+                        let target = state.capture_target();
+                        let _ = handle_ref
+                            .emit("capture-target", serde_json::json!({ "target": target }));
+                    }
+
+                    // ── Phase 1 source picker ──
+                    // Panel requests the window/display list. We enumerate
+                    // via SCShareableContent and emit it back as
+                    // `capture-sources` (event-bus request/response, the
+                    // codebase's convention — there are no Tauri commands).
+                    #[cfg(target_os = "macos")]
+                    "request-capture-sources" => {
+                        match recorder::sources::list_capture_sources() {
+                            Ok(sources) => {
+                                let _ = handle_ref.emit("capture-sources", &sources);
+                            }
+                            Err(e) => {
+                                log::warn!("[recorder] list_capture_sources failed: {e}");
+                                let _ = handle_ref.emit(
+                                    "capture-sources",
+                                    serde_json::json!({
+                                        "displays": [],
+                                        "windows": [],
+                                        "error": e,
+                                    }),
+                                );
+                            }
+                        }
+                    }
+
+                    // Open the custom-region drag-select overlay on the
+                    // primary display.
+                    #[cfg(target_os = "macos")]
+                    "open-region-selector" => {
+                        recorder::region_selector::open_region_selector(handle_ref);
+                    }
+
+                    // Region selector cancelled — close it, tell the panel.
+                    #[cfg(target_os = "macos")]
+                    "close-region-selector" => {
+                        recorder::region_selector::close_region_selector(handle_ref);
+                        let _ = handle_ref.emit(
+                            "recorder-region-result",
+                            serde_json::json!({ "cancelled": true }),
+                        );
+                    }
+
                     #[cfg(target_os = "macos")]
                     "loom-record-screen" => {
                         log::info!("[Loom] Record Screen requested");
@@ -1955,14 +2084,24 @@ pub fn run() {
                             recorder::recording_ui::close_countdown(&handle);
                             log::info!("[recorder] countdown complete \u{2014} starting capture");
 
+                            // Phase 1 — the capture target the panel staged
+                            // (None → primary full screen, unchanged default).
+                            let target = {
+                                let state: tauri::State<'_, AppState> = handle.state();
+                                state.capture_target()
+                            };
                             let path = recorder::screen_capture::new_recording_path();
                             let started = tokio::task::spawn_blocking(move || {
-                                recorder::screen_capture::ScreenRecorder::start(path)
+                                recorder::screen_capture::ScreenRecorder::start(path, target)
                             })
                             .await;
 
                             match started {
                                 Ok(Ok(rec)) => {
+                                    // Phase 1 auto-stop watchdog (Q4): grab what to
+                                    // watch before the recorder is moved into the
+                                    // shared slot.
+                                    let watch = rec.watch_target();
                                     *loom_rec.lock().await = Some(rec);
                                     let state: tauri::State<'_, AppState> = handle.state();
                                     state.set_loom_state(LoomState::Recording);
@@ -1971,6 +2110,62 @@ pub fn run() {
                                     tray::update_tray_for_loom(&tray, &handle);
                                     recorder::recording_ui::open_control_bar(&handle);
                                     log::info!("[recorder] control bar opened — recording live");
+
+                                    // Phase 1 — watchdog: if the captured window
+                                    // closes/quits or the captured display is
+                                    // unplugged, auto-stop-and-save (as if the user
+                                    // pressed Stop). A window moved to another Space
+                                    // is still *present*, so a Space switch does NOT
+                                    // trip this. Debounced over ~1s (2 misses) to
+                                    // ride out transient enumeration blips.
+                                    if let Some(watch) = watch {
+                                        let handle_w = handle.clone();
+                                        spawn_async("loom-watchdog", move || async move {
+                                            use recorder::screen_capture::WatchTarget;
+                                            let mut misses: u32 = 0;
+                                            loop {
+                                                tokio::time::sleep(
+                                                    std::time::Duration::from_millis(500),
+                                                )
+                                                .await;
+                                                let recording = {
+                                                    let s: tauri::State<'_, AppState> =
+                                                        handle_w.state();
+                                                    s.loom_state() == LoomState::Recording
+                                                };
+                                                if !recording {
+                                                    break; // stopped some other way
+                                                }
+                                                let present = tokio::task::spawn_blocking(
+                                                    move || match watch {
+                                                        WatchTarget::Window(id) => {
+                                                            recorder::sources::window_present(id)
+                                                        }
+                                                        WatchTarget::Display(id) => {
+                                                            recorder::sources::display_present(id)
+                                                        }
+                                                    },
+                                                )
+                                                .await
+                                                .unwrap_or(true);
+                                                if present {
+                                                    misses = 0;
+                                                    continue;
+                                                }
+                                                misses += 1;
+                                                if misses >= 2 {
+                                                    log::warn!(
+                                                        "[recorder] auto_stop_reason: \
+                                                         target_invalid ({watch:?}) — \
+                                                         auto-stopping"
+                                                    );
+                                                    let _ = handle_w
+                                                        .emit("wolfee-action", "loom-stop-recording");
+                                                    break;
+                                                }
+                                            }
+                                        });
+                                    }
 
                                     // Phase 1 Teleprompter — if the panel staged a
                                     // script before Start, open the overlay in

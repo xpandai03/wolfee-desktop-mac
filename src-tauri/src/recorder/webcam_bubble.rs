@@ -19,6 +19,12 @@ use tauri::{
 
 pub const WEBCAM_BUBBLE_LABEL: &str = "webcam-bubble";
 
+/// Window title of the bubble. Phase 1 "Camera only" capture resolves
+/// the bubble's `SCWindow` by this title so it can be fed to
+/// `SCContentFilter::with_window` (see `screen_capture.rs`). Keep in
+/// sync with the `.title(...)` on the builder below.
+pub const WEBCAM_BUBBLE_TITLE: &str = "Wolfee Camera";
+
 /// Transparent margin around the circle so its drop shadow has room.
 const MARGIN: f64 = 14.0;
 
@@ -49,7 +55,7 @@ pub fn open_webcam_bubble<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         WEBCAM_BUBBLE_LABEL,
         WebviewUrl::App("index.html#/webcam-bubble".into()),
     )
-    .title("Wolfee Camera")
+    .title(WEBCAM_BUBBLE_TITLE)
     .decorations(false)
     .transparent(true)
     .always_on_top(true)

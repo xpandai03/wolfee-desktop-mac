@@ -1,7 +1,89 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
+use serde::{Deserialize, Serialize};
 use tokio::process::{Child, Command};
 use tokio::io::AsyncWriteExt;
+
+// ── Capture target types (Phase 1 source picker) ────────────────────
+// Pure serde types with no macOS dependency, so they compile on every
+// platform and can be held in `AppState`. The macOS-only capture code
+// (`screen_capture.rs`) and `state.rs` both reference these.
+
+/// A capture region in the target display's coordinate space (points,
+/// top-left origin — the space SCK's `content_rect` expects). Plain
+/// `f64`s so it survives serde to/from the panel and the prefs file
+/// without dragging the C `CGRect` type around.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct RegionRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// What the user chose to capture. Staged from `RecorderPanel` via the
+/// `recorder-config` action and read by the `loom-record-screen` arm.
+/// `None` (no explicit choice) means primary full screen — preserving
+/// the pre-Phase-1 default.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CaptureTarget {
+    /// A whole display. `display_id` from `SCDisplay::display_id()`.
+    FullScreen { display_id: u32 },
+    /// A single window. `window_id` from `SCWindow::window_id()`.
+    Window { window_id: u32 },
+    /// A sub-rectangle of a display.
+    Region { display_id: u32, rect: RegionRect },
+    /// Just the floating webcam-bubble window — captured via
+    /// `with_window` so it stays on the same MP4/`SCRecordingOutput`
+    /// pipeline (Q1 resolution: SCK, never MediaRecorder/ffmpeg).
+    CameraOnly,
+}
+
+/// Recorder preferences persisted across app restarts (Phase 1, Q3):
+/// the last-used capture target and the last custom region *per
+/// display*. Stored as JSON next to the recordings, mirroring the
+/// plain-file pattern the control bar already uses for its position.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RecorderPrefs {
+    pub last_target: Option<CaptureTarget>,
+    /// Last custom region keyed by `display_id`.
+    #[serde(default)]
+    pub regions: HashMap<u32, RegionRect>,
+}
+
+/// Path to the persisted recorder prefs JSON.
+fn recorder_prefs_file() -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("io.wolfee.desktop")
+        .join("recorder_prefs.json")
+}
+
+/// Load persisted recorder prefs (empty default if missing/corrupt).
+pub fn load_recorder_prefs() -> RecorderPrefs {
+    std::fs::read_to_string(recorder_prefs_file())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Persist recorder prefs to disk (best-effort; logs on failure).
+pub fn save_recorder_prefs(prefs: &RecorderPrefs) {
+    let path = recorder_prefs_file();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    match serde_json::to_string_pretty(prefs) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&path, json) {
+                log::warn!("[recorder] save_recorder_prefs failed: {e}");
+            }
+        }
+        Err(e) => log::warn!("[recorder] serialize prefs failed: {e}"),
+    }
+}
 
 // ── Loom-style screen recorder (Phase 1) ────────────────────────────
 // `screen_capture` is macOS-only (it depends on the macOS-only
@@ -10,6 +92,12 @@ use tokio::io::AsyncWriteExt;
 // WAV recorder — is left untouched.
 #[cfg(target_os = "macos")]
 pub mod screen_capture;
+// Capture-source enumeration + watchdog presence checks (Phase 1).
+#[cfg(target_os = "macos")]
+pub mod sources;
+// Custom-region drag-select overlay (Phase 1).
+#[cfg(target_os = "macos")]
+pub mod region_selector;
 pub mod uploader_v2;
 // Pre-record panel window — cross-platform Tauri APIs only, not gated.
 pub mod panel_window;

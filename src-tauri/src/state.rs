@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Mutex;
+
+use crate::recorder::{CaptureTarget, RecorderPrefs, RegionRect};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -163,6 +166,47 @@ pub struct AppState {
     /// Phase 3 — reading-pace words per minute for the auto-scroll
     /// timer. Range 80–220, default 130.
     pub teleprompter_wpm: Mutex<i32>,
+
+    // ── Phase 1 source picker ────────────────────────────────────────
+    /// Last-used capture target, staged by the panel's `recorder-config`
+    /// action and read by `loom-record-screen`. `None` = primary full
+    /// screen (the pre-Phase-1 default). Persisted across restarts.
+    pub last_capture_target: Mutex<Option<CaptureTarget>>,
+    /// Last custom region per `display_id` (Q3 — per-display, last-used).
+    /// Persisted across restarts.
+    pub custom_region_per_display: Mutex<HashMap<u32, RegionRect>>,
+}
+
+impl AppState {
+    // ── Phase 1 source picker helpers ───────────────────────────────
+
+    /// The capture target to use for the next recording (clone of the
+    /// staged target; `None` → primary full screen).
+    pub fn capture_target(&self) -> Option<CaptureTarget> {
+        self.last_capture_target.lock().unwrap().clone()
+    }
+
+    /// Stage a capture target and persist it (+ remember the region per
+    /// display when the target is a custom region).
+    pub fn set_capture_target(&self, target: Option<CaptureTarget>) {
+        if let Some(CaptureTarget::Region { display_id, rect }) = &target {
+            self.custom_region_per_display
+                .lock()
+                .unwrap()
+                .insert(*display_id, *rect);
+        }
+        *self.last_capture_target.lock().unwrap() = target;
+        self.persist_recorder_prefs();
+    }
+
+    /// Snapshot AppState's recorder prefs to disk.
+    pub fn persist_recorder_prefs(&self) {
+        let prefs = RecorderPrefs {
+            last_target: self.last_capture_target.lock().unwrap().clone(),
+            regions: self.custom_region_per_display.lock().unwrap().clone(),
+        };
+        crate::recorder::save_recorder_prefs(&prefs);
+    }
 }
 
 impl AppState {

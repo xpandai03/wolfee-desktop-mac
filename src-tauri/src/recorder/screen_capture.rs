@@ -27,6 +27,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use screencapturekit::{
+    cg::CGRect,
     recording_output::{
         RecordingCallbacks, SCRecordingOutput, SCRecordingOutputCodec,
         SCRecordingOutputConfiguration, SCRecordingOutputFileType,
@@ -37,6 +38,22 @@ use screencapturekit::{
         sc_stream::SCStream,
     },
 };
+
+use super::webcam_bubble::WEBCAM_BUBBLE_TITLE;
+// `CaptureTarget` + `RegionRect` are plain serde types (no macOS deps)
+// so they live in the un-gated `recorder` module and can be referenced
+// from `state.rs` on every platform.
+use super::{CaptureTarget, RegionRect};
+
+/// What the auto-stop watchdog (`lib.rs`) should watch for this
+/// recording. Returned by `ScreenRecorder::watch_target()`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum WatchTarget {
+    /// Stop if this window disappears from shareable content.
+    Window(u32),
+    /// Stop if this display disconnects.
+    Display(u32),
+}
 
 /// Cap the recording at 1080p tall. Width is derived from the display's
 /// aspect ratio so there are no letterbox bars.
@@ -114,23 +131,49 @@ pub struct ScreenRecorder {
     finish_rx: mpsc::Receiver<RecEvent>,
     output_path: PathBuf,
     started: Instant,
+    /// What the auto-stop watchdog should monitor (window/display).
+    watch_target: Option<WatchTarget>,
+}
+
+/// Aspect-correct an arbitrary source size to ~1080p tall (never
+/// upscaling beyond the source). Width is rounded to even so the H.264
+/// encoder is happy. The ratio is unit-independent, so this is correct
+/// whether the inputs are points or pixels.
+fn fit_1080(src_w: f64, src_h: f64) -> (u32, u32) {
+    let src_w = src_w.max(1.0);
+    let src_h = src_h.max(1.0);
+    let aspect = src_w / src_h;
+    let out_h = TARGET_HEIGHT.min(src_h.round() as u32).max(2);
+    let out_w = (((f64::from(out_h) * aspect).round() as u32) + 1) & !1;
+    (out_w.max(2), out_h)
+}
+
+/// Clamp a requested region to the display bounds so a stale/oversized
+/// rect can never push `content_rect` outside the captured surface.
+fn clamp_region(rect: RegionRect, disp_w: f64, disp_h: f64) -> RegionRect {
+    let x = rect.x.clamp(0.0, (disp_w - 1.0).max(0.0));
+    let y = rect.y.clamp(0.0, (disp_h - 1.0).max(0.0));
+    let width = rect.width.clamp(1.0, disp_w - x);
+    let height = rect.height.clamp(1.0, disp_h - y);
+    RegionRect { x, y, width, height }
 }
 
 impl ScreenRecorder {
-    /// Start recording the primary display to `output_path`.
+    /// Start recording `target` to `output_path`. `None` means primary
+    /// full screen (the pre-Phase-1 default).
     ///
     /// Blocking — call from `spawn_blocking`. The ScreenCaptureKit
     /// calls cross into the Objective-C runtime; the existing Copilot
     /// system-audio capture uses the same `spawn_blocking` discipline.
-    pub fn start(output_path: PathBuf) -> Result<Self, String> {
-        log::info!("[recorder] ScreenRecorder::start — entering");
+    pub fn start(output_path: PathBuf, target: Option<CaptureTarget>) -> Result<Self, String> {
+        log::info!("[recorder] ScreenRecorder::start — entering (target={target:?})");
         if !macos_supports_recording() {
             return Err("Screen recording requires macOS 15 (Sequoia) or later.".to_string());
         }
 
-        // 1. Pick the primary display. Phase 1 records the primary
-        //    display only; multi-display selection lands with the
-        //    pre-record panel (deferred — see the test plan).
+        // 1. Enumerate displays + windows once. Same SCShareableContent
+        //    behind the same Screen Recording TCC grant — no extra
+        //    permission for window enumeration.
         log::info!("[recorder] calling SCShareableContent::get()");
         let content = SCShareableContent::get().map_err(|e| {
             format!(
@@ -139,33 +182,119 @@ impl ScreenRecorder {
             )
         })?;
         let displays = content.displays();
-        log::info!("[recorder] SCShareableContent OK — {} display(s)", displays.len());
-        let display = displays.into_iter().next().ok_or_else(|| {
-            "No display available to capture. If you just granted screen-recording \
-             permission, quit and reopen Wolfee, then try again."
-                .to_string()
-        })?;
-
-        // 2. Derive an aspect-correct capture size, ~1080p tall. The
-        //    width/height *ratio* is unit-independent, so this is
-        //    correct whether the crate reports points or pixels.
-        let dw = display.width().max(1);
-        let dh = display.height().max(1);
-        let aspect = f64::from(dw) / f64::from(dh);
-        let out_h = TARGET_HEIGHT;
-        let out_w = (((f64::from(out_h) * aspect).round() as u32) + 1) & !1; // even
+        let windows = content.windows();
         log::info!(
-            "[Loom] display {dw}x{dh} (aspect {aspect:.3}) → capture {out_w}x{out_h} @ {TARGET_FPS}fps"
+            "[recorder] SCShareableContent OK — {} display(s), {} window(s)",
+            displays.len(),
+            windows.len()
         );
+        if displays.is_empty() {
+            return Err("No display available to capture. If you just granted \
+                        screen-recording permission, quit and reopen Wolfee, then try again."
+                .to_string());
+        }
 
-        // 3. Content filter: the whole display, excluding nothing.
-        //    The recorder is driven entirely from the tray menu (a
-        //    transient system menu that is never part of a capture),
-        //    so Phase 1 needs no window-exclusion list.
-        let filter = SCContentFilter::create()
-            .with_display(&display)
-            .with_excluding_windows(&[])
-            .build();
+        // Resolve `None` → primary full screen so the default path is
+        // unchanged from Phase 0.
+        let target = target.unwrap_or_else(|| CaptureTarget::FullScreen {
+            display_id: displays[0].display_id(),
+        });
+
+        // 2. Build the SCContentFilter from the chosen target, and pick
+        //    an aspect-correct ~1080p capture size + a watch target for
+        //    the auto-stop watchdog.
+        let (filter, watch_target, src_w, src_h): (SCContentFilter, Option<WatchTarget>, f64, f64) =
+            match &target {
+                CaptureTarget::FullScreen { display_id } => {
+                    let display = displays
+                        .iter()
+                        .find(|d| d.display_id() == *display_id)
+                        .or_else(|| displays.first())
+                        .ok_or_else(|| "Requested display is no longer connected.".to_string())?;
+                    let f = SCContentFilter::create()
+                        .with_display(display)
+                        .with_excluding_windows(&[])
+                        .build();
+                    (
+                        f,
+                        Some(WatchTarget::Display(display.display_id())),
+                        f64::from(display.width()),
+                        f64::from(display.height()),
+                    )
+                }
+                CaptureTarget::Window { window_id } => {
+                    let window = windows
+                        .iter()
+                        .find(|w| w.window_id() == *window_id)
+                        .ok_or_else(|| {
+                            "That window is no longer open. Pick another window and try again."
+                                .to_string()
+                        })?;
+                    let frame = window.frame();
+                    let f = SCContentFilter::create().with_window(window).build();
+                    (
+                        f,
+                        Some(WatchTarget::Window(window.window_id())),
+                        frame.width,
+                        frame.height,
+                    )
+                }
+                CaptureTarget::Region { display_id, rect } => {
+                    let display = displays
+                        .iter()
+                        .find(|d| d.display_id() == *display_id)
+                        .or_else(|| displays.first())
+                        .ok_or_else(|| "Requested display is no longer connected.".to_string())?;
+                    let r =
+                        clamp_region(*rect, f64::from(display.width()), f64::from(display.height()));
+                    log::info!(
+                        "[Loom] region {:?} clamped to {r:?} on display {}",
+                        rect,
+                        display.display_id()
+                    );
+                    let f = SCContentFilter::create()
+                        .with_display(display)
+                        .with_excluding_windows(&[])
+                        .with_content_rect(CGRect {
+                            x: r.x,
+                            y: r.y,
+                            width: r.width,
+                            height: r.height,
+                        })
+                        .build();
+                    (
+                        f,
+                        Some(WatchTarget::Display(display.display_id())),
+                        r.width,
+                        r.height,
+                    )
+                }
+                CaptureTarget::CameraOnly => {
+                    // Q1 resolution: capture the bubble window via
+                    // with_window — same MP4 pipeline, no MediaRecorder.
+                    let window = windows
+                        .iter()
+                        .find(|w| w.title().as_deref() == Some(WEBCAM_BUBBLE_TITLE))
+                        .ok_or_else(|| {
+                            "Turn the camera on first — the camera bubble needs to be on \
+                             screen to record it."
+                                .to_string()
+                        })?;
+                    let frame = window.frame();
+                    let f = SCContentFilter::create().with_window(window).build();
+                    (
+                        f,
+                        Some(WatchTarget::Window(window.window_id())),
+                        frame.width,
+                        frame.height,
+                    )
+                }
+            };
+
+        let (out_w, out_h) = fit_1080(src_w, src_h);
+        log::info!(
+            "[Loom] source {src_w:.0}x{src_h:.0} → capture {out_w}x{out_h} @ {TARGET_FPS}fps (watch={watch_target:?})"
+        );
 
         // 4. Stream configuration: video size/fps + audio. SCK folds
         //    the microphone (macOS 15+) and the system audio into the
@@ -228,7 +357,13 @@ impl ScreenRecorder {
             finish_rx,
             output_path,
             started: Instant::now(),
+            watch_target,
         })
+    }
+
+    /// What the auto-stop watchdog should monitor for this recording.
+    pub fn watch_target(&self) -> Option<WatchTarget> {
+        self.watch_target
     }
 
     /// Stop recording, wait for the MP4 to be finalized, and return the
